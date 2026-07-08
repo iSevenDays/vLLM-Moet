@@ -11,3 +11,6 @@ __pycache__/
 
 # Internal session logs / research harnesses (not for publication)
 internal/
+
+# local artifacts (wheels kept out of git)
+patch/*.whl

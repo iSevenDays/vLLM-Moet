@@ -1,11 +1,33 @@
 # DeepSeek‑V4‑Flash on Blackwell (SM120)
 
 A hard‑tuned **vLLM** that makes **DeepSeek‑V4‑Flash** (159B MoE) **fast** on Blackwell — and
-fits it on hardware the FP4 checkpoint can't. Stock vLLM has no SM120 path for DS4 (its FP8
-route needs DeepGEMM, which has no SM120 kernels) — other stacks do run it on SM120 (e.g.
-sglang); this is a **vLLM** path, tuned to be fast, with hand‑written SM120 kernels.
+fits it on hardware the FP4 checkpoint can't. The 2‑bit expert compression + FP4 recovery and the
+SM120 SASS kernels are ours; the base is official vLLM (**v0.24.0** since 2026‑07).
 
 ## What you get
+
+**Current base: official vLLM v0.24.0** (`patch/vllm-moet-v0.24.0.patch`, ~3.4k lines — the old
+43.5k‑line DS4/SM120 backport died when upstream shipped DeepSeek‑V4 + SM120 natively). Same
+machine/checkpoint/knobs A/B vs the previous fork (official FP4 checkpoint, 2‑bit experts +
+FP4 delta, MTP k=2, CUDA graphs, single‑stream medians, 2026‑07‑08):
+
+| hardware | fork v0.19 | **port v0.24** | Δ |
+|---|---:|---:|---|
+| 1× RTX PRO 6000 (96 GB) — decode | 127.5 tok/s | **161.2 tok/s** | **+26%** |
+| 1× RTX PRO 6000 — prefill 8k | 2 309 tok/s | **4 847 tok/s** | **+110%** |
+| 2× RTX PRO 6000 (TP2) — decode | 177.3 tok/s | **209.6 tok/s** | **+18%** |
+| 2× RTX PRO 6000 (TP2) — prefill 8k | 3 342 tok/s | **5 791 tok/s** | **+73%** |
+| 4× RTX 5090 (TP4) — decode | 106.7 tok/s | **214.4 tok/s** | **+101%** |
+| 4× RTX 5090 (TP4) — prefill 8k | 3 765 tok/s | **5 561 tok/s** | **+48%** |
+
+MTP acceptance identical across bases (~2.6 tok/step) — the gains are step‑time (upstream
+runner/attention got faster; prefill: upstream FlashInfer SM120 sparse‑MLA replaced our Triton
+path). The v0.24.0 release is broken‑as‑shipped for DS4 on SM120 — the patch carries the fixes
+(DeepGEMM nv‑dev pin, flashinfer 0.6.14, SM12x `cooperative_topk` gate, o_proj einsum scale
+layout, `thread_local` graph capture); details in [docs/v024-port.md](docs/v024-port.md).
+
+Numbers below this line are the **v0.19 fork's** (kept for the techniques and methodology;
+warmed coding corpus, so not directly comparable to the table above):
 
 | | hardware | tok/s | context |
 |---|---|---:|---|
@@ -144,6 +166,13 @@ kernels here are reachable through stock CUDA on sm_120; this toolchain is what 
 
 ## Repository layout
 - **`kernels/`** — SASS (`sass/`) + prebuilt SM120 cubins (`cubins-sm120/`) + generators (`gen/`) + `MANIFEST.md`.
+  Includes the **K=6144** MoE‑GEMM family (gate‑up for GLM‑5.x hidden 6144 — GLM‑5.2 prep).
 - **`tools/serve.sh`** — single launcher (TP/PP, `MOE_W2`/`GATE`/`DELTA_GB` knobs) + probes.
-- **`patch/vllm-moet.patch`** — runtime delta vs official vLLM `v0.19.2rc0` (verified to apply clean).
-- **`BUILD.md`** / **`Dockerfile.sm120`** — pinned base, SM120 build recipe, run instructions.
+- **`patch/vllm-moet-v0.24.0.patch`** — **current** runtime delta vs official vLLM `v0.24.0`
+  (18 files, +3.4k lines: 2‑bit/delta/gate modules + hooks in `mxfp4.py`/`fp8.py` + the SM120
+  base fixes). Env pins that go with it: DeepGEMM nv‑dev `a6b593d2`, flashinfer 0.6.14.
+- **`patch/vllm-moet.patch`** — legacy delta vs `v0.19.2rc0` (the old fork; superseded).
+- **`docs/v024-port.md`** — the v0.24 port: dependency pins, SM120 fixes, apply recipe,
+  benchmark methodology.
+- **`BUILD.md`** / **`Dockerfile.sm120`** — pinned base, SM120 build recipe, run instructions
+  (v0.19 fork; for v0.24 see `docs/v024-port.md`).
