@@ -75,6 +75,26 @@ Environment pins that go with the patch (both required on SM120):
   drafter `embed_tokens` share across PP ranks (the NVFP4/DS4 MTP head ships no embedding of
   its own; upstream's share is gated to `pp_world_size == 1`). Validated on DS4‑Flash PP4
   (4× RTX 5090): acceptance to 2.81, 184 vs 93 tok/s (~2× MTP speedup).
+- **NVFP4 KV cache** (`--kv-cache-dtype nvfp4`) for the SM120 sparse‑MLA path — a packed
+  **352 B/token** layout (512× E2M1 + 32× E4M3 block‑16 scales at a fixed 2⁻⁶ global scale +
+  64× FP8 rope) replacing the 656 B `fp8_ds_mla` layout, **1.86× less KV/token**. The write
+  kernel is a standalone SM120 torch extension (`csrc/nvfp4_ds_mla/`); FlashInfer's sparse‑MLA
+  JIT sources are patched with `ModelType::GLM_NSA_NVFP4` (`tools/nvfp4_flashinfer_sm120/`) so
+  the packed bulk expands in place before QK and the FP8‑MMA pipeline is unchanged. Live on
+  GLM‑5.2 TP4 (128K ctx): KV pool **+38%** (415K → 571K tokens), decode parity (104 tok/s —
+  sparse reads only top‑2048), needle PASS to 126K, arithmetic + coherence intact. (Follow‑up:
+  move the write kernel into `vllm._C`; FlashInfer 0.6.14 ships an AOT `sparse_mla_sm120.so`
+  that must be removed so the patched JIT sources rebuild.)
+- **Deterministic MoE unpermute** — the routed‑expert scatter‑add uses a bijective
+  `index_copy` instead of `index_add`, removing the atomic‑accumulation non‑determinism in
+  free‑running decode (matters under PP where physical KV‑block assignment varies run to run).
+- **BASE cache (inverted delta)** — an opt‑in mirror of the delta tier: the 2‑bit base lives in
+  host RAM and a GPU pool caches the hot experts, so a model whose 2‑bit base does not fit VRAM
+  (e.g. GLM‑5.2 on 2 cards) can still serve at cache‑hit speed. GLM routing is concentrated
+  enough (≈89% of token→expert routings served from ~20% of experts) to make this practical.
+- **AFRAG prefill** — fragment‑major activation repack (single‑pass Triton into dedicated
+  buffers) so each QMMA A‑fragment loads in one `LDG.128`; ~1.3× on the prefill GEMM,
+  bit‑identical to the mc4 path, default‑on where the `mc4afrag` cubins ship.
 
 Everything stays **opt‑in** (`VLLM_MOE_W2=1` etc.); with the knobs off the only behavioural
 delta vs stock v0.24.0 are the SM120 fixes above.

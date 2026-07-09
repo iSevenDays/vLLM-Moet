@@ -175,6 +175,12 @@ MTP under **pipeline parallelism** also landed: the patch carries draft‑token 
 drafter embedding share across PP ranks — DeepSeek‑V4‑Flash on 4× RTX 5090 **PP4** does
 184 tok/s with MTP vs 93 without (~2×), acceptance up to 2.81.
 
+**NVFP4 KV cache** (`--kv-cache-dtype nvfp4`) packs the SM120 sparse‑MLA KV to **352 B/token**
+(vs 656 B `fp8_ds_mla`) — on GLM‑5.2 TP4 that is **+38% KV pool** (415K → 571K tokens at 128K
+ctx) at decode parity, needle PASS to 126K. See [docs/v024-port.md](docs/v024-port.md) for this
+and the other v0.24 additions (deterministic MoE unpermute, the host‑resident BASE cache, AFRAG
+prefill).
+
 ## The SM120 toolchain we built
 
 These kernels exist only because we first built the assembler and the ISA data they need.
