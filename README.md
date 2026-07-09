@@ -93,9 +93,14 @@ Result on **1× RTX 5090 (32 GB)**: dense FP8 + an 11–14 GiB pool (19% of expe
 72.7 GiB pinned host RAM, CUDA graphs on, coherent greedy output — **~38 tok/s** steady
 decode with MTP k=2 (~32 without; acceptance 2.83 — the miss replay covers MTP verify steps
 too), 10–24 tok/s while the working set shifts (miss replays). Not a speed demon — a
-**capacity unlock**: the model this card cannot even hold now runs on it, and the same knob
-is the path to GLM‑5.2 (753B) on two 96 GB cards, where the pool covers ~58% of experts and
-misses become rare.
+**capacity unlock**: the model this card cannot even hold now runs on it.
+
+The same knob puts **GLM‑5.2 (753B) on two 96 GB cards**: TP2 with a 48 GiB/rank pool
+(50.6% of experts; the 2‑bit base alone is ~190 GiB, matching the *entire* 2‑GPU VRAM
+budget) serves coherently at 32K context — ~19 tok/s on a warm working set, hit‑rate 91%
+of routings at half coverage. Numeric‑heavy quality wants the FP4 tier back on top (a
+three‑tier host→2‑bit→FP4 hierarchy — in progress); throughput scales with per‑step
+residency, which MTP‑draft prefetch will raise next.
 
 ---
 
