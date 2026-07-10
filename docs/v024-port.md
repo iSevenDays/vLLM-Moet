@@ -62,9 +62,70 @@ Environment pins that go with the patch (both required on SM120):
   counter, and the runner fetches all missing routed experts synchronously (batched pinned
   H2D, 51.6 GiB/s measured) and replays the step's graph once — replay bit‑identical to a
   resident forward (unit‑tested, `internal` test_base_cache). Prefill prefetches per layer
-  via `ensure_resident`. TP OR‑reduces the miss decision; PP unsupported; mutually exclusive
-  with the FP4 delta tier. Measured on 1× RTX 5090: 22.9 GiB GPU / 72.7 GiB pinned host,
-  ~32 tok/s steady (96% pool hit at 19% coverage), 10–21 tok/s under working‑set shift.
+  via `ensure_resident`. TP MAX‑reduces the miss decision. Under **PP** a miss is local to
+  its stage (per‑stage counter, inputs still held in the stage's static buffers), so each
+  stage re‑runs only its own **segment** before activations flow downstream — no cross‑stage
+  collective; TP ranks within a stage replay together. The replay iterates to a **fixed
+  point** (bounded at 8, typically ≤1 extra pass): corrected early layers can re‑route later
+  layers onto experts the first pass never fetched, and those second‑order misses otherwise
+  zeroed contributions *inside* the replay — measured as cross‑request greedy
+  nondeterminism. Slots touched by any pass of a step are pinned against eviction until the
+  next step (the passes must not cannibalize each other's fetches); on tight pools an
+  emergency eviction pass (synchronous callers only) relaxes the 2‑tick coldness bound
+  rather than leave a miss UNRESTORED. Coexists with the FP4 need‑pool (explicit
+  `VLLM_MOE_W2_DELTA_GB`, three‑tier stack). Opt‑in `VLLM_MOE_W2_PREFETCH=1` adds a
+  draft‑affinity prefetcher: an in‑graph routing log feeds a token→experts table, and each
+  decode step's input ids (under MTP: last step's sampled+draft tokens) prefetch predicted
+  experts on the side stream, overlapping the forward.
+
+  **Pool sizing is the dominant knob — the engine reports it as a KPI.** The mandatory
+  replay is per‑STEP, so decode tracks the fraction of zero‑miss steps, which is brutally
+  non‑linear in coverage while the token hit‑rate barely moves. Controlled A/B (DS4 1×5090,
+  MTP k=2, idle box, fox 512, median of 10+, 2026‑07‑10):
+
+  | pool | coverage | token hit | decode |
+  |---|---:|---:|---:|
+  | 11 GiB (util 0.90) | 15.2% | 96.5–97.7% | 32.7 tok/s |
+  | 14 GiB (util 0.95) | 19.3% | 98.7–98.9% | **43.4 tok/s** |
+
+  +33% decode from 3 GiB of pool; 14 GiB does NOT fit at util 0.90 (KV needs 0.46 GiB after
+  graphs) — raise `--gpu-memory-utilization` alongside the pool. The engine logs pool
+  coverage at startup and a windowed **`[base] KPI: replay X% of last N steps (avg Y missing
+  pairs/step…)`** line every `VLLM_MOE_W2_KPI_EVERY` steps (default 500, always on) — the
+  replay % is the number to watch when sizing a config; if it is high, grow the pool first.
+  Earlier notes conflated configs here ("~38 tok/s", "~32 no‑MTP @ 19%"): those were mixed
+  11–14 GiB runs on a loaded box. Bench‑prompt caveat: the fox loop flatters both locality
+  and MTP acceptance (2.70); varied prompts at pool 11 land at 21–25 tok/s (acc 2.5–2.6).
+  Also: the "51.6 GiB/s" pinned‑H2D figure is the PRO 6000; **an RTX 5090 does ~26.6 GiB/s**
+  (measured under load), so 5090 miss fetches cost 2× the notes' assumption.
+- **NVMe expert stores** (`VLLM_MOE_W2_STORE_DIR=<dir>`, `moe_w2_store.py`): the host stores
+  behind the base cache and the FP4 need‑pool move to per‑rank **pack files** (row offset =
+  `(li·E+ei)·stride`, stride 4 KiB‑aligned, JSON sidecar; sparse holes for unwritten
+  layers). One store interface, three backends — pinned (default, byte‑identical to the
+  pre‑store code), pack (buffered `preadv` thread pool into a pinned stage; page cache = RAM
+  tier), and **tiered** (`VLLM_MOE_W2_BASE_RAM_GB=<GiB|auto>`): a pinned MRU arena whose
+  hits are zero‑copy pinned views (H2D DMAs straight from the arena — recovers the pack
+  backend's −9%) and whose misses read into the arena slot (buffered by default;
+  `VLLM_MOE_W2_TIER_DIRECT=1` for O_DIRECT). Same‑night A/B, DS4 1×5090 @ 11 GiB pool:
+  pinned 33.0 / pack 25.5 / tiered+20 GiB arena **32.8 tok/s (parity)** at RSS 26–33 vs
+  42–44 GiB; GLM TP2 both stores on NVMe: expert‑store RAM ~568 → ~136 GiB, 29–30 tok/s,
+  needle 4/4 to 36K prompt tokens. Prefill batches are scan‑flagged (fill free arena slots,
+  never evict the decode hot set — a caller flag, NOT a batch‑size heuristic: GLM's
+  100+‑row decode replay fetches misclassified and froze the arena at −66%); the arena hot
+  set persists to `<pack>.heat.json` and preheats on boot (57 GiB ≈ 35 s). **Boot‑from‑pack**
+  (`_try_skip_requant`, all three loaders): a layer present in every serving pack skips
+  dequant→re‑quant entirely — GLM TP2 second boot 408 s vs ~11 min, no ~405 GiB transient;
+  the pack is a persistent quantization cache keyed by shape/config sidecar match. Also
+  fixed here, exposed by long‑prefill testing but **pre‑existing**: the manager tick and
+  forward‑thread paths ran concurrent seen‑snapshots into one shared pinned `_seen_host`
+  (torch's two‑pass `nonzero` overruns its output when the input mutates mid‑call →
+  TensorAdvancedIndexing.cpp:3008 assert → glibc heap corruption → dead worker on ≥16K
+  prefills; a torn snapshot could also evict an in‑flight expert's slot). Snapshots are now
+  serialized under a dedicated lock. Backends unit‑tested byte‑identical
+  (`tools/test_store_backends.py`: 3 backends × cold/warm/reboot/evict/overflow/scan/
+  preheat, both IO modes). Ops: packs on a bind‑mounted real FS (not overlayfs); ~1 TB NVMe
+  for the full GLM stack; parity holds even on a Gen3‑x4 drive (3.7 GB/s) — steady‑state
+  misses ride the page cache, cold shifts pay drive speed.
 - **Deterministic unpermute**: the MoE output scatter used atomic `index_add_`, so identical
   runs wobbled (~1.6e‑2 on prefill) and greedy decode was not reproducible (surfaced by the
   PP determinism investigation; never PP‑specific). Valid `sorted_ids` form a permutation of

@@ -1170,10 +1170,10 @@ index 32a2d8689..3e83d5a87 100644
              mn=r,
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
-index 000000000..26ed3b130
+index 000000000..3ca45853b
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
-@@ -0,0 +1,1048 @@
+@@ -0,0 +1,1121 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Routed experts on 2-bit tensor-sym planes (cubit moe_w2) for the
@@ -1426,6 +1426,57 @@ index 000000000..26ed3b130
 +        tier.add_layer_host_planes(layer_key, fp13, fp2)
 +
 +
++def _try_skip_requant(layer, layer_key: int, E: int, N13: int, K13: int,
++                      N2: int, K2: int, param_names) -> bool:
++    """Boot-from-pack: when every host store this config serves from already
++    holds this layer's rows (valid pack written by a previous boot), the
++    dequant->requant of the checkpoint experts produces bytes NOBODY reads —
++    the base planes live in the pack, and so do the FP4 need-pool sections.
++    Skip it: register the layer's slot-layout metadata and the param stubs
++    exactly as _finish_layer's base path would, and let the tiers serve
++    from the pack. On GLM the requant is the dominant boot cost (NVFP4 ->
++    f64 -> 2-bit, hundreds of GiB of transients); with the pack it reduces
++    to open+read.
++
++    Only applies over the base cache (base_enabled): the GPU-resident plane
++    path needs the planes materialized regardless. A PinnedHostStore never
++    contains layers at boot -> configs without VLLM_MOE_W2_STORE_DIR are
++    untouched. Layers absent from the pack (e.g. the MTP drafter, or a
++    partially written pack) requant as before. When the FP4 tier is enabled
++    but ITS pack misses the layer, we also requant (the fp4 sections can
++    only be rebuilt from the checkpoint bytes)."""
++    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
++    if not moe_w2_delta.base_enabled():
++        return False
++    dev = torch.device("cuda")
++    c13len, s13len = N13 * K13 // 4, N13 * K13 // 32
++    c2len, s2len = N2 * K2 // 4, N2 * K2 // 32
++    btier = moe_w2_delta.get_base_tier(
++        _layer_cutoff() + 1, E, dev,
++        w13_bytes=c13len + s13len, w2_bytes=c2len + s2len)
++    if layer_key not in btier._store:
++        return False
++    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
++    if tier is not None and layer_key not in tier._store:
++        return False
++    _LAYERS[layer_key] = dict(
++        N13=N13, K13=K13, N2=N2, K2=K2, E=E, base=True,
++        off_s13=c13len, off_c2=c13len + s13len,
++        off_s2=c13len + s13len + c2len,
++        off4_s13=2 * c13len, off4_c2=2 * c13len + s13len,
++        off4_s2=2 * c13len + s13len + 2 * c2len,
++    )
++    stub = torch.empty(0, dtype=torch.uint8, device=dev)
++    for name in param_names:
++        layer.register_parameter(
++            name, torch.nn.Parameter(stub, requires_grad=False))
++    logger.info(
++        "moe_w2: layer %d requant SKIPPED — %s serving from pack "
++        "(boot-from-pack)", layer_key,
++        "base+fp4" if tier is not None else "base")
++    return True
++
++
 +def build_layer_planes(layer, layer_key: int) -> None:
 +    """Quantize one FusedMoE layer's experts to 2-bit planes (GPU, chunked).
 +
@@ -1444,6 +1495,10 @@ index 000000000..26ed3b130
 +    K13, K2 = N2, N13 // 2               # H, I (4096/2048 on DS4-Flash TP1)
 +    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
 +    _require_kernels(K13, K2, need_w4=moe_w2_delta.enabled())
++    if _try_skip_requant(layer, layer_key, E, N13, K13, N2, K2,
++                         ("w13_weight", "w13_weight_scale", "w2_weight",
++                          "w2_weight_scale")):
++        return
 +
 +    planes13 = torch.empty(E, N13 * K13 // 4, dtype=torch.uint8, device=dev)
 +    sc13 = torch.empty(E, N13 * K13 // 32, dtype=torch.uint8, device=dev)
@@ -1520,6 +1575,10 @@ index 000000000..26ed3b130
 +    E, N13, K13 = w13.shape
 +    _, N2, K2 = w2.shape
 +    _require_kernels(K13, K2, need_w4=moe_w2_delta.enabled())
++    if _try_skip_requant(layer, layer_key, E, N13, K13, N2, K2,
++                         ("w13_weight", f"w13_{scale_suffix}", "w2_weight",
++                          f"w2_{scale_suffix}")):
++        return
 +
 +    planes13 = torch.empty(E, N13 * K13 // 4, dtype=torch.uint8, device=dev)
 +    sc13 = torch.empty(E, N13 * K13 // 32, dtype=torch.uint8, device=dev)
@@ -1598,6 +1657,10 @@ index 000000000..26ed3b130
 +    K2 = K2h * 2
 +    group = K13 // s13.shape[2]                 # 16 for NVFP4
 +    _require_kernels(K13, K2, need_w4=moe_w2_delta.enabled())
++    if _try_skip_requant(layer, layer_key, E, N13, K13, N2, K2,
++                         ("w13_weight", "w13_weight_scale", "w2_weight",
++                          "w2_weight_scale")):
++        return
 +
 +    planes13 = torch.empty(E, N13 * K13 // 4, dtype=torch.uint8, device=dev)
 +    sc13 = torch.empty(E, N13 * K13 // 32, dtype=torch.uint8, device=dev)
@@ -2072,6 +2135,16 @@ index 000000000..26ed3b130
 +            # the gate's force_promote reads the FP4 tier's own seen scatter
 +            moe_w2_delta.mark_seen(tier.seen[layer_key],
 +                                   topk_ids.view(-1).long())
++        if not prefill and btier.route_log is not None:
++            # per-(token,layer) routing log for the draft-prefetch predictor:
++            # a static [n_layers, T_cap, k_cap] buffer the runner reads back
++            # post-step (~KBs). In-graph safe: fixed shapes per captured
++            # size, static destination. Rows beyond this step's real token
++            # count hold stale ids — the host slices by the true T.
++            _t = min(topk_ids.shape[0], btier.route_log.shape[1])
++            _k = min(topk_ids.shape[1], btier.route_log.shape[2])
++            btier.route_log[layer_key, :_t, :_k].copy_(
++                topk_ids[:_t, :_k], non_blocking=True)
 +        if layer_key == 0:
 +            # per-step counter reset, in-graph (layer 0 runs first each step)
 +            btier.miss_count.zero_()
@@ -2224,10 +2297,10 @@ index 000000000..26ed3b130
 +    return enabled() and _ensure_ready()
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
 new file mode 100644
-index 000000000..5261f931d
+index 000000000..6dd9ef388
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
-@@ -0,0 +1,907 @@
+@@ -0,0 +1,1220 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""FP4 delta tier for the 1-GPU 2-bit MoE path (quality restoration).
@@ -2401,7 +2474,13 @@ index 000000000..5261f931d
 +                                device=dev)
 +        self._seen_host = torch.zeros_like(self.seen, device="cpu",
 +                                           pin_memory=True)
-+        self._host = {}               # layer -> pinned [E, SLOT_BYTES] u8
++        # Host store behind a backend interface: classic pinned/pageable
++        # tensors (default), or an on-disk pack file with the kernel page
++        # cache as the RAM tier (VLLM_MOE_W2_STORE_DIR) — see moe_w2_store.
++        from vllm.model_executor.layers.quantization.utils import (
++            moe_w2_store)
++        self._store = moe_w2_store.make_store(
++            tag, n_layers, n_experts, self.slot_bytes, pinned=host_pinned)
 +        self._stream = torch.cuda.Stream(dev)
 +        # Guards pool/slot_table/_mirror/_owner/_free/_freq mutations. In steady
 +        # state only the manager thread mutates them (uncontended). The
@@ -2409,6 +2488,16 @@ index 000000000..5261f931d
 +        # thread, so the two must be serialized. The desc kernel only READS
 +        # slot_table (never takes the lock), so steady-state decode is unaffected.
 +        self._lock = threading.Lock()
++        # Serializes the seen-snapshot sequence (D2H copy_ -> event sync ->
++        # nonzero) across the manager tick and the forward-thread paths
++        # (force_promote / ensure_resident / mark_need_only). They share ONE
++        # pinned _seen_host and ONE side stream; torch's two-pass nonzero
++        # overruns its output when the input mutates between passes — a
++        # concurrent copy_ from the other thread does exactly that. Measured
++        # on GLM long-prefill needles: TensorAdvancedIndexing.cpp:3008
++        # internal assert -> glibc heap corruption -> dead worker; a torn
++        # snapshot could also evict an in-flight expert (bad bytes served).
++        self._snap_lock = threading.Lock()
 +        self._tick = 0
 +        self._stop = False
 +        self._thread = None
@@ -2425,6 +2514,29 @@ index 000000000..5261f931d
 +        self._win_active_d = 0   # distinct active experts this window
 +        self._cap_frames = []
 +        self._cap_done = False
++        # per-step KPI counters (window + cumulative), fed by kpi_step()
++        self._kpi_steps = 0
++        self._kpi_miss_pairs = 0
++        self._kpi_replays = 0
++        self._kpi_c_steps = 0
++        self._kpi_c_replays = 0
++        self._kpi_unfixed = 0     # experts replay could NOT restore (window)
++        self._kpi_2nd = 0         # extra replays for second-order misses
++        # Slots touched since step_begin(): promoted or hit by any pass of
++        # the CURRENT step. Never evictable (even in the emergency pass) —
++        # without this, a fixed-point iteration can evict pass-k's fetches
++        # to serve pass-k+1 (their seen marks are zeroed after each
++        # snapshot) and ping-pong past the replay cap.
++        self._step_pins: set[int] = set()
++        # Draft-affinity prefetch (VLLM_MOE_W2_PREFETCH=1, base tier only):
++        # route_log = in-graph [n_layers, T_cap, K_cap] routing log written
++        # by the forward glue; _aff = token->experts affinity table folded
++        # from it post-step; draft_prefetch() predicts+fetches at step start.
++        self.route_log: torch.Tensor | None = None
++        self._aff: torch.Tensor | None = None
++        self._aff_k = 8
++        self._last_ids: torch.Tensor | None = None
++        self._kpi_prefetched = 0
 +        # recency-decayed routing frequency per expert (drives the freq policy)
 +        self._freq = torch.zeros(n_layers, n_experts, dtype=torch.float32)
 +        # NEED signal (gate-driven policy): how often the confidence gate flagged a
@@ -2472,11 +2584,11 @@ index 000000000..5261f931d
 +        n = max(budget // self.slot_bytes, 0)
 +        if n == 0:
 +            # Nothing to cache into -> behave exactly like manual DELTA_GB=0:
-+            # release the pinned host store too (tens of GiB of host RAM the
-+            # tier can never use; candidates require li in _host, so the
++            # release the host store too (tens of GiB of host RAM the tier
++            # can never use; candidates require li in the store, so the
 +            # manager and force_promote turn inert).
 +            with self._lock:
-+                self._host = {}
++                self._store.release()
 +            logger.info(
 +                "moe_w2 delta tier AUTO: %.2f GiB free after KV < reserve "
 +                "%.1f GiB -> pool disabled (0 slots, pure 2-bit; host store "
@@ -2509,15 +2621,9 @@ index 000000000..5261f931d
 +        (e.g. [fp4_13|sc13] / [fp4_2|sc2] for the over-base FP4 tier): copy
 +        each part D2H into its slice of the host row — a GPU-side cat of
 +        multi-GiB planes is exactly the transient that OOMs a 32 GB card
-+        during load."""
-+        host = torch.empty(self.E, self.slot_bytes, dtype=torch.uint8,
-+                           pin_memory=self._host_pinned)
-+        off = 0
-+        for t in (*parts13, *parts2):
-+            host[:, off:off + t.shape[1]].copy_(t, non_blocking=False)
-+            off += t.shape[1]
-+        assert off == self.slot_bytes, (off, self.slot_bytes)
-+        self._host[layer_key] = host
++        during load. With the pack-file store a layer already on disk is
++        skipped entirely (persistent quantization cache)."""
++        self._store.add_layer(layer_key, (*parts13, *parts2))
 +
 +    def start(self):
 +        if self._thread is not None:   # idempotent: started once at tier creation
@@ -2549,12 +2655,16 @@ index 000000000..5261f931d
 +        if time.monotonic() - self._last_capture < 5.0:
 +            return
 +        self._tick += 1
-+        with torch.cuda.stream(self._stream):
-+            self._seen_host.copy_(self.seen, non_blocking=True)
-+            ev = torch.cuda.Event()
-+            ev.record(self._stream)
-+        ev.synchronize()
-+        seen = self._seen_host.nonzero()
++        with self._snap_lock:
++            with torch.cuda.stream(self._stream):
++                self._seen_host.copy_(self.seen, non_blocking=True)
++                ev = torch.cuda.Event()
++                ev.record(self._stream)
++            ev.synchronize()
++            seen = self._seen_host.nonzero()
++            # token counts for the hit-rate below — read under the snap lock
++            # so a concurrent snapshot can't swap the values underneath.
++            cnt_raw = self._seen_host[seen[:, 0], seen[:, 1]]
 +        if seen.numel() == 0:
 +            return
 +        if _CAPTURE and not self._cap_done:
@@ -2566,7 +2676,7 @@ index 000000000..5261f931d
 +        # token counts (count-mode) or 1s (binary) per active expert -> the
 +        # token-weighted ratio is the honest one; the distinct ratio is the old
 +        # flag-based number, logged alongside for comparison.
-+        cnt = self._seen_host[seen[:, 0], seen[:, 1]].to(torch.float64)
++        cnt = cnt_raw.to(torch.float64)
 +        cached = self._mirror[seen[:, 0], seen[:, 1]] >= 0
 +        self._win_hits += float((cnt * cached).sum())
 +        self._win_active += float(cnt.sum())
@@ -2586,7 +2696,7 @@ index 000000000..5261f931d
 +                if s >= 0:
 +                    la, ex, _ = self._owner[s]
 +                    self._owner[s] = (la, ex, self._tick)
-+                elif li in self._host:
++                elif li in self._store:
 +                    cand.append((li, ei))
 +            # "need" policy: the background manager does NOT promote — FP4 is filled
 +            # only by the gate's force_promote (an expert 2-bit handled fine never
@@ -2620,12 +2730,17 @@ index 000000000..5261f931d
 +            self._log_summary()
 +            self._last_summary_tick = self._tick
 +
-+    def _take_slots_batch(self, k: int) -> list[int]:
++    def _take_slots_batch(self, k: int, emergency: bool = False) -> list[int]:
 +        """Take up to k slots (lock held by caller): free list first, then ONE
 +        vectorized eviction pass over all slots. Replaces the old per-slot
 +        python scan per promotion — O(n_slots) per TAKEN slot — which at GLM
 +        scale (4k slots x hundreds of gate promotions per fire) burned seconds
 +        of GIL time per fired step and starved the forward thread.
++
++        `emergency=True` (synchronous runner-thread callers only — never the
++        background manager) adds a second eviction pass that relaxes the
++        2-tick coldness bound when the first pass cannot cover k, keeping
++        the seen-window exclusion. See the pass comments below.
 +
 +        Eviction policy is unchanged: least-valuable slot by _POLICY key
 +        (need / freq / lru), restricted to slots whose owner is not active in
@@ -2650,13 +2765,37 @@ index 000000000..5261f931d
 +            key = self._freq[lic, eic].double()
 +        else:
 +            key = tk.clone()
-+        ineligible = (li < 0) | ((self._tick - tk) < 2)
-+        # owner active in the current window -> not evictable
-+        ineligible |= self._seen_host[lic, eic].to(torch.bool)
-+        key[ineligible] = float("inf")
-+        take = min(k_evict, int((~ineligible).sum()))
-+        if take > 0:
-+            victims = torch.topk(key, take, largest=False).indices.tolist()
++        # Hard exclusions: free markers, owners active in the current seen
++        # window (their slots may be read by this step's graph/replay), and
++        # step-pinned slots (touched by any pass of the current step).
++        blocked = (li < 0) | self._seen_host[lic, eic].to(torch.bool)
++        if self._step_pins:
++            blocked[list(self._step_pins)] = True
++        # Pass 1: only >=2-tick-cold victims (never disturbs slots a
++        # CONCURRENT in-flight graph might still read — the background
++        # manager's constraint). Pass 2 (emergency): the synchronous callers
++        # (force_promote / ensure_resident, runner thread, no forward in
++        # flight) relax the coldness bound rather than leave a missing
++        # expert UNRESTORED — a replay that keeps zeroed contributions is a
++        # silent quality hit and a nondeterminism source, strictly worse
++        # than evicting a warm-but-idle slot.
++        passes = [blocked | ((self._tick - tk) < 2)]
++        if emergency:
++            passes.append(blocked)
++        taken: set[int] = set()
++        for ineligible in passes:
++            need = k - len(out)
++            if need <= 0:
++                break
++            mask = ineligible.clone()
++            if taken:
++                mask[list(taken)] = True
++            kk = key.clone()
++            kk[mask] = float("inf")
++            take = min(need, int((~mask).sum()))
++            if take <= 0:
++                continue
++            victims = torch.topk(kk, take, largest=False).indices.tolist()
 +            for s in victims:
 +                vli, vei, vt = self._owner[s]
 +                self.slot_table[vli, vei] = -1
@@ -2667,6 +2806,7 @@ index 000000000..5261f931d
 +                    logger.info(
 +                        "[%s] evict   L%-2d E%-3d  slot %-4d (cold %d ticks)",
 +                        self._tag, vli, vei, s, self._tick - vt)
++                taken.add(s)
 +                out.append(s)
 +        return out
 +
@@ -2676,8 +2816,9 @@ index 000000000..5261f931d
 +        return slots[0] if slots else None
 +
 +    def _promote(self, li, ei, slot):
++        row = self._store.rows_for([(li, ei)])[0]
 +        with torch.cuda.stream(self._stream):
-+            self.pool[slot].copy_(self._host[li][ei], non_blocking=True)
++            self.pool[slot].copy_(row, non_blocking=True)
 +            ev = torch.cuda.Event()
 +            ev.record(self._stream)
 +        ev.synchronize()           # bytes resident BEFORE mapping
@@ -2691,6 +2832,101 @@ index 000000000..5261f931d
 +                        self._tag, li, ei, slot, self._tick)
 +
 +    # ---- confidence-gated re-forward (directive 2 / Step B) --------------
++
++    def step_begin(self) -> None:
++        """Open a new step's pin scope (runner: before the first miss read;
++        prefill: at each ensure_resident). Slots touched after this call are
++        pinned against eviction until the next step_begin — the fixed-point
++        replay's passes must never cannibalize each other's fetches."""
++        with self._lock:
++            self._step_pins.clear()
++
++    # ---- draft-affinity prefetch (VLLM_MOE_W2_PREFETCH=1) ------------------
++
++    def draft_prefetch(self, cur_ids: torch.Tensor) -> int:
++        """Called by the runner at the START of a decode step (outside
++        capture), with the step's REAL input token ids — under MTP these are
++        exactly last step's sampled+draft tokens, so this IS the draft
++        signal. Two actions:
++
++        1. fold the PREVIOUS step's in-graph route_log into the
++           token->experts affinity table (routing is strongly
++           token-identity-correlated — the same fact that makes 19%
++           coverage serve 96% of routings);
++        2. predict this step's routed set from the table and fetch the
++           non-resident predictions on the side stream, OVERLAPPING the
++           forward: layers deep enough to run after the mapping hit
++           directly, earlier ones find the bytes resident when the
++           fixed-point replay re-runs — either way the fetch leaves the
++           critical path.
++
++        Best-effort by design: never emergency-evicts, capped per step,
++        wrong predictions cost one cold slot each and decay away."""
++        if self.route_log is None:
++            return 0
++        t_cap = self.route_log.shape[1]
++        ids = cur_ids[:t_cap].detach().to("cpu", non_blocking=False).long()
++        # 1) fold previous step's log for the ids that produced it
++        if self._last_ids is not None and self._last_ids.numel() > 0:
++            k = self._aff_k
++            log = (self.route_log[:, :self._last_ids.shape[0], :k]
++                   .to("cpu", non_blocking=False).to(torch.int16))
++            need = int(self._last_ids.max()) + 1
++            if self._aff is None or self._aff.shape[0] < need:
++                size = 1 << (need - 1).bit_length()
++                grown = torch.full((size, self.n_layers, k), -1,
++                                   dtype=torch.int16)
++                if self._aff is not None:
++                    grown[:self._aff.shape[0]] = self._aff
++                self._aff = grown
++            self._aff[self._last_ids] = log.permute(1, 0, 2)
++        self._last_ids = ids
++        if self._aff is None:
++            return 0
++        # 2) predict + prefetch
++        vids = ids[ids < self._aff.shape[0]]
++        if vids.numel() == 0:
++            return 0
++        pred = self._aff[vids]                     # [T, L, k]
++        cap = int(os.getenv("VLLM_MOE_W2_PREFETCH_CAP", "32"))
++        pairs = []
++        with self._lock:
++            for li in range(self.n_layers):
++                es = pred[:, li, :].flatten()
++                es = es[es >= 0]
++                if es.numel() == 0:
++                    continue
++                for e in torch.unique(es).tolist():
++                    if int(self._mirror[li, e]) < 0 and li in self._store:
++                        pairs.append((li, int(e)))
++                        if len(pairs) >= cap:
++                            break
++                if len(pairs) >= cap:
++                    break
++            if not pairs:
++                return 0
++            slots = self._take_slots_batch(len(pairs))   # non-emergency
++            plan = [(p, s) for p, s in zip(pairs, slots)]
++            if not plan:
++                return 0
++            rows = self._store.rows_for([p for p, _ in plan])
++            for ((li, ei), slot), row in zip(plan, rows):
++                self._owner[slot] = (li, ei, self._tick)
++                self._step_pins.add(slot)
++                with torch.cuda.stream(self._stream):
++                    self.pool[slot].copy_(row, non_blocking=True)
++            with torch.cuda.stream(self._stream):
++                ev = torch.cuda.Event()
++                ev.record(self._stream)
++            ev.synchronize()
++            for (li, ei), slot in plan:
++                self.slot_table[li, ei] = slot
++                self._mirror[li, ei] = slot
++                self._freq[li, ei] += 1.0
++            self._n_promoted += len(plan)
++            self._win_promoted += len(plan)
++            self._kpi_prefetched += len(plan)
++        return len(plan)
 +
 +    def force_promote(self, layers=None, max_promote=None) -> int:
 +        """Synchronously pull this step's COLD routed experts up to FP4, for a
@@ -2716,20 +2952,21 @@ index 000000000..5261f931d
 +        Returns:
 +            number of experts newly promoted to FP4.
 +        """
-+        if not self._host:
++        if len(self._store) == 0:
 +            return 0
 +        # snapshot the forward's routed-expert scatter. The side stream must
 +        # WAIT on the forward (main) stream first so the snapshot includes THIS
 +        # step's mark_seen scatter — cross-stream ordering is not automatic, and
 +        # a snapshot racing ahead would miss this step's cold experts.
 +        main = torch.cuda.current_stream(self.dev)
-+        with torch.cuda.stream(self._stream):
-+            self._stream.wait_stream(main)
-+            self._seen_host.copy_(self.seen, non_blocking=True)
-+            ev = torch.cuda.Event()
-+            ev.record(self._stream)
-+        ev.synchronize()
-+        seen = self._seen_host.nonzero()
++        with self._snap_lock:
++            with torch.cuda.stream(self._stream):
++                self._stream.wait_stream(main)
++                self._seen_host.copy_(self.seen, non_blocking=True)
++                ev = torch.cuda.Event()
++                ev.record(self._stream)
++            ev.synchronize()
++            seen = self._seen_host.nonzero()
 +        if seen.numel() == 0:
 +            return 0
 +        # Bound the working set to RECENT steps: `seen` otherwise accumulates
@@ -2746,6 +2983,18 @@ index 000000000..5261f931d
 +            cand = []
 +            for li, ei in seen.tolist():
 +                seen_set.add((li, ei))
++                # Refresh last_seen for CACHED owners routed this window
++                # (mirrors _tick_once). force_promote zeroes `seen` after its
++                # snapshot, so a manager tick racing this step would otherwise
++                # see an empty window, find these slots "cold" (stale tick),
++                # evict + rewrite one WHILE the imminent replay reads it —
++                # measured as rare cross-request greedy nondeterminism. The
++                # tick refresh keeps them coldness-protected for >=2 ticks.
++                s = int(self._mirror[li, ei])
++                if s >= 0:
++                    la, ex, _ = self._owner[s]
++                    self._owner[s] = (la, ex, self._tick)
++                    self._step_pins.add(s)
 +                if layer_filter is not None and li not in layer_filter:
 +                    continue
 +                # NEED signal: this step was gate-flagged (2-bit low-confidence), so
@@ -2754,7 +3003,7 @@ index 000000000..5261f931d
 +                # true culprits are the experts consistently present across fires;
 +                # decay washes out the coincidental ones.
 +                self._need[li, ei] += 1.0
-+                if li in self._host and int(self._mirror[li, ei]) < 0:
++                if li in self._store and int(self._mirror[li, ei]) < 0:
 +                    cand.append((li, ei))
 +            if not cand:
 +                return 0
@@ -2774,25 +3023,45 @@ index 000000000..5261f931d
 +            # gets its _owner reserved before the copies, so a concurrent
 +            # manager tick can never hand one of them out again (two experts
 +            # -> one slot -> pool corruption; see the force_promote history).
-+            slots = self._take_slots_batch(len(cand))
-+            plan = []
-+            for (li, ei), slot in zip(cand, slots):
-+                self._owner[slot] = (li, ei, self._tick)
-+                with torch.cuda.stream(self._stream):
-+                    self.pool[slot].copy_(self._host[li][ei], non_blocking=True)
-+                plan.append((li, ei, slot))
++            # emergency=True: this is the synchronous runner-thread path with
++            # no forward in flight — leaving a miss UNRESTORED is worse than
++            # evicting a warm-but-idle slot (see _take_slots_batch).
++            slots = self._take_slots_batch(len(cand), emergency=True)
++            plan = [((li, ei), slot) for (li, ei), slot in zip(cand, slots)]
 +            if not plan:
 +                return 0
++            # one batched host read (pack-file store: mmap -> pinned stage;
++            # pinned store: zero-copy views), THEN the H2D copies — all stage
++            # rows stay valid until the single sync below.
++            rows = self._store.rows_for([p for p, _ in plan])
++            for ((li, ei), slot), row in zip(plan, rows):
++                self._owner[slot] = (li, ei, self._tick)
++                self._step_pins.add(slot)
++                with torch.cuda.stream(self._stream):
++                    self.pool[slot].copy_(row, non_blocking=True)
 +            with torch.cuda.stream(self._stream):
 +                ev = torch.cuda.Event()
 +                ev.record(self._stream)
 +            ev.synchronize()
-+            for li, ei, slot in plan:
++            for (li, ei), slot in plan:
 +                self.slot_table[li, ei] = slot
 +                self._mirror[li, ei] = slot
 +                self._freq[li, ei] += 1.0
 +            self._n_promoted += len(plan)
 +            self._win_promoted += len(plan)
++        if len(plan) < len(cand):
++            # QUALITY KPI: some of this step's missing experts got NO slot
++            # (free list empty + every victim ineligible: seen-live or <2
++            # ticks old). The mandatory replay then RE-ZEROES their
++            # contributions — a silent quality drop even at MISS_TOL=0, and
++            # (pool-content-dependent) a source of run-to-run greedy
++            # nondeterminism. The fix is a bigger pool, not a knob.
++            self._kpi_unfixed += len(cand) - len(plan)
++            logger.warning_once(
++                "moe_w2 [%s]: %d missing experts could not be promoted "
++                "(pool too tight to evict) — replay keeps their zeroed "
++                "contributions. Raise the pool GiB; occurrences counted "
++                "in the KPI line.", self._tag, len(cand) - len(plan))
 +        if _TRACE >= 2:
 +            logger.info("[%s] force-promote %d experts (gate)",
 +                        self._tag, len(plan))
@@ -2805,37 +3074,54 @@ index 000000000..5261f931d
 +        cudagraph capture (prefill is eager), serialized with the manager via
 +        the lock. Marks the ids seen first so the batched eviction never picks
 +        this layer's in-flight experts as victims. Returns experts fetched."""
-+        if layer_key not in self._host:
++        if layer_key not in self._store:
 +            return 0
 +        ids = ids.unique().long()
 +        mark_seen(self.seen[layer_key], ids.to(self.dev))
 +        # snapshot seen (protects eviction) exactly like force_promote
 +        main = torch.cuda.current_stream(self.dev)
-+        with torch.cuda.stream(self._stream):
-+            self._stream.wait_stream(main)
-+            self._seen_host.copy_(self.seen, non_blocking=True)
-+            ev = torch.cuda.Event()
-+            ev.record(self._stream)
-+        ev.synchronize()
++        with self._snap_lock:
++            with torch.cuda.stream(self._stream):
++                self._stream.wait_stream(main)
++                self._seen_host.copy_(self.seen, non_blocking=True)
++                ev = torch.cuda.Event()
++                ev.record(self._stream)
++            ev.synchronize()
 +        with self._lock:
-+            cand = [(layer_key, int(e)) for e in ids.cpu()
-+                    if int(self._mirror[layer_key, int(e)]) < 0]
++            cand = []
++            for e in ids.cpu():
++                e = int(e)
++                s = int(self._mirror[layer_key, e])
++                if s < 0:
++                    cand.append((layer_key, e))
++                else:
++                    # tick-refresh cached hits (same rationale as
++                    # force_promote: protect them from a racing manager
++                    # eviction while this layer's eager GEMMs read them)
++                    la, ex, _ = self._owner[s]
++                    self._owner[s] = (la, ex, self._tick)
 +            if not cand:
 +                return 0
-+            slots = self._take_slots_batch(len(cand))
-+            plan = []
-+            for (li, ei), slot in zip(cand, slots):
-+                self._owner[slot] = (li, ei, self._tick)
-+                with torch.cuda.stream(self._stream):
-+                    self.pool[slot].copy_(self._host[li][ei], non_blocking=True)
-+                plan.append((li, ei, slot))
++            # emergency=True: prefill MUST have its whole layer resident —
++            # an unfetched expert here zeroes contributions for EVERY token
++            # of the chunk (the existing pool-too-small warning path).
++            slots = self._take_slots_batch(len(cand), emergency=True)
++            plan = [((li, ei), slot) for (li, ei), slot in zip(cand, slots)]
 +            if not plan:
 +                return 0
++            # scan=True: prefill working sets are one-shot — the tiered
++            # store may warm FREE arena slots with them but must not evict
++            # its decode hot set (a long prefill would wipe the arena).
++            rows = self._store.rows_for([p for p, _ in plan], scan=True)
++            for ((li, ei), slot), row in zip(plan, rows):
++                self._owner[slot] = (li, ei, self._tick)
++                with torch.cuda.stream(self._stream):
++                    self.pool[slot].copy_(row, non_blocking=True)
 +            with torch.cuda.stream(self._stream):
 +                ev = torch.cuda.Event()
 +                ev.record(self._stream)
 +            ev.synchronize()
-+            for li, ei, slot in plan:
++            for (li, ei), slot in plan:
 +                self.slot_table[li, ei] = slot
 +                self._mirror[li, ei] = slot
 +                self._freq[li, ei] += 1.0
@@ -2856,16 +3142,17 @@ index 000000000..5261f931d
 +        slot/pool mutation, no H2D copy, no re-forward -> zero serving perturbation
 +        beyond the seen snapshot. _freq (all-routing) keeps accruing in _tick_once,
 +        so _need/_freq gives per-expert over-representation in low-confidence steps."""
-+        if not self._host:
++        if len(self._store) == 0:
 +            return 0
 +        main = torch.cuda.current_stream(self.dev)
-+        with torch.cuda.stream(self._stream):
-+            self._stream.wait_stream(main)
-+            self._seen_host.copy_(self.seen, non_blocking=True)
-+            ev = torch.cuda.Event()
-+            ev.record(self._stream)
-+        ev.synchronize()
-+        seen = self._seen_host.nonzero()
++        with self._snap_lock:
++            with torch.cuda.stream(self._stream):
++                self._stream.wait_stream(main)
++                self._seen_host.copy_(self.seen, non_blocking=True)
++                ev = torch.cuda.Event()
++                ev.record(self._stream)
++            ev.synchronize()
++            seen = self._seen_host.nonzero()
 +        if seen.numel() == 0:
 +            return 0
 +        lf = set(layers) if layers is not None else None
@@ -2882,6 +3169,61 @@ index 000000000..5261f931d
 +        cached = int((self._mirror >= 0).sum())
 +        return dict(slots=self.n_slots, cached=cached, tick=self._tick,
 +                    promoted=self._n_promoted, evicted=self._n_evicted)
++
++    # ---- per-step KPI (base cache) ----------------------------------------
++
++    def kpi_step(self, miss_pairs: int, replayed: bool) -> None:
++        """Fed by the runner once per executed step (TP-max miss count and
++        whether the step was replayed). The windowed replay rate is THE
++        pool-sizing KPI: replays double the step, so tok/s tracks the
++        fraction of zero-miss steps, which falls off a cliff with pool
++        coverage — NOT the (much flatter) token hit-rate. Runner thread
++        only, no lock needed."""
++        self._kpi_steps += 1
++        self._kpi_miss_pairs += miss_pairs
++        self._kpi_replays += int(replayed)
++        self._kpi_c_steps += 1
++        self._kpi_c_replays += int(replayed)
++        if _KPI_EVERY <= 0 or self._kpi_steps < _KPI_EVERY:
++            return
++        cov_total = max(len(self._store), 1) * self.E
++        unfixed = (f"; UNRESTORED experts: {self._kpi_unfixed} "
++                   "(pool too tight — quality at risk)"
++                   if self._kpi_unfixed else "")
++        if self._kpi_2nd:
++            unfixed += (f"; second-order replays: {self._kpi_2nd}")
++        if self._kpi_prefetched:
++            unfixed += (f"; draft-prefetched: {self._kpi_prefetched}")
++        logger.info(
++            "[%s] KPI: replay %.1f%% of last %d steps (avg %.1f missing "
++            "pairs/step; cumulative %.1f%% of %d) — pool %d slots = %.1f%% "
++            "of experts%s. Rising replay%% => raise the pool "
++            "(VLLM_MOE_W2_BASE_CACHE_GB) before touching anything else.",
++            self._tag, 100.0 * self._kpi_replays / self._kpi_steps,
++            self._kpi_steps, self._kpi_miss_pairs / self._kpi_steps,
++            100.0 * self._kpi_c_replays / max(self._kpi_c_steps, 1),
++            self._kpi_c_steps, self.n_slots,
++            100.0 * self.n_slots / cov_total, unfixed)
++        self._kpi_steps = self._kpi_miss_pairs = self._kpi_replays = 0
++        self._kpi_unfixed = 0
++        self._kpi_2nd = 0
++        self._kpi_prefetched = 0
++
++    def kpi_second_order(self, n: int, capped: bool = False) -> None:
++        """Runner reports n EXTRA fixed-point replays this step (a corrected
++        pass re-routed onto still-missing experts). Chronic second-order
++        replays = coverage too low for the model's routing volatility.
++        `capped`: the loop exited at its bound with misses STILL present —
++        the step's logits kept zeroed contributions (hard determinism/
++        quality breach; logged loudly)."""
++        self._kpi_2nd += n
++        if capped:
++            self._kpi_unfixed += 1
++            logger.warning(
++                "moe_w2 [%s]: fixed-point replay hit its cap with misses "
++                "remaining — this step kept zeroed expert contributions "
++                "(nondeterministic output). Pool badly undersized for this "
++                "workload.", self._tag)
 +
 +    # ---- observability ---------------------------------------------------
 +
@@ -2905,10 +3247,10 @@ index 000000000..5261f931d
 +        cached = int(cov.sum())
 +        # Under pipeline parallelism this rank hosts only ITS layers (local
 +        # layer_keys); normalize coverage by the layers actually staged here
-+        # (len(self._host)) rather than the full slot_table (n_layers*E), so the
-+        # reported %experts is honest per-rank. On TP/1-GPU every layer is hosted
-+        # on each rank -> len(self._host) == n_layers -> unchanged.
-+        total = max(len(self._host), 1) * self.E
++        # (len(self._store)) rather than the full slot_table (n_layers*E), so
++        # the reported %experts is honest per-rank. On TP/1-GPU every layer is
++        # hosted on each rank -> len(self._store) == n_layers -> unchanged.
++        total = max(len(self._store), 1) * self.E
 +        hr = 100.0 * self._win_hits / max(self._win_active, 1.0)
 +        hrd = 100.0 * self._win_hits_d / max(self._win_active_d, 1)
 +        logger.info(
@@ -2921,6 +3263,25 @@ index 000000000..5261f931d
 +        hist = " ".join(f"L{li}:{int(c)}" for li, c in enumerate(per_layer) if c)
 +        if hist:
 +            logger.info("[%s] experts per layer: %s", self._tag, hist)
++        if hasattr(self._store, "stats"):
++            st = self._store.stats()
++            if "arena_slots" in st:
++                # tiered backend: the fetch split ram-hit vs NVMe is the
++                # arena-coverage curve — the whole point of the tier.
++                tot = max(st["hit_rows"] + st["miss_rows"], 1)
++                logger.info(
++                    "[%s] tiered store: arena %d/%d slots | fetch rows "
++                    "%d ram + %d nvme (%.1f%% ram) | nvme %.2f GiB | "
++                    "call ms p50/p99: hit %.2f/%.2f, miss %.1f/%.1f",
++                    self._tag, st["arena_used"], st["arena_slots"],
++                    st["hit_rows"], st["miss_rows"],
++                    100.0 * st["hit_rows"] / tot,
++                    st["miss_bytes"] / 2**30,
++                    st["hit_p50_ms"], st["hit_p99_ms"],
++                    st["miss_p50_ms"], st["miss_p99_ms"])
++            else:
++                logger.info("[%s] pack store: %d row reads, %.2f GiB total",
++                            self._tag, st["reads"], st["read_bytes"] / 2**30)
 +        # CONCENTRATION study: compare how top-heavy low-confidence routing (_need,
 +        # from the gate via mark_need_only) is vs overall routing (_freq). If the
 +        # top few % of experts hold MOST of the _need mass while _freq is spread,
@@ -2953,6 +3314,8 @@ index 000000000..5261f931d
 +                    promoted_total=self._n_promoted,
 +                    evicted_total=self._n_evicted,
 +                    fp4_by_layer=self.precision_map())
++        if hasattr(self._store, "stats"):
++            snap["store"] = self._store.stats()
 +        try:  # atomic write so a tail/watcher never reads a half file
 +            tmp = path + ".tmp"
 +            with open(tmp, "w") as f:
@@ -3049,6 +3412,15 @@ index 000000000..5261f931d
 +    return _base_tol_dyn
 +
 +
++# Base-cache KPI cadence: every N runner steps log the per-STEP replay rate,
++# avg missing pairs/step and pool coverage. Always on (INFO, one line per
++# window) because pool sizing is the dominant base-cache perf knob and the
++# per-step replay rate is the number that actually predicts tok/s — token
++# hit-rate hides it (measured on DS4 1x5090: 96.5% token hit = replay almost
++# every step = 32.7 tok/s; 98.8% = large zero-miss fraction = 43.4 tok/s,
++# +33% from 3 GiB of pool). 0 disables the log (counters still kept).
++_KPI_EVERY = int(os.getenv("VLLM_MOE_W2_KPI_EVERY", "500"))
++
 +# Was VLLM_MOE_W2_DELTA_GB set explicitly (vs the "2.0" default)? Coexistence
 +# with the base cache must be opt-in: the historical base-cache configs never
 +# set DELTA_GB and must not silently grow an FP4 pool out of the default.
@@ -3086,16 +3458,30 @@ index 000000000..5261f931d
 +        # after logits to decide the fetch+replay.
 +        _BASE_TIER.miss_count = torch.zeros(1, dtype=torch.int32,
 +                                            device=_BASE_TIER.dev)
++        if os.getenv("VLLM_MOE_W2_PREFETCH", "0") == "1":
++            # in-graph routing log for the draft-affinity prefetcher:
++            # [n_layers, T_cap, K_cap] — T_cap covers small decode batches
++            # (seqs x MTP verify tokens); bigger steps log a prefix only.
++            _BASE_TIER.route_log = torch.zeros(
++                n_layers, int(os.getenv("VLLM_MOE_W2_PREFETCH_TCAP", "8")),
++                16, dtype=torch.int32, device=_BASE_TIER.dev)
++            logger.info("moe_w2 BASE cache: draft-affinity PREFETCH armed "
++                        "(route_log %s)", tuple(_BASE_TIER.route_log.shape))
 +        n_step = n_layers * 16      # decode working set (top-k<=16) headroom
 +        assert _BASE_TIER.n_slots >= max(2 * 256, n_step), (
 +            f"moe_w2 base cache: pool of {_BASE_TIER.n_slots} slots is smaller "
 +            f"than a step's worst-case working set; raise "
 +            f"VLLM_MOE_W2_BASE_CACHE_GB")
 +        _BASE_TIER.start()
++        cov = 100.0 * _BASE_TIER.n_slots / (n_layers * n_experts)
 +        logger.info("moe_w2 BASE cache: %d slots x %.2f MiB (%.1f GiB pool) — "
-+                    "2-bit base is HOST-resident",
++                    "2-bit base is HOST-resident; pool covers %.1f%% of "
++                    "%d experts. POOL SIZE IS THE DOMINANT PERF KNOB "
++                    "(replays are per-step: DS4 15%%->19%% coverage measured "
++                    "+33%% decode) — watch the '[base] KPI' line.",
 +                    _BASE_TIER.n_slots, _BASE_TIER.slot_bytes / 2**20,
-+                    _BASE_TIER.n_slots * _BASE_TIER.slot_bytes / 2**30)
++                    _BASE_TIER.n_slots * _BASE_TIER.slot_bytes / 2**30,
++                    cov, n_layers * n_experts)
 +    return _BASE_TIER
 +
 +
@@ -3554,6 +3940,634 @@ index 000000000..698df163f
 +    vals = levels[codes.long()]
 +    s = torch.exp2(scales.float() - 127.0).repeat_interleave(32, dim=-1)
 +    return vals * s
+diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_store.py b/vllm/model_executor/layers/quantization/utils/moe_w2_store.py
+new file mode 100644
+index 000000000..32d8ed0df
+--- /dev/null
++++ b/vllm/model_executor/layers/quantization/utils/moe_w2_store.py
+@@ -0,0 +1,622 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Host-side expert stores for the 2-bit MoE tiers (moe_w2_delta.DeltaTier).
++
++Three backends behind one tiny interface:
++
++  - PinnedHostStore: today's behaviour — per-layer [E, slot_bytes] host
++    tensors (pinned or pageable), rows handed to cudaMemcpyAsync directly.
++    Default; byte-identical to the pre-store code path.
++  - MmapPackStore (VLLM_MOE_W2_STORE_DIR=<dir>): rows live in a per-rank
++    PACK FILE on disk; reads are buffered preads -> pinned stage -> H2D.
++    The kernel page cache is the RAM tier (LRU for free), so host RAM holds
++    only the hot part of the base instead of the whole 73-190 GiB store —
++    and the pack doubles as a persistent quantization cache across boots (a
++    layer already in the pack skips D2H staging entirely).
++  - TieredPackStore (additionally VLLM_MOE_W2_BASE_RAM_GB=<GiB|auto>, base
++    tier only): a PINNED arena of the N most-recently-used rows over the
++    same pack. An arena hit is a zero-copy pinned view (H2D DMAs straight
++    from it — the exact PinnedHostStore hot path, no syscall, no memcpy);
++    a miss preadv's the row into the arena slot (the arena IS the bounce
++    buffer), buffered by default so the page cache serves as an
++    opportunistic L3 under the arena (VLLM_MOE_W2_TIER_DIRECT=1 for
++    O_DIRECT misses). The arena itself can never be reclaimed under
++    memory pressure — the hot fetch set stays RAM-fast even on hosts with
++    zero spare page cache. Policy is recency (LRU): freq-pinning lost on
++    live GLM traces (routing too flat — see GLM_RAMTIER_FINDINGS).
++
++Pack layout (per tier tag, per TP rank):
++    <dir>/<tag>.rank<r>of<w>.pack        raw rows, offset = (li*E+ei)*stride
++    <dir>/<tag>.rank<r>of<w>.json        sidecar: shapes + layers written
++
++`stride` is slot_bytes rounded up to 4 KiB so the SAME pack serves the
++O_DIRECT reader without a repack (O_DIRECT needs 4K-aligned offset/length/
++buffer; the pinned arena is page-aligned and stride-strided, so every row
++satisfies all three). Rows of layers not listed in the sidecar are holes
++(sparse file) and are never read.
++
++Concurrency: every read/write caller already holds the owning DeltaTier's
++lock (manager tick, force_promote, ensure_resident are serialized there),
++so the shared pinned stage buffer / arena bookkeeping need no lock of
++their own.
++"""
++
++import json
++import os
++import time
++from collections import deque
++from concurrent.futures import ThreadPoolExecutor
++
++import torch
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++_ALIGN = 4096
++_PACK_VERSION = 1
++
++
++def _rank_suffix() -> str:
++    """Pack-file name suffix identifying this rank's shard. TP rank always;
++    PP rank appended only under pipeline parallelism (PP ranks host disjoint
++    layers but share TP rank numbers — same-name packs would race on the
++    sidecar). Graceful fallback when torch.distributed is uninitialized
++    (single-GPU, tests, offline tools)."""
++    try:
++        from vllm.distributed import (get_pp_group,
++                                      get_tensor_model_parallel_rank,
++                                      get_tensor_model_parallel_world_size)
++        tp_rank = get_tensor_model_parallel_rank()
++        tp_world = get_tensor_model_parallel_world_size()
++        pp = get_pp_group()
++        pp_rank, pp_world = pp.rank_in_group, pp.world_size
++    except Exception:  # noqa: BLE001 - any uninitialized-state error
++        tp_rank, tp_world, pp_rank, pp_world = 0, 1, 0, 1
++    s = f"rank{tp_rank}of{tp_world}"
++    if pp_world > 1:
++        s += f".pp{pp_rank}of{pp_world}"
++    return s
++
++
++class PinnedHostStore:
++    """Per-layer host tensors, exactly the pre-store `_host` dict."""
++
++    resident = True
++
++    def __init__(self, slot_bytes: int, pinned: bool = True):
++        self.slot_bytes = slot_bytes
++        self._pinned = pinned
++        self._layers: dict[int, torch.Tensor] = {}
++
++    def __contains__(self, layer_key: int) -> bool:
++        return layer_key in self._layers
++
++    def __len__(self) -> int:
++        return len(self._layers)
++
++    def add_layer(self, layer_key: int, parts) -> None:
++        E = parts[0].shape[0]
++        host = torch.empty(E, self.slot_bytes, dtype=torch.uint8,
++                           pin_memory=self._pinned)
++        off = 0
++        for t in parts:
++            host[:, off:off + t.shape[1]].copy_(t, non_blocking=False)
++            off += t.shape[1]
++        assert off == self.slot_bytes, (off, self.slot_bytes)
++        self._layers[layer_key] = host
++
++    def rows_for(self, pairs, scan: bool = False) -> list[torch.Tensor]:
++        """Host rows for [(layer, expert), ...]; zero-copy pinned views.
++        `scan` (a prefill-sized one-shot batch) only matters for the
++        tiered backend's arena policy — ignored here."""
++        return [self._layers[li][ei] for li, ei in pairs]
++
++    def release(self) -> None:
++        self._layers = {}
++
++
++class MmapPackStore:
++    """Rows in an on-disk pack file; reads staged through a pinned buffer.
++
++    The store is append-only at load time and read-only afterwards. A layer
++    present in the sidecar is trusted (shape-checked) and its staging is
++    skipped on later boots — the persistent-quant-cache property.
++    """
++
++    resident = False
++
++    def __init__(self, dir_: str, tag: str, n_layers: int, n_experts: int,
++                 slot_bytes: int):
++        self.slot_bytes = slot_bytes
++        self.E = n_experts
++        self.n_layers = n_layers
++        self.stride = (slot_bytes + _ALIGN - 1) // _ALIGN * _ALIGN
++        os.makedirs(dir_, exist_ok=True)
++        base = f"{tag}.{_rank_suffix()}"
++        self.path = os.path.join(dir_, base + ".pack")
++        self._sidecar_path = os.path.join(dir_, base + ".json")
++        self._meta = dict(version=_PACK_VERSION, tag=tag, E=n_experts,
++                          n_layers=n_layers, slot_bytes=slot_bytes,
++                          stride=self.stride, layers=[])
++        if os.path.exists(self._sidecar_path):
++            try:
++                with open(self._sidecar_path) as f:
++                    old = json.load(f)
++                match = all(old.get(k) == self._meta[k] for k in
++                            ("version", "E", "slot_bytes", "stride"))
++                if match:
++                    self._meta["layers"] = sorted(
++                        int(li) for li in old.get("layers", []))
++                else:
++                    logger.warning(
++                        "moe_w2 store: pack %s shape mismatch "
++                        "(have %s, want %s) — rebuilding", self.path,
++                        {k: old.get(k) for k in ("E", "slot_bytes", "stride")},
++                        {k: self._meta[k] for k in ("E", "slot_bytes",
++                                                    "stride")})
++            except (OSError, ValueError, json.JSONDecodeError) as e:
++                logger.warning("moe_w2 store: unreadable sidecar %s (%s) — "
++                               "rebuilding", self._sidecar_path, e)
++        self._present = set(self._meta["layers"])
++        size = self.n_layers * self.E * self.stride
++        flags = os.O_RDWR | os.O_CREAT
++        self._fd = os.open(self.path, flags, 0o644)
++        if os.fstat(self._fd).st_size < size:
++            os.ftruncate(self._fd, size)   # sparse until layers are written
++        # reusable pinned stage for reads (grown on demand; callers hold the
++        # tier lock, and the tier syncs its H2D copies before the next call,
++        # so reuse is safe).
++        self._stage = torch.empty(0, slot_bytes, dtype=torch.uint8,
++                                  pin_memory=True)
++        # write-side staging reused across layers (pageable [E, stride])
++        self._wbuf: torch.Tensor | None = None
++        self._pool = ThreadPoolExecutor(
++            max_workers=int(os.getenv("VLLM_MOE_W2_STORE_THREADS", "8")),
++            thread_name_prefix="moe-w2-store")
++        self._reads = 0
++        self._read_bytes = 0
++        self._read_s = 0.0
++        if self._present:
++            logger.info(
++                "moe_w2 store[%s]: pack %s has %d/%d layers — staging for "
++                "those layers will be SKIPPED (persistent quant cache)",
++                tag, self.path, len(self._present), n_layers)
++
++    # ---- staging (load time) ----------------------------------------
++
++    def __contains__(self, layer_key: int) -> bool:
++        return layer_key in self._present
++
++    def __len__(self) -> int:
++        return len(self._present)
++
++    def add_layer(self, layer_key: int, parts) -> None:
++        if layer_key in self._present:
++            return          # already packed on a previous boot
++        E = parts[0].shape[0]
++        assert E == self.E, (E, self.E)
++        if self._wbuf is None:
++            self._wbuf = torch.zeros(self.E, self.stride, dtype=torch.uint8)
++        off = 0
++        for t in parts:
++            self._wbuf[:, off:off + t.shape[1]].copy_(t, non_blocking=False)
++            off += t.shape[1]
++        assert off == self.slot_bytes, (off, self.slot_bytes)
++        mv = memoryview(self._wbuf.numpy()).cast("B")
++        base_off = layer_key * self.E * self.stride
++        written = 0
++        while written < len(mv):        # pwrite may be partial (>2 GiB rows)
++            written += os.pwrite(self._fd, mv[written:written + (1 << 30)],
++                                 base_off + written)
++        os.fdatasync(self._fd)
++        self._present.add(layer_key)
++        self._meta["layers"] = sorted(self._present)
++        tmp = self._sidecar_path + ".tmp"
++        with open(tmp, "w") as f:
++            json.dump(self._meta, f)
++        os.replace(tmp, self._sidecar_path)
++        if len(self._present) == self.n_layers:
++            self._wbuf = None       # all layers packed; drop write staging
++
++    # ---- reads (serve time) -----------------------------------------
++
++    def rows_for(self, pairs, scan: bool = False) -> list[torch.Tensor]:
++        """Pinned-stage rows for [(layer, expert), ...]. The returned views
++        alias the shared stage buffer: consume (issue H2D + sync) before the
++        next rows_for call — which every DeltaTier call site does.
++        `scan` is the tiered backend's arena discipline — ignored here.
++
++        Reads are buffered preads straight into the pinned stage: one
++        syscall per row (GIL released, kernel readahead at full drive
++        bandwidth) instead of mmap page-fault storms — measured 8x slower
++        via mmap on the DS4 PoC, ~100 x 70 KB faults per 6.75 MiB row. An
++        fadvise(WILLNEED) pass first lets the drive overlap the cold rows
++        of a batch; warm rows are page-cache memcpys — the cache IS the
++        RAM tier."""
++        n = len(pairs)
++        if self._stage.shape[0] < n:
++            self._stage = torch.empty(max(n, 2 * self._stage.shape[0]),
++                                      self.slot_bytes, dtype=torch.uint8,
++                                      pin_memory=True)
++        t0 = time.perf_counter()
++        offs = [(li * self.E + ei) * self.stride for li, ei in pairs]
++        for off in offs:
++            try:
++                os.posix_fadvise(self._fd, off, self.slot_bytes,
++                                 os.POSIX_FADV_WILLNEED)
++            except OSError:
++                break       # advisory only
++        stage_mv = memoryview(self._stage.numpy()).cast("B")
++
++        def _read_one(i_off):
++            i, off = i_off
++            row = stage_mv[i * self.slot_bytes:(i + 1) * self.slot_bytes]
++            done = 0
++            while done < self.slot_bytes:
++                got = os.preadv(self._fd, [row[done:]], off + done)
++                if got <= 0:
++                    raise IOError(f"moe_w2 pack short read @ {off + done} "
++                                  f"({self.path})")
++                done += got
++
++        # preadv releases the GIL: a pool turns both page-cache memcpys and
++        # cold NVMe reads into parallel work (single-threaded memcpy at
++        # ~6 GB/s made a 400 MB replay fetch cost ~70 ms — measured).
++        if n > 2:
++            list(self._pool.map(_read_one, enumerate(offs)))
++        else:
++            for pair in enumerate(offs):
++                _read_one(pair)
++        self._reads += n
++        self._read_bytes += n * self.slot_bytes
++        self._read_s += time.perf_counter() - t0
++        return [self._stage[i] for i in range(n)]
++
++    def release(self) -> None:
++        self._pool.shutdown(wait=False)
++        try:
++            os.close(self._fd)
++        except OSError:
++            pass
++        self._present = set()
++        self._stage = torch.empty(0, self.slot_bytes, dtype=torch.uint8)
++        self._wbuf = None
++
++    def stats(self) -> dict:
++        return dict(reads=self._reads, read_bytes=self._read_bytes,
++                    read_s=self._read_s)
++
++
++class TieredPackStore(MmapPackStore):
++    """Pinned-arena RAM tier over the pack file, O_DIRECT NVMe underneath.
++
++    The arena holds the `n_slots` most-recently-used rows in ONE pinned
++    allocation ([n_slots, stride]; page-aligned base + 4K stride = every
++    row O_DIRECT-legal). rows_for returns views INTO the arena:
++
++      - hit: zero-copy pinned view, H2D DMAs straight from it — the exact
++        PinnedHostStore hot path (no syscall, no memcpy — this is what
++        recovers the pack backend's measured -9%);
++      - miss: O_DIRECT preadv straight into the arena slot (the arena is
++        its own bounce buffer), evicting the least-recently-used slot not
++        referenced by the current batch. Host-only eviction is safe: the
++        GPU reads its pool copy, never the arena.
++
++    Miss reads are BUFFERED by default: the page cache then acts as an
++    opportunistic L3 under the arena — on a RAM-rich host an arena miss is
++    a page-cache memcpy, on a tight host the cache stays small and misses
++    degrade gracefully to NVMe reads, while the pinned arena floor (the
++    hot fetch set) can never be reclaimed either way. Measured on DS4
++    1x5090 (base 11 GiB, arena 20 GiB, same-night A/B): pinned 33.0 tok/s,
++    tiered-buffered 32.8 (PARITY — the pack backend without an arena sat
++    at 25.5), while pure O_DIRECT misses on the box's Gen3-x4-linked drive
++    (3.7 GB/s) cost -33%. VLLM_MOE_W2_TIER_DIRECT=1 forces O_DIRECT misses
++    (no cache growth, fully deterministic latency = raw drive speed).
++
++    SCAN RESISTANCE: a rows_for(..., scan=True) batch (ensure_resident,
++    i.e. prefill layer working sets) may fill FREE arena slots but never
++    evicts — a long-document prefill touching most experts once would
++    otherwise wipe the decode hot set (measured on GLM needle runs: arena
++    hit-rate halved). Scan misses beyond the free slots are served from
++    the parent's buffered stage. Decode fetches (force_promote, manager
++    _promote) insert/evict normally — the caller, not a batch-size
++    heuristic, decides: on GLM the decode replay fetch is routinely
++    100+ rows and a size threshold froze the arena (29->10 tok/s).
++    VLLM_MOE_W2_TIER_SCAN=0 disables the discipline entirely.
++
++    PREHEAT: the arena's key list (hot-first) is dumped to
++    <pack>.heat.json every 1024 fetch calls (async, off the fetch path);
++    on boot the previous hot set is read back into the arena
++    (VLLM_MOE_W2_TIER_PREHEAT=0 to skip) so the first requests after a
++    restart start from RAM instead of paying the NVMe warmup.
++
++    View-lifetime contract (same as the parent's stage): consume the
++    returned rows (issue H2D + sync) before the next rows_for call —
++    every DeltaTier call site does, under the tier lock. Slots referenced
++    by the CURRENT batch are never evicted within it; a batch larger than
++    the whole arena overflows into the parent's buffered stage (correct,
++    logged, expected only for absurdly small arenas).
++    """
++
++    def __init__(self, dir_: str, tag: str, n_layers: int, n_experts: int,
++                 slot_bytes: int, ram_gb: float):
++        super().__init__(dir_, tag, n_layers, n_experts, slot_bytes)
++        self.n_arena = max(int(ram_gb * 2**30) // self.stride, 16)
++        self._arena = torch.empty(self.n_arena, self.stride,
++                                  dtype=torch.uint8, pin_memory=True)
++        assert self._arena.data_ptr() % _ALIGN == 0, "pinned base unaligned?"
++        self._arena_mv = memoryview(self._arena.numpy()).cast("B")
++        self._pos: dict[tuple[int, int], int] = {}     # (li,ei) -> slot
++        self._owner_pair: list = [None] * self.n_arena
++        self._last = [0] * self.n_arena                # recency clock stamps
++        self._clock = 0
++        self._free = list(range(self.n_arena))
++        # Miss-read mode: buffered (default; page cache = opportunistic L3)
++        # or O_DIRECT (deterministic, bypasses the cache). The O_DIRECT fd
++        # is separate; the parent's buffered fd keeps serving writes
++        # (add_layer) and stage-overflow reads.
++        self.direct = os.getenv("VLLM_MOE_W2_TIER_DIRECT", "0") == "1"
++        self._dfd = (os.open(self.path, os.O_RDONLY | os.O_DIRECT)
++                     if self.direct else -1)
++        self.scan_enabled = os.getenv("VLLM_MOE_W2_TIER_SCAN", "1") == "1"
++        # fetch metrics (read by DeltaTier._log_summary/_dump)
++        self._hit_rows = 0
++        self._miss_rows = 0
++        self._miss_bytes = 0
++        self._lat_hit_ms = deque(maxlen=2048)    # pure arena-hit calls
++        self._lat_miss_ms = deque(maxlen=2048)   # calls with >=1 NVMe row
++        self._calls = 0
++        self._heat_path = self.path + ".heat.json"
++        if os.getenv("VLLM_MOE_W2_TIER_PREHEAT", "1") == "1":
++            self._preheat()
++
++    # -- internals ------------------------------------------------------
++
++    def _read_row(self, slot: int, off: int) -> None:
++        """One row read from the pack into arena slot `slot` (thread-pool
++        body). O_DIRECT mode reads the full stride (offset/length/buffer
++        all 4K-aligned by construction); buffered mode reads just
++        slot_bytes through the page cache."""
++        row = self._arena_mv[slot * self.stride:(slot + 1) * self.stride]
++        fd, want = ((self._dfd, self.stride) if self.direct
++                    else (self._fd, self.slot_bytes))
++        done = 0
++        while done < want:
++            got = os.preadv(fd, [row[done:want]], off + done)
++            if got <= 0:
++                raise IOError(f"moe_w2 pack short read @ {off + done} "
++                              f"({self.path})")
++            done += got
++
++    def _evict_order(self, busy: set) -> list:
++        """Slot ids coldest-first, skipping the current batch's slots."""
++        order = sorted(range(self.n_arena), key=self._last.__getitem__)
++        return [s for s in order if s not in busy]
++
++    def _dump_heat(self, keys: list) -> None:
++        """Persist the arena's hot set (async, pool thread). Best-effort:
++        a missed dump only costs preheat freshness."""
++        try:
++            tmp = self._heat_path + ".tmp"
++            with open(tmp, "w") as f:
++                json.dump(dict(version=1, keys=keys), f)
++            os.replace(tmp, self._heat_path)
++        except OSError as e:
++            logger.warning_once("moe_w2 tiered store: heat dump failed: %s",
++                                e)
++
++    def _preheat(self) -> None:
++        """Refill the arena with the previous run's hot set (boot time,
++        before serving — no locking needed). Any failure leaves the arena
++        empty and serving proceeds with a cold arena."""
++        try:
++            with open(self._heat_path) as f:
++                keys = [tuple(k) for k in json.load(f).get("keys", [])]
++        except (OSError, ValueError, json.JSONDecodeError):
++            return
++        keys = [k for k in dict.fromkeys(keys)          # dedupe, keep order
++                if k[0] in self._present and 0 <= k[1] < self.E]
++        keys = keys[:self.n_arena]
++        if not keys:
++            return
++        t0 = time.perf_counter()
++        try:
++            fills = [(i, (li * self.E + ei) * self.stride)
++                     for i, (li, ei) in enumerate(keys)]
++            list(self._pool.map(lambda p: self._read_row(p[0], p[1]), fills))
++            for i, k in enumerate(keys):
++                self._pos[k] = i
++                self._owner_pair[i] = k
++                self._last[i] = len(keys) - i      # heat order = recency
++            self._free = list(range(len(keys), self.n_arena))
++            self._clock = len(keys) + 1
++            logger.info(
++                "moe_w2 tiered store: arena PREHEATED — %d rows "
++                "(%.1f GiB) from %s in %.1f s",
++                len(keys), len(keys) * self.stride / 2**30,
++                self._heat_path, time.perf_counter() - t0)
++        except Exception as e:  # noqa: BLE001 - preheat must not kill boot
++            logger.warning("moe_w2 tiered store: preheat failed (%s) — "
++                           "starting cold", e)
++            self._pos = {}
++            self._owner_pair = [None] * self.n_arena
++            self._last = [0] * self.n_arena
++            self._free = list(range(self.n_arena))
++            self._clock = 0
++
++    # -- reads ----------------------------------------------------------
++
++    def rows_for(self, pairs, scan: bool = False) -> list[torch.Tensor]:
++        t0 = time.perf_counter()
++        self._clock += 1
++        self._calls += 1
++        n = len(pairs)
++        # Scan resistance: a prefill batch (caller-flagged) may consume
++        # free slots but never evicts (see class docstring) — its overflow
++        # reads go via the stage and leave the decode hot set alone.
++        scan = scan and self.scan_enabled
++        out: list = [None] * n
++        busy: set = set()
++        miss_idx: list[int] = []
++        # pass 1: arena hits (and intra-batch duplicates via _pos updates)
++        for i, (li, ei) in enumerate(pairs):
++            s = self._pos.get((li, ei))
++            if s is not None:
++                out[i] = s
++                self._last[s] = self._clock
++                busy.add(s)
++            else:
++                miss_idx.append(i)
++        # pass 2: place misses — free slots, then LRU eviction (non-scan)
++        evict_order = None
++        ev_i = 0
++        overflow: list[int] = []
++        placed: list[tuple[int, int, int]] = []   # (idx, slot, offset)
++        for i in miss_idx:
++            li, ei = pairs[i]
++            s = self._pos.get((li, ei))
++            if s is not None:          # duplicate earlier in this batch
++                out[i] = s
++                busy.add(s)
++                continue
++            if self._free:
++                slot = self._free.pop()
++            elif scan:
++                overflow.append(i)         # scans never evict
++                continue
++            else:
++                if evict_order is None:
++                    evict_order = self._evict_order(busy)
++                while ev_i < len(evict_order) \
++                        and evict_order[ev_i] in busy:
++                    ev_i += 1
++                if ev_i >= len(evict_order):
++                    overflow.append(i)     # batch > arena; stage fallback
++                    continue
++                slot = evict_order[ev_i]
++                ev_i += 1
++                old = self._owner_pair[slot]
++                if old is not None:
++                    del self._pos[old]
++            self._pos[(li, ei)] = slot
++            self._owner_pair[slot] = (li, ei)
++            self._last[slot] = self._clock
++            busy.add(slot)
++            out[i] = slot
++            placed.append((i, slot, (li * self.E + ei) * self.stride))
++        # pass 3: parallel fills (the link saturates at low QD for
++        # multi-MiB rows; the pool mainly overlaps syscall latency and,
++        # in buffered mode, parallelizes page-cache memcpys)
++        if placed:
++            if not self.direct:
++                for _, _, off in placed:
++                    try:
++                        os.posix_fadvise(self._fd, off, self.slot_bytes,
++                                         os.POSIX_FADV_WILLNEED)
++                    except OSError:
++                        break       # advisory only
++            if len(placed) > 2:
++                list(self._pool.map(
++                    lambda p: self._read_row(p[1], p[2]), placed))
++            else:
++                for p in placed:
++                    self._read_row(p[1], p[2])
++        # overflow rows (scan discipline, or arena smaller than one batch):
++        # parent's buffered stage
++        stage_rows: dict[int, torch.Tensor] = {}
++        if overflow:
++            if not scan:
++                logger.warning(
++                    "moe_w2 tiered store: batch of %d rows exceeds the "
++                    "arena (%d slots) — %d rows served via buffered stage; "
++                    "raise VLLM_MOE_W2_BASE_RAM_GB", n, self.n_arena,
++                    len(overflow))
++            srows = MmapPackStore.rows_for(
++                self, [pairs[i] for i in overflow])
++            stage_rows = dict(zip(overflow, srows))
++        # metrics + result assembly
++        n_miss = len(placed) + len(overflow)
++        self._hit_rows += n - n_miss
++        self._miss_rows += n_miss
++        self._miss_bytes += n_miss * self.stride
++        dt_ms = (time.perf_counter() - t0) * 1e3
++        (self._lat_miss_ms if n_miss else self._lat_hit_ms).append(dt_ms)
++        if placed and self._calls % 1024 == 0:
++            keys = sorted(self._pos, key=lambda k: self._last[self._pos[k]],
++                          reverse=True)
++            self._pool.submit(self._dump_heat, [list(k) for k in keys])
++        return [stage_rows[i] if out[i] is None
++                else self._arena[out[i], :self.slot_bytes]
++                for i in range(n)]
++
++    def release(self) -> None:
++        if self._dfd >= 0:
++            try:
++                os.close(self._dfd)
++            except OSError:
++                pass
++        self._pos = {}
++        self._owner_pair = []
++        self._free = []
++        self._arena_mv = None
++        self._arena = torch.empty(0, dtype=torch.uint8)
++        super().release()
++
++    def stats(self) -> dict:
++        def pct(d, q):
++            if not d:
++                return 0.0
++            v = sorted(d)
++            return v[min(int(len(v) * q), len(v) - 1)]
++        st = super().stats()
++        st.update(
++            arena_slots=self.n_arena,
++            arena_used=self.n_arena - len(self._free),
++            hit_rows=self._hit_rows,
++            miss_rows=self._miss_rows,
++            miss_bytes=self._miss_bytes,
++            hit_p50_ms=pct(self._lat_hit_ms, 0.50),
++            hit_p99_ms=pct(self._lat_hit_ms, 0.99),
++            miss_p50_ms=pct(self._lat_miss_ms, 0.50),
++            miss_p99_ms=pct(self._lat_miss_ms, 0.99),
++        )
++        return st
++
++
++def make_store(tag: str, n_layers: int, n_experts: int, slot_bytes: int,
++               pinned: bool):
++    """Store factory: pack-file backends when VLLM_MOE_W2_STORE_DIR is set
++    (plus a pinned arena for the BASE tier when VLLM_MOE_W2_BASE_RAM_GB
++    is set), else the classic pinned/pageable host store. Env read at call
++    time so tests can toggle backends without reimporting the module."""
++    dir_ = os.getenv("VLLM_MOE_W2_STORE_DIR", "").strip()
++    if not dir_:
++        return PinnedHostStore(slot_bytes, pinned=pinned)
++    ram_raw = os.getenv("VLLM_MOE_W2_BASE_RAM_GB", "").strip().lower()
++    if tag == "base" and ram_raw not in ("", "0", "0.0"):
++        stride = (slot_bytes + _ALIGN - 1) // _ALIGN * _ALIGN
++        pack_gib = n_layers * n_experts * stride / 2**30
++        ram_gb = 0.25 * pack_gib if ram_raw == "auto" else float(ram_raw)
++        store = TieredPackStore(dir_, tag, n_layers, n_experts, slot_bytes,
++                                ram_gb)
++        logger.info(
++            "moe_w2 store[%s]: TIERED backend %s — pinned arena %.1f GiB "
++            "(%d slots, %.0f%% of the %.1f GiB pack) + %s NVMe misses",
++            tag, store.path, store.n_arena * store.stride / 2**30,
++            store.n_arena, 100.0 * store.n_arena / (n_layers * n_experts),
++            pack_gib, "O_DIRECT" if store.direct else "buffered")
++        if store.n_arena < 2 * n_experts:
++            logger.warning(
++                "moe_w2 store[%s]: arena of %d slots is smaller than one "
++                "prefill layer's worst case (2*E=%d) — expect stage "
++                "overflows; raise VLLM_MOE_W2_BASE_RAM_GB",
++                tag, store.n_arena, 2 * n_experts)
++        return store
++    store = MmapPackStore(dir_, tag, n_layers, n_experts, slot_bytes)
++    logger.info(
++        "moe_w2 store[%s]: PACK-FILE backend %s (slot %.2f MiB, "
++        "stride %d, %d layers x %d experts; host RAM tier = page cache)",
++        tag, store.path, slot_bytes / 2**20, store.stride, n_layers,
++        n_experts)
++    return store
 diff --git a/vllm/model_executor/layers/quantization/utils/prefill_timers.py b/vllm/model_executor/layers/quantization/utils/prefill_timers.py
 new file mode 100644
 index 000000000..fd83f500b
@@ -5506,7 +6520,7 @@ index dad1777b4..1f4b8b92b 100644
                              # Join offloader's copy stream after forward to avoid
                              # unjoined stream error. The last layer's start_prefetch
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index 74938a823..87f745bef 100644
+index 74938a823..583fa2e33 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
 @@ -4,6 +4,7 @@
@@ -5625,10 +6639,132 @@ index 74938a823..87f745bef 100644
  
          if is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
              # Run the encoder, just like we do with other multimodal inputs.
-@@ -4337,6 +4380,40 @@ class GPUModelRunner(
+@@ -4306,6 +4349,30 @@ class GPUModelRunner(
+             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
+         )
+ 
++        # moe_w2 draft-affinity PREFETCH (VLLM_MOE_W2_PREFETCH=1): before the
++        # forward, fold the PREVIOUS step's in-graph routing log into the
++        # token->experts table and prefetch this step's predicted experts on
++        # the tier's side stream. Under MTP this step's input ids ARE last
++        # step's sampled+draft tokens — the draft signal. Decode-shaped
++        # steps only (a prefill chunk would poison the table; prefill
++        # prefetches via ensure_resident anyway).
++        if moe_w2_gate is not None and not self.is_pooling_model:
++            try:
++                from vllm.model_executor.layers.quantization.utils import (
++                    moe_w2_delta as _w2d)
++                _btier = _w2d._BASE_TIER
++                if (
++                    _btier is not None
++                    and _btier.route_log is not None
++                    and max_num_scheduled_tokens <= 4
++                ):
++                    _n_real = min(
++                        scheduler_output.total_num_scheduled_tokens,
++                        _btier.route_log.shape[1])
++                    _btier.draft_prefetch(input_ids[:_n_real])
++            except Exception as e:  # noqa: BLE001 - never crash serving
++                logger.warning_once("moe_w2 draft prefetch skipped: %s", e)
++
+         # Run the model.
+         # Use persistent buffers for CUDA graphs.
+         # When spec decode is enabled, defer connector finalization
+@@ -4337,6 +4404,131 @@ class GPUModelRunner(
                  **model_kwargs,
              )
  
++        # moe_w2 BASE cache under PIPELINE parallelism: a miss is LOCAL to the
++        # stage — its desc kernels zeroed the missing pairs' contributions and
++        # bumped ITS miss counter, and the stage still holds this step's
++        # inputs (static graph buffers / intermediate_tensors). Correctness
++        # therefore needs only a SEGMENT re-run before the activations are
++        # consumed downstream — ~1/pp_size of a forward, unlike the gate's
++        # full-pipeline replay (the gate's signal, confidence, exists only at
++        # the logits; the base's signal is per-stage). No PP collective: each
++        # stage fixes its own segment; TP ranks WITHIN a stage decide via
++        # MAX-reduce and replay together (the segment contains TP
++        # collectives). Downstream stages never see the zeroed activations,
++        # so no cross-stage coordination is needed. KV rewrites in the replay
++        # are idempotent (same slot mapping, corrected values) — this covers
++        # MTP verify steps too, same as the inline TP path. PP==1 keeps the
++        # post-logits path below (unchanged).
++        if (
++            moe_w2_gate is not None
++            and get_pp_group().world_size > 1
++            and not self.is_pooling_model
++        ):
++            try:
++                from vllm.model_executor.layers.quantization.utils import (
++                    moe_w2_delta as _w2d)
++                _btier = _w2d._BASE_TIER
++                if _btier is not None:
++                    # open this step's pin scope: slots touched by any pass
++                    # below are ineligible for eviction until the next step
++                    _btier.step_begin()
++                    _miss = int(_btier.miss_count.item())
++                    _tp = get_tp_group()
++                    if _tp.world_size > 1:
++                        _t = torch.tensor([_miss], device=_btier.dev)
++                        torch.distributed.all_reduce(
++                            _t, op=torch.distributed.ReduceOp.MAX,
++                            group=_tp.device_group)
++                        _max_miss = int(_t.item())
++                    else:
++                        _max_miss = _miss
++                    if _miss > 0:
++                        _btier.force_promote(max_promote=None)
++                    _btier.kpi_step(
++                        _max_miss, _max_miss > _w2d.base_miss_tol())
++                    # Replay to a FIXED POINT (bounded): the corrected early
++                    # layers can re-route later layers to experts the first
++                    # pass never fetched — those SECOND-ORDER misses zero
++                    # contributions inside the replay itself, making logits
++                    # depend on pool content (measured as cross-request
++                    # greedy nondeterminism). Re-read the counter after each
++                    # replay; fetch + replay again until miss-free (typically
++                    # converges in one extra pass).
++                    _replays = 0
++                    while (_max_miss > _w2d.base_miss_tol()
++                           and _replays < 8):
++                        _replays += 1
++                        with set_forward_context(
++                            attn_metadata,
++                            self.vllm_config,
++                            num_tokens=num_tokens_padded,
++                            num_tokens_across_dp=num_tokens_across_dp,
++                            cudagraph_runtime_mode=cudagraph_mode,
++                            batch_descriptor=batch_desc,
++                            ubatch_slices=ubatch_slices_padded,
++                            slot_mapping=slot_mappings,
++                            skip_compiled=has_encoder_input,
++                        ):
++                            model_output = self._model_forward(
++                                input_ids=input_ids,
++                                positions=positions,
++                                intermediate_tensors=intermediate_tensors,
++                                inputs_embeds=inputs_embeds,
++                                **model_kwargs,
++                            )
++                        _miss = int(_btier.miss_count.item())
++                        if _tp.world_size > 1:
++                            _t = torch.tensor([_miss], device=_btier.dev)
++                            torch.distributed.all_reduce(
++                                _t, op=torch.distributed.ReduceOp.MAX,
++                                group=_tp.device_group)
++                            _max_miss = int(_t.item())
++                        else:
++                            _max_miss = _miss
++                        if _miss > 0:
++                            _btier.force_promote(max_promote=None)
++                    if _replays > 1:
++                        _btier.kpi_second_order(
++                            _replays - 1,
++                            capped=_max_miss > _w2d.base_miss_tol())
++            except Exception as e:  # noqa: BLE001 - never crash serving
++                logger.warning(
++                    "moe_w2 base-cache PP stage replay skipped: %s", e)
++
 +        # moe_w2 confidence gate under PP: cache this step's forward context so
 +        # the worker can drive a FULL second pipeline pass (gate_reforward) when
 +        # the last rank flags low confidence. A partial last-stage-only inline
@@ -5666,7 +6802,7 @@ index 74938a823..87f745bef 100644
          with record_function_or_nullcontext("gpu_model_runner: postprocess"):
              if self.use_aux_hidden_state_outputs:
                  # True when EAGLE 3 is used.
-@@ -4395,6 +4472,159 @@ class GPUModelRunner(
+@@ -4395,6 +4587,192 @@ class GPUModelRunner(
                  assert broadcasted is not None
                  logits = broadcasted["logits"]
  
@@ -5690,6 +6826,9 @@ index 74938a823..87f745bef 100644
 +                    moe_w2_delta as _w2d)
 +                _btier = _w2d._BASE_TIER
 +                if _btier is not None:
++                    # open this step's pin scope: slots touched by any pass
++                    # below are ineligible for eviction until the next step
++                    _btier.step_begin()
 +                    _miss = int(_btier.miss_count.item())
 +                    _tp = get_tp_group()
 +                    if _tp.world_size > 1:
@@ -5709,7 +6848,22 @@ index 74938a823..87f745bef 100644
 +                    # zeroed (bounded approximation, delta/gate class).
 +                    if _miss > 0:
 +                        _btier.force_promote(max_promote=None)
-+                    if _max_miss > _w2d.base_miss_tol():
++                    # KPI: per-step replay rate + missing pairs (windowed
++                    # INFO line) — the pool-sizing signal.
++                    _btier.kpi_step(
++                        _max_miss, _max_miss > _w2d.base_miss_tol())
++                    # Replay to a FIXED POINT (bounded): corrected early
++                    # layers can re-route later layers onto experts the
++                    # first pass never fetched; those second-order misses
++                    # zero contributions inside the replay itself and made
++                    # greedy output depend on pool content (cross-request
++                    # nondeterminism). Re-read the counter after each
++                    # replay; fetch + replay until miss-free (typically one
++                    # extra pass).
++                    _replays = 0
++                    while (_max_miss > _w2d.base_miss_tol()
++                           and _replays < 8):
++                        _replays += 1
 +                        with set_forward_context(
 +                            attn_metadata,
 +                            self.vllm_config,
@@ -5734,6 +6888,21 @@ index 74938a823..87f745bef 100644
 +                            hidden_states = _re_out
 +                        sample_hidden_states = hidden_states[logits_indices]
 +                        logits = self.model.compute_logits(sample_hidden_states)
++                        _miss = int(_btier.miss_count.item())
++                        if _tp.world_size > 1:
++                            _t = torch.tensor([_miss], device=logits.device)
++                            torch.distributed.all_reduce(
++                                _t, op=torch.distributed.ReduceOp.MAX,
++                                group=_tp.device_group)
++                            _max_miss = int(_t.item())
++                        else:
++                            _max_miss = _miss
++                        if _miss > 0:
++                            _btier.force_promote(max_promote=None)
++                    if _replays > 1:
++                        _btier.kpi_second_order(
++                            _replays - 1,
++                            capped=_max_miss > _w2d.base_miss_tol())
 +            except Exception as e:  # noqa: BLE001 - never crash serving
 +                logger.warning("moe_w2 base-cache miss replay skipped: %s", e)
 +
@@ -5826,7 +6995,7 @@ index 74938a823..87f745bef 100644
          self.execute_model_state = ExecuteModelState(
              scheduler_output,
              logits,
-@@ -4416,6 +4646,95 @@ class GPUModelRunner(
+@@ -4416,6 +4794,95 @@ class GPUModelRunner(
  
          return None
  
@@ -5922,7 +7091,7 @@ index 74938a823..87f745bef 100644
      def _input_fits_in_drafter(
          self, common_attn_metadata: CommonAttentionMetadata | None
      ) -> bool:
-@@ -4441,6 +4760,12 @@ class GPUModelRunner(
+@@ -4441,6 +4908,12 @@ class GPUModelRunner(
              # receive sampled token ids from the last PP rank.
              if self.use_async_scheduling and not get_pp_group().is_last_rank:
                  self._pp_receive_prev_sampled_token_ids_to_input_batch()
@@ -5935,7 +7104,7 @@ index 74938a823..87f745bef 100644
              # In case of PP with kv transfer, we need to pass through the
              # kv_connector_output
              return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
-@@ -4605,6 +4930,23 @@ class GPUModelRunner(
+@@ -4605,6 +5078,23 @@ class GPUModelRunner(
              # tokens on the CPU, so they are run after bookkeeping.
              propose_draft_token_ids(valid_sampled_token_ids)
  
@@ -5959,7 +7128,7 @@ index 74938a823..87f745bef 100644
          # Finalize KV connector (wait_for_save + clear metadata) after
          # draft model runs. Deferred from target model forward to allow
          # draft model to also save its KV cache.
-@@ -4696,13 +5038,35 @@ class GPUModelRunner(
+@@ -4696,13 +5186,35 @@ class GPUModelRunner(
      def _pp_broadcast_prev_sampled_token_ids(
          self, sampled_token_ids: torch.Tensor
      ) -> None:
@@ -6000,7 +7169,7 @@ index 74938a823..87f745bef 100644
          # Skip for chunked prefill: sampled tokens are dummy
          # and will be discarded, no need to broadcast.
          if not self._is_all_reqs_chunked_prefill():
-@@ -4711,16 +5075,33 @@ class GPUModelRunner(
+@@ -4711,16 +5223,33 @@ class GPUModelRunner(
              )
  
      def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
@@ -6038,7 +7207,7 @@ index 74938a823..87f745bef 100644
  
          # construct `prev_req_id_to_index` here so `_prepare_input_ids`
          # can map req_id -> previous batch row
-@@ -4731,15 +5112,136 @@ class GPUModelRunner(
+@@ -4731,15 +5260,136 @@ class GPUModelRunner(
              if i in discard_req_indices_set:
                  continue
              prev_req_id_to_index[req_id] = i
@@ -6180,7 +7349,7 @@ index 74938a823..87f745bef 100644
      def take_draft_token_ids(self) -> DraftTokenIds | None:
          if not self.num_spec_tokens or not self._draft_token_req_ids:
              return None
-@@ -5209,6 +5711,22 @@ class GPUModelRunner(
+@@ -5209,6 +5859,22 @@ class GPUModelRunner(
                          )
                          eplb_models += 1
  
@@ -6203,7 +7372,7 @@ index 74938a823..87f745bef 100644
                  self._setup_eagle3_aux_hidden_state_outputs()
  
                  # Resolve the MoE model, unwrapping VLM wrappers if needed.
-@@ -5969,7 +6487,8 @@ class GPUModelRunner(
+@@ -5969,7 +6635,8 @@ class GPUModelRunner(
              else:
                  hidden_states = outputs
  
@@ -6213,7 +7382,7 @@ index 74938a823..87f745bef 100644
                  self.speculative_config.use_eagle()
                  or self.speculative_config.uses_draft_model()
                  or self.speculative_config.uses_extract_hidden_states()
-@@ -6875,8 +7394,9 @@ class GPUModelRunner(
+@@ -6875,8 +7542,9 @@ class GPUModelRunner(
          # because some of them change the threshold at init time.
          self.calculate_reorder_batch_threshold()
  
@@ -6225,7 +7394,7 @@ index 74938a823..87f745bef 100644
              self.speculative_config.use_eagle()
              or self.speculative_config.uses_draft_model()
          ):
-@@ -6929,7 +7449,8 @@ class GPUModelRunner(
+@@ -6929,7 +7597,8 @@ class GPUModelRunner(
          )
  
          # Initialize drafter's cudagraph dispatcher if using spec decode.
