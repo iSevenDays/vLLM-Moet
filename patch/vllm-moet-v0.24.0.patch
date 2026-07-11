@@ -1045,7 +1045,7 @@ index 7cdb04c..6481313 100644
          assert self.moe_kernel is not None
          return self.moe_kernel.apply(
 diff --git a/vllm/model_executor/layers/quantization/modelopt.py b/vllm/model_executor/layers/quantization/modelopt.py
-index d51a2dd..322e29c 100644
+index d51a2dd..31cfb43 100644
 --- a/vllm/model_executor/layers/quantization/modelopt.py
 +++ b/vllm/model_executor/layers/quantization/modelopt.py
 @@ -1,6 +1,7 @@
@@ -1172,7 +1172,7 @@ index d51a2dd..322e29c 100644
          raise ValueError(
              f"{self.__class__.__name__} uses the new modular kernel initialization "
              "logic. This function should not be called."
-@@ -1548,10 +1644,40 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
+@@ -1548,10 +1644,49 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
          )
          layer.register_parameter("w2_input_scale", w2_input_scale)
  
@@ -1182,12 +1182,18 @@ index d51a2dd..322e29c 100644
 +        # process_weights_after_loading. Mutating .data keeps the vLLM
 +        # parameter classes and their loader attributes intact (scale_2 /
 +        # input_scale are tiny and stay put).
++        # Loader-level skip first: a layer the pack store already serves
++        # (boot-from-pack sidecar hit) needs NO checkpoint staging at all —
++        # plan_pack_skip stubs the big params and disarms their loaders,
++        # removing both the ~0.5 TB host-RAM transient and the staged
++        # copies (the intermittent-OOM / slow-boot root cause on GLM TP2).
 +        from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
 +        if moe_w2_cubit.is_w2_layer(getattr(layer, "layer_name", "")):
-+            for pname in ("w13_weight", "w13_weight_scale",
-+                          "w2_weight", "w2_weight_scale"):
-+                p_ = getattr(layer, pname)
-+                p_.data = p_.data.cpu()
++            if not moe_w2_cubit.plan_pack_skip(layer):
++                for pname in ("w13_weight", "w13_weight_scale",
++                              "w2_weight", "w2_weight_scale"):
++                    p_ = getattr(layer, pname)
++                    p_.data = p_.data.cpu()
 +
      def process_weights_after_loading(self, layer: RoutedExperts) -> None:
          """
@@ -1204,7 +1210,10 @@ index d51a2dd..322e29c 100644
 +        if moe_w2_cubit.is_w2_layer(getattr(layer, "layer_name", "")):
 +            from vllm.model_executor.layers.fused_moe.config import (
 +                FUSED_MOE_UNQUANTIZED_CONFIG)
-+            key = len(moe_w2_cubit._LAYERS)
++            # the CREATE-time counter when the loader-skip planner ran
++            # (identical build order); len(_LAYERS) for older paths
++            key = getattr(layer, "_moe_w2_create_key",
++                          len(moe_w2_cubit._LAYERS))
 +            moe_w2_cubit.build_layer_planes_nvfp4(layer, key)
 +            layer._moe_w2_key = key
 +            self._moe_w2_active = True
@@ -1213,7 +1222,7 @@ index d51a2dd..322e29c 100644
  
          # Use a single gscale for w13.
          if self.moe.is_act_and_mul and not torch.allclose(
-@@ -1655,6 +1781,19 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
+@@ -1655,6 +1790,19 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
          shared_experts: SharedExperts | None,
          shared_experts_input: torch.Tensor | None,
      ) -> torch.Tensor:
@@ -1233,7 +1242,7 @@ index d51a2dd..322e29c 100644
          assert not self.is_monolithic
          assert self.moe_kernel is not None
          return self.moe_kernel.apply(
-@@ -2473,6 +2612,9 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
+@@ -2473,6 +2621,9 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
  
          # Excluded layers
          if self.is_layer_excluded(prefix):
@@ -1322,10 +1331,10 @@ index 32a2d86..3e83d5a 100644
              mn=r,
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
-index 0000000..fe574ae
+index 0000000..6753062
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
-@@ -0,0 +1,1243 @@
+@@ -0,0 +1,1328 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Routed experts on 2-bit tensor-sym planes (cubit moe_w2) for the
@@ -1634,6 +1643,76 @@ index 0000000..fe574ae
 +        tier.add_layer_host_planes(layer_key, fp13, fp2)
 +
 +
++# Loader-level skip (the planes-cache/pack "v1.5 follow-up"): layers the
++# pack already serves never need their checkpoint experts in host RAM at
++# all. Decided at CREATE time (sidecar probe), executed by stubbing the big
++# params + no-op'ing their weight loaders — the vLLM loader then streams
++# past those tensors without allocating or copying. Measured motivation
++# (GLM-5.2 TP2 boot-from-pack): ~190 s of giant host allocations before the
++# shard read, 222 s of staged copies during it, and a ~0.5 TB transient
++# that intermittently OOM'd the box when boots overlapped.
++_n_created = 0
++_skip_logged = False
++
++
++def _noop_loader(*args, **kwargs):
++    """Weight-loader stand-in for pack-skipped params: the expert loading
++    loop calls with return_success=True and must see truthy, or it treats
++    the shard as unmapped and keeps probing replicas."""
++    return True if kwargs.get("return_success") else None
++
++
++def plan_pack_skip(layer) -> bool:
++    """CREATE-time twin of _try_skip_requant: assign this layer's key (the
++    same build-order counter process_weights_after_loading uses), probe the
++    pack sidecars, and when every serving store already holds the layer,
++    stub the four big params and disarm their loaders. Returns True when
++    the layer will boot from the pack with zero checkpoint staging."""
++    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
++    from vllm.model_executor.layers.quantization.utils.moe_w2_store import (
++        pack_has_layer)
++    global _n_created
++    key = _n_created
++    _n_created += 1
++    layer._moe_w2_create_key = key
++    if not (enabled() and moe_w2_delta.base_enabled()):
++        return False
++    try:
++        E, N13, K13h = layer.w13_weight.shape
++        _, N2, K2h = layer.w2_weight.shape
++    except Exception:  # noqa: BLE001 - unexpected layout: stage as before
++        return False
++    K13, K2 = K13h * 2, K2h * 2
++    c13len, s13len = N13 * K13 // 4, N13 * K13 // 32
++    c2len, s2len = N2 * K2 // 4, N2 * K2 // 32
++    n_keys = _layer_cutoff() + 1
++    if not pack_has_layer("base", key, n_keys, E,
++                          c13len + s13len + c2len + s2len):
++        return False
++    if moe_w2_delta.enabled():
++        # over-base FP4 need-pool: its slots carry their own scales
++        # ([fp4_13|sc13|fp4_2|sc2]) — mirror _fp4_tier_for_build's sizing
++        fslot = (N13 * K13 // 2 + s13len) + (N2 * K2 // 2 + s2len)
++        if not pack_has_layer("fp4", key, n_keys, E, fslot):
++            return False
++    for pname in ("w13_weight", "w13_weight_scale",
++                  "w2_weight", "w2_weight_scale"):
++        p = getattr(layer, pname)
++        p.data = torch.empty(0, dtype=p.data.dtype, device="cpu")
++        p.weight_loader = _noop_loader
++    layer._moe_w2_shapes = (E, N13, K13, N2, K2)
++    layer._moe_w2_pack_skip = True
++    global _skip_logged
++    if not _skip_logged:
++        _skip_logged = True
++        logger.info(
++            "moe_w2 LOADER-SKIP armed: pack-resident expert layers are "
++            "neither host-staged nor copied from the checkpoint "
++            "(first: key %d)", key)
++    logger.debug("moe_w2: layer key %d loader-skipped", key)
++    return True
++
++
 +def _try_skip_requant(layer, layer_key: int, E: int, N13: int, K13: int,
 +                      N2: int, K2: int, param_names) -> bool:
 +    """Boot-from-pack: when every host store this config serves from already
@@ -1854,6 +1933,21 @@ index 0000000..fe574ae
 +
 +    assert _ensure_ready(), "moe_w2 cubins missing"
 +    dev = torch.device("cuda")
++    if getattr(layer, "_moe_w2_pack_skip", False):
++        # loader-level skip: the params are 0-byte stubs (plan_pack_skip),
++        # shapes travel via the create-time stash. The pack MUST still
++        # serve the layer — there is no checkpoint copy to fall back to.
++        E, N13, K13, N2, K2 = layer._moe_w2_shapes
++        _require_kernels(K13, K2, need_w4=moe_w2_delta.enabled())
++        assert _try_skip_requant(
++            layer, layer_key, E, N13, K13, N2, K2,
++            ("w13_weight", "w13_weight_scale", "w2_weight",
++             "w2_weight_scale")), (
++            f"moe_w2: layer {layer_key} was loader-skipped on a pack "
++            f"sidecar hit but the pack no longer serves it (dir/sidecar "
++            f"changed mid-load?) — restart without the stale "
++            f"VLLM_MOE_W2_STORE_DIR state")
++        return
 +    w13 = layer.w13_weight.data                 # [E, 2I, H/2] u8 (cpu)
 +    s13 = layer.w13_weight_scale.data           # [E, 2I, H/16] e4m3
 +    s13_2 = layer.w13_weight_scale_2.data       # [E, 2] f32 (w1, w3)
@@ -5064,10 +5158,10 @@ index 0000000..4834c60
 +        _mark_broken(f"store failed: {e}")
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_store.py b/vllm/model_executor/layers/quantization/utils/moe_w2_store.py
 new file mode 100644
-index 0000000..41a5a05
+index 0000000..c0b9374
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_store.py
-@@ -0,0 +1,629 @@
+@@ -0,0 +1,656 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Host-side expert stores for the 2-bit MoE tiers (moe_w2_delta.DeltaTier).
@@ -5652,6 +5746,33 @@ index 0000000..41a5a05
 +            miss_p99_ms=pct(self._lat_miss_ms, 0.99),
 +        )
 +        return st
++
++
++def pack_has_layer(tag: str, layer_key: int, n_layers: int, n_experts: int,
++                   slot_bytes: int) -> bool:
++    """Sidecar-only presence probe: does the pack this config would serve
++    from already hold `layer_key`? Used at WEIGHT-CREATE time (before any
++    store exists) to decide the loader-level skip — a pack-resident layer's
++    checkpoint experts never need to be read into host staging at all.
++    Deliberately touches only the sidecar JSON (no fd, no arena, no pinned
++    allocs) and never raises."""
++    dir_ = os.getenv("VLLM_MOE_W2_STORE_DIR", "").strip()
++    if not dir_:
++        return False
++    try:
++        stride = (slot_bytes + _ALIGN - 1) // _ALIGN * _ALIGN
++        sidecar = os.path.join(dir_, f"{tag}.{_rank_suffix()}.json")
++        if not os.path.exists(sidecar):
++            return False
++        with open(sidecar) as f:
++            meta = json.load(f)
++        want = dict(version=_PACK_VERSION, E=n_experts,
++                    slot_bytes=slot_bytes, stride=stride)
++        if any(meta.get(k) != v for k, v in want.items()):
++            return False
++        return int(layer_key) in {int(li) for li in meta.get("layers", [])}
++    except Exception:  # noqa: BLE001 - probe only, staging path still works
++        return False
 +
 +
 +def make_store(tag: str, n_layers: int, n_experts: int, slot_bytes: int,
