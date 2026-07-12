@@ -1215,7 +1215,7 @@ index 27a85bb3d..88f310c4f 100755
      # JIT all the required kernels before model execution so there is no
      # JIT'ing in the hot-path. However, this warmup increases the engine
 diff --git a/vllm/model_executor/layers/attention/mla_attention.py b/vllm/model_executor/layers/attention/mla_attention.py
-index 051468ed1..33902056c 100644
+index 051468ed1..9e5cc3dad 100644
 --- a/vllm/model_executor/layers/attention/mla_attention.py
 +++ b/vllm/model_executor/layers/attention/mla_attention.py
 @@ -188,6 +188,7 @@ return curr_o @ W_O
@@ -1226,7 +1226,46 @@ index 051468ed1..33902056c 100644
  from abc import abstractmethod
  from dataclasses import dataclass
  from enum import Enum
-@@ -1001,12 +1002,21 @@ class MLAAttention(nn.Module, AttentionLayerBase):
+@@ -800,7 +801,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
+             else:
+                 mqa_q = (mqa_ql_nope, mqa_q_pe)
+             if self.impl.dcp_world_size > 1:
+-                assert not fp8_attention, "DCP not support fp8 kvcache now."
++                # Quantized KV caches are fine under DCP as long as the query
++                # that rides the all-gather stays bf16 (packed-cache sparse
++                # impls); impls that quantize the query itself are not wired.
++                assert not (fp8_attention and self.impl.supports_quant_query_input), (
++                    "DCP does not support fp8-quantized query input."
++                )
+                 # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
+                 mqa_q = torch.cat(mqa_q, dim=-1)
+                 # mqa_q do allgather in head dim.
+@@ -813,19 +819,22 @@ class MLAAttention(nn.Module, AttentionLayerBase):
+ 
+             # correct dcp attn_out with lse.
+             if self.impl.dcp_world_size > 1:
++                # Kernels differ in LSE convention: FA3-style impls emit
++                # natural-log LSE, the SM120 sparse kernels emit log2.
++                lse_base_e = not getattr(self.impl, "returns_base2_lse", False)
+                 if self.dcp_a2a:
+                     attn_out = dcp_a2a_lse_reduce(
+                         attn_out,
+                         lse,
+                         get_dcp_group(),
+-                        is_lse_base_on_e=True,
++                        is_lse_base_on_e=lse_base_e,
+                     )
+                 else:
+                     attn_out = cp_lse_ag_out_rs(
+                         attn_out,
+                         lse,
+                         get_dcp_group(),
+-                        is_lse_base_on_e=True,
++                        is_lse_base_on_e=lse_base_e,
+                     )
+ 
+             # v_up projection
+@@ -1001,12 +1010,21 @@ class MLAAttention(nn.Module, AttentionLayerBase):
          kv_cache_dtype = kv_cache_dtype_str_to_dtype(
              self.kv_cache_dtype, vllm_config.model_config
          )
@@ -1248,7 +1287,7 @@ index 051468ed1..33902056c 100644
          )
  
      def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):
-@@ -1424,6 +1434,13 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
+@@ -1424,6 +1442,13 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
          cache_config = vllm_config.cache_config
          model_config = vllm_config.model_config
  
@@ -1262,7 +1301,7 @@ index 051468ed1..33902056c 100644
          chunked_prefill_workspace_size = min(
              # Try for 8 full length request or at least 4 pages per-request
              max(
-@@ -1438,7 +1455,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
+@@ -1438,7 +1463,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
              # which would result in up-projected context being
              #   2*(192*128)*(64*1024) = 3gb
              # (assuming 192 QK head dim, 128 heads, and fp16)
@@ -3337,10 +3376,10 @@ index 000000000..43bad76a2
 +    return enabled() and _ensure_ready()
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
 new file mode 100644
-index 000000000..f7905fd40
+index 000000000..471f6a3b8
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
-@@ -0,0 +1,1783 @@
+@@ -0,0 +1,1876 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""FP4 delta tier for the 1-GPU 2-bit MoE path (quality restoration).
@@ -3668,6 +3707,7 @@ index 000000000..f7905fd40
 +        self._kpi_c_steps = 0
 +        self._kpi_c_replays = 0
 +        self._kpi_unfixed = 0     # experts replay could NOT restore (window)
++        self._kpi_deferred = 0    # slotless warm-up fetches (no reader; window)
 +        self._kpi_2nd = 0         # extra replays for second-order misses
 +        self._kpi_fp_giveup = 0   # steps that accepted second-order residue
 +        self._kpi_fp_resid = 0    # residual missing pairs in those steps
@@ -3677,6 +3717,13 @@ index 000000000..f7905fd40
 +        # to serve pass-k+1 (their seen marks are zeroed after each
 +        # snapshot) and ping-pong past the replay cap.
 +        self._step_pins: set[int] = set()
++        # Prefill-layer pin scope (ensure_resident): pins live only until
++        # the NEXT ensure_resident call (the layer's eager GEMMs are done
++        # by then). Step-scoped pins would accumulate the whole prefill
++        # working set (61 layers x routed >> pool) and starve every later
++        # layer's fetch; no scope at all lets the emergency eviction take
++        # the CURRENT layer's slots between its fetch and its GEMMs.
++        self._layer_pins: set[int] = set()
 +        # Residency coupling (BASE tier only, split-FP4 over the base
 +        # cache): the coexisting FP4 tier whose refinement slots read THIS
 +        # tier's base slots — its mapped experts are eviction-blocked here.
@@ -4002,6 +4049,8 @@ index 000000000..f7905fd40
 +                   | ((self._tick - tk) < 2))
 +        if self._step_pins:
 +            blocked[list(self._step_pins)] = True
++        if self._layer_pins:
++            blocked[list(self._layer_pins)] = True
 +        if bool(blocked.all()):
 +            return None
 +        key = self._freq[lic, eic].double()
@@ -4123,9 +4172,16 @@ index 000000000..f7905fd40
 +        of GIL time per fired step and starved the forward thread.
 +
 +        `emergency=True` (synchronous runner-thread callers only — never the
-+        background manager) adds a second eviction pass that relaxes the
-+        2-tick coldness bound when the first pass cannot cover k, keeping
-+        the seen-window exclusion. See the pass comments below.
++        background manager) adds two fallback eviction passes when the first
++        pass cannot cover k: pass 2 relaxes the 2-tick coldness bound but
++        keeps the seen-window exclusion; pass 3 also drops the seen window
++        (a recency HEURISTIC — with per-step manager passes the snapshot
++        holds one full step's routing, which under an MTP-verify gate storm
++        approaches the pool size and starved pass 2 into leaving zeroed
++        contributions: measured as corrupted math on DS4 three-tier,
++        tau→storm). Pass 3 keeps only the correctness contracts: step pins
++        (the CURRENT step's reads/fetches) and split-FP4 residency coupling.
++        See the pass comments below.
 +
 +        Eviction policy is unchanged: least-valuable slot by _POLICY key
 +        (need / freq / lru), restricted to slots whose owner is not active in
@@ -4152,34 +4208,54 @@ index 000000000..f7905fd40
 +            # inf sentinel below cannot be represented there (lru is not a
 +            # production policy for these tiers; surfaced by unit tests)
 +            key = tk.double()
-+        # Hard exclusions: free markers, owners active in the current seen
-+        # window (their slots may be read by this step's graph/replay), and
-+        # step-pinned slots (touched by any pass of the current step).
-+        blocked = (li < 0) | self._seen_host[lic, eic].to(torch.bool)
++        # Exclusion tiers. HARD (correctness): free markers, step-pinned
++        # slots (fetched or hit by a pass of the CURRENT step — a replay is
++        # about to read them), and the coupled-FP4 block added below. SOFT
++        # (recency heuristic): owners active in the seen window — likely to
++        # be routed again soon, but nothing in-flight reads them once the
++        # step that marked them is over and they are not step-pinned.
++        hard = torch.zeros_like(li, dtype=torch.bool)
++        hard |= (li < 0)
 +        if self._step_pins:
-+            blocked[list(self._step_pins)] = True
++            hard[list(self._step_pins)] = True
++        if self._layer_pins:
++            hard[list(self._layer_pins)] = True
++        blocked = hard | self._seen_host[lic, eic].to(torch.bool)
 +        # Residency coupling (split-FP4 over the base cache): never evict a
 +        # BASE slot whose expert is mapped in the coupled FP4 tier — the
 +        # split kernel reads its refinement against THESE base codes+scales.
-+        # The read is lockless (the other tier's host mirror, mutated under
-+        # ITS lock); a torn value is benign: dispatch requires residency in
-+        # BOTH slot tables, so a stale exclusion only delays one eviction
-+        # and a missed one downgrades that expert to a base miss -> the
-+        # standard fetch+replay restores it.
++        # HARD exclusion: these experts are exactly the gate's recent
++        # promotions (the quality-critical set), and in split mode a
++        # base-evicted pair downgrades to a plain MISS — zeroed inside a
++        # gate replay (which never refetches). Measured as corrupted math
++        # on gate-fired tokens when this was soft. The cost is bounded by
++        # the (small) FP4 pool size. The mirror read is lockless (the other
++        # tier mutates it under ITS lock); a torn value is benign: dispatch
++        # requires residency in BOTH slot tables, so a stale exclusion only
++        # delays one eviction and a missed one downgrades that expert to a
++        # base miss -> the standard fetch+replay restores it.
 +        if self._coupled_fp4 is not None:
-+            blocked |= self._coupled_fp4._mirror[lic, eic] >= 0
++            cpl = self._coupled_fp4._mirror[lic, eic] >= 0
++            hard |= cpl
++            blocked |= cpl
 +        # Pass 1: only >=min_cold-tick-cold victims (never disturbs slots a
 +        # CONCURRENT in-flight graph might still read — the background
 +        # manager's constraint; speculative prefetchers pass a much higher
-+        # bound so they can never churn the hot set). Pass 2 (emergency):
-+        # the synchronous callers (force_promote / ensure_resident, runner
-+        # thread, no forward in flight) relax the coldness bound rather
-+        # than leave a missing expert UNRESTORED — a replay that keeps
-+        # zeroed contributions is a silent quality hit and a nondeterminism
-+        # source, strictly worse than evicting a warm-but-idle slot.
++        # bound so they can never churn the hot set). Passes 2-3
++        # (emergency): the synchronous callers (force_promote /
++        # ensure_resident, runner thread, no forward in flight) relax first
++        # the coldness bound, then the seen window, rather than leave a
++        # missing expert UNRESTORED — a replay that keeps zeroed
++        # contributions is a silent quality hit and a nondeterminism
++        # source, strictly worse than evicting a warm-but-idle slot. The
++        # seen window must be droppable: one step of an MTP-verify gate
++        # storm can mark nearly the whole pool (DS4: 3 tok x top-8 x 61
++        # layers vs an 11 GiB pool), and an all-blocked pass 2 silently
++        # zeroes hundreds of experts per step (measured: corrupted math).
 +        passes = [blocked | ((self._tick - tk) < min_cold)]
 +        if emergency:
 +            passes.append(blocked)
++            passes.append(hard)
 +        taken: set[int] = set()
 +        for ineligible in passes:
 +            need = k - len(out)
@@ -4244,7 +4320,25 @@ index 000000000..f7905fd40
 +        poll."""
 +        with self._lock:
 +            self._step_pins.clear()
++            self._layer_pins.clear()
 +        wake_all()
++
++    def step_end(self) -> None:
++        """Close this step's SEEN window (runner: after the replay loop /
++        the gate decision consumed it). `seen` must scope to ONE step: the
++        eviction exclusion and force_promote's hit-pinning derive from it,
++        and the old free-running manager implicitly kept it that narrow by
++        zeroing every ~20 ms of wall clock. Event-driven passes turned that
++        into "last 4 steps", so a PREFILL's marks (61 ensure_resident
++        layers, thousands of pairs) survived into the first decode step's
++        force_promote — which then pinned every hit slot, leaving eviction
++        NO victims (measured: [pool 2123, pinned 2123], hundreds of
++        unpromotable experts per step, corrupted first decode tokens).
++        Decode steps with misses are unaffected (force_promote already
++        zeroes after its snapshot); this closes the window for miss-free
++        and prefill steps. A mark lost to an in-flight scatter only delays
++        one lazy promotion (the manager's own idiom)."""
++        self.seen.zero_()
 +
 +    # ---- draft-affinity prefetch (VLLM_MOE_W2_PREFETCH=1) ------------------
 +
@@ -4354,7 +4448,8 @@ index 000000000..f7905fd40
 +            self._kpi_prefetched += len(plan)
 +        return len(plan)
 +
-+    def force_promote(self, layers=None, max_promote=None) -> int:
++    def force_promote(self, layers=None, max_promote=None,
++                      pin: bool = True) -> int:
 +        """Synchronously pull this step's COLD routed experts up to FP4, for a
 +        confidence-gated re-forward (directive 2 / Step B).
 +
@@ -4375,6 +4470,15 @@ index 000000000..f7905fd40
 +        Args:
 +            layers: optional iterable of layer keys to restrict to (default all).
 +            max_promote: optional cap on experts promoted this call.
++            pin: step-pin the touched slots (hits + fetches). Pass False
++                ONLY when no replay follows this call in the current step
++                (the runner's LAST fetch of the fixed-point loop): those
++                fetches serve future steps, and pinning them would grow
++                the step's pin set to the whole working set — on MTP
++                verify (3 pos x top-8 x 61 layers) that is the entire
++                14 GiB pool, leaving the eviction no victims (measured:
++                [pool 2123, pinned 2123], hundreds of unpromotable
++                experts, corrupted math).
 +        Returns:
 +            number of experts newly promoted to FP4.
 +        """
@@ -4418,7 +4522,8 @@ index 000000000..f7905fd40
 +            if bool(hit.any()):
 +                hs = slots[hit]
 +                self._owner_tick[hs] = self._tick
-+                self._step_pins.update(hs.tolist())
++                if pin:
++                    self._step_pins.update(hs.tolist())
 +            keep = torch.ones(seen.shape[0], dtype=torch.bool)
 +            if layer_filter is not None:
 +                lf = torch.zeros(self.n_layers, dtype=torch.bool)
@@ -4463,7 +4568,8 @@ index 000000000..f7905fd40
 +            rows = self._store.rows_for([p for p, _ in plan])
 +            for ((li, ei), slot), row in zip(plan, rows):
 +                self._own(slot, li, ei)
-+                self._step_pins.add(slot)
++                if pin:
++                    self._step_pins.add(slot)
 +                with torch.cuda.stream(self._stream):
 +                    self.pool[slot].copy_(row, non_blocking=True)
 +            with torch.cuda.stream(self._stream):
@@ -4477,18 +4583,33 @@ index 000000000..f7905fd40
 +            self._n_promoted += len(plan)
 +            self._win_promoted += len(plan)
 +        if len(plan) < len(cand):
-+            # QUALITY KPI: some of this step's missing experts got NO slot
-+            # (free list empty + every victim ineligible: seen-live or <2
-+            # ticks old). The mandatory replay then RE-ZEROES their
-+            # contributions — a silent quality drop even at MISS_TOL=0, and
-+            # (pool-content-dependent) a source of run-to-run greedy
-+            # nondeterminism. The fix is a bigger pool, not a knob.
-+            self._kpi_unfixed += len(cand) - len(plan)
-+            logger.warning_once(
-+                "moe_w2 [%s]: %d missing experts could not be promoted "
-+                "(pool too tight to evict) — replay keeps their zeroed "
-+                "contributions. Raise the pool GiB; occurrences counted "
-+                "in the KPI line.", self._tag, len(cand) - len(plan))
++            if not pin:
++                # No reader follows this call in the current step (see the
++                # pin doc): a slotless candidate is a DEFERRED warm-up
++                # fetch, not a quality event — the next step that routes it
++                # refetches under its own (pinned) mandatory pass. Expected
++                # whenever pool ~= one step's working set.
++                self._kpi_deferred += len(cand) - len(plan)
++            else:
++                # QUALITY KPI: some of this step's missing experts got NO
++                # slot (free list empty + every victim ineligible) and a
++                # replay WILL re-read the step — their contributions stay
++                # zeroed: a silent quality drop even at MISS_TOL=0, and
++                # (pool-content-dependent) a source of run-to-run greedy
++                # nondeterminism. The fix is a bigger pool, not a knob.
++                self._kpi_unfixed += len(cand) - len(plan)
++                npin = len(self._step_pins)
++                ncpl = (int((self._coupled_fp4._mirror[
++                    self._owner_li.clamp(min=0),
++                    self._owner_ei.clamp(min=0)] >= 0).sum())
++                        if self._coupled_fp4 is not None else 0)
++                logger.warning(
++                    "moe_w2 [%s]: %d missing experts could not be promoted "
++                    "(pool too tight to evict) — replay keeps their zeroed "
++                    "contributions. Raise the pool GiB; occurrences counted "
++                    "in the KPI line. [pool %d, pinned %d, fp4-coupled %d, "
++                    "free %d, wanted %d]", self._tag, len(cand) - len(plan),
++                    self.n_slots, npin, ncpl, len(self._free), len(cand))
 +        if _TRACE >= 2:
 +            logger.info("[%s] force-promote %d experts (gate)",
 +                        self._tag, len(plan))
@@ -4515,13 +4636,19 @@ index 000000000..f7905fd40
 +                ev.record(self._stream)
 +            ev.synchronize()
 +        with self._lock:
++            # open THIS layer's pin scope (releases the previous layer's —
++            # its GEMMs are done; see _layer_pins in __init__)
++            self._layer_pins.clear()
 +            slots = self._mirror[layer_key].long()[ids.cpu()]
 +            hit = slots >= 0
 +            if bool(hit.any()):
-+                # tick-refresh cached hits (same rationale as
-+                # force_promote: protect them from a racing manager
-+                # eviction while this layer's eager GEMMs read them)
-+                self._owner_tick[slots[hit]] = self._tick
++                # tick-refresh + LAYER-pin cached hits: the eager GEMMs
++                # read them right after this call, and the emergency
++                # eviction (this very call's fetch, pass 3) may otherwise
++                # take them — seen/coldness are soft exclusions there.
++                hs = slots[hit]
++                self._owner_tick[hs] = self._tick
++                self._layer_pins.update(hs.tolist())
 +            cand = [(layer_key, int(e)) for e in ids.cpu()[~hit].tolist()]
 +            if not cand:
 +                return 0
@@ -4538,6 +4665,7 @@ index 000000000..f7905fd40
 +            rows = self._store.rows_for([p for p, _ in plan], scan=True)
 +            for ((li, ei), slot), row in zip(plan, rows):
 +                self._own(slot, li, ei)
++                self._layer_pins.add(slot)
 +                with torch.cuda.stream(self._stream):
 +                    self.pool[slot].copy_(row, non_blocking=True)
 +            with torch.cuda.stream(self._stream):
@@ -4663,6 +4791,9 @@ index 000000000..f7905fd40
 +        unfixed = (f"; UNRESTORED experts: {self._kpi_unfixed} "
 +                   "(pool too tight — quality at risk)"
 +                   if self._kpi_unfixed else "")
++        if self._kpi_deferred:
++            unfixed += (f"; deferred warm-ups: {self._kpi_deferred} "
++                        "(benign; pool ~= step working set)")
 +        if self._kpi_2nd:
 +            unfixed += (f"; second-order replays: {self._kpi_2nd}")
 +        if self._kpi_fp_giveup:
@@ -4688,6 +4819,7 @@ index 000000000..f7905fd40
 +            100.0 * self.n_slots / cov_total, unfixed)
 +        self._kpi_steps = self._kpi_miss_pairs = self._kpi_replays = 0
 +        self._kpi_unfixed = 0
++        self._kpi_deferred = 0
 +        self._kpi_2nd = 0
 +        self._kpi_fp_giveup = 0
 +        self._kpi_fp_resid = 0
@@ -7070,10 +7202,123 @@ index 000000000..adf4754de
 +    torch.zeros(1, device="cuda")
 +    return _ensure_ready()
 diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
-index fe2b268cd..d56825ef8 100644
+index fe2b268cd..61663ec74 100644
 --- a/vllm/model_executor/layers/sparse_attn_indexer.py
 +++ b/vllm/model_executor/layers/sparse_attn_indexer.py
-@@ -340,6 +340,9 @@ def sparse_attn_indexer(
+@@ -27,6 +27,12 @@ from vllm.v1.attention.backends.mla.indexer import (
+     DeepseekV32IndexerMetadata,
+ )
+ from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
++from vllm.v1.attention.ops.dcp_sparse_topk import (
++    MAX_FP32_EXACT_ID,
++    dcp_gather_topk_scores,
++    dcp_local_pos_to_global,
++    dcp_merge_global_topk,
++)
+ from vllm.v1.worker.workspace import current_workspace_manager
+ 
+ logger = init_logger(__name__)
+@@ -78,6 +84,36 @@ def kv_cache_as_quant_view(
+     return kv_cache.unsqueeze(-2)
+ 
+ 
++def _dcp_merge_topk_into_buffer(
++    logits: torch.Tensor,
++    topk_indices: torch.Tensor,
++    interleave: int,
++    col_offset: torch.Tensor | None = None,
++) -> None:
++    """Lift local top-k winners to global ids and reduce across the DCP group.
++
++    ``topk_indices`` (int32, ``-1`` pad) hold *local-shard* positions and are
++    overwritten in place with the merged *global* top-k (identical on every
++    rank). ``col_offset`` rebases per-row positions into the shared prefill
++    logits workspace for the score gather; decode logits are already
++    request-relative.
++    """
++    from vllm.distributed.parallel_state import get_dcp_group
++
++    dcp_group = get_dcp_group()
++    scores = dcp_gather_topk_scores(logits, topk_indices, col_offset=col_offset)
++    global_ids = dcp_local_pos_to_global(
++        topk_indices,
++        dcp_group.world_size,
++        dcp_group.rank_in_group,
++        interleave,
++    )
++    merged = dcp_merge_global_topk(
++        global_ids, scores, topk_indices.shape[1], dcp_group
++    )
++    topk_indices.copy_(merged)
++
++
+ @eager_break_during_capture
+ def sparse_attn_indexer(
+     hidden_states: torch.Tensor,
+@@ -96,6 +132,8 @@ def sparse_attn_indexer(
+     topk_indices_buffer: torch.Tensor,
+     skip_k_cache_insert: bool,
+     use_fp4_cache: bool = False,
++    dcp_world_size: int = 1,
++    cp_kv_cache_interleave_size: int = 1,
+ ) -> torch.Tensor:
+     # careful! this will be None in dummy run
+     attn_metadata = get_forward_context().attn_metadata
+@@ -138,6 +176,8 @@ def sparse_attn_indexer(
+             topk_indices_buffer,
+             skip_k_cache_insert,
+             use_fp4_cache,
++            dcp_world_size,
++            cp_kv_cache_interleave_size,
+         )
+     attn_metadata_narrowed = attn_metadata[k_cache_prefix]
+     assert isinstance(attn_metadata_narrowed, DeepseekV32IndexerMetadata)
+@@ -190,6 +230,26 @@ def sparse_attn_indexer(
+             scales_spec,
+         )
+         for chunk in prefill_metadata.chunks:
++            num_chunk_rows = chunk.token_end - chunk.token_start
++            if dcp_world_size > 1 and chunk.total_seq_lens == 0:
++                # This rank's shard is empty for the whole chunk, but the
++                # cross-rank merge below is a collective: contribute an all
++                # invalid candidate list (buffer rows are already -1).
++                empty_logits = torch.full(
++                    (num_chunk_rows, 1),
++                    float("-inf"),
++                    dtype=torch.float32,
++                    device=q_quant.device,
++                )
++                _dcp_merge_topk_into_buffer(
++                    empty_logits,
++                    topk_indices_buffer[
++                        chunk.token_start : chunk.token_end, :topk_tokens
++                    ],
++                    cp_kv_cache_interleave_size,
++                )
++                continue
++
+             k_quant = k_quant_full[: chunk.total_seq_lens]
+             k_scale = k_scale_full[: chunk.total_seq_lens]
+ 
+@@ -255,6 +315,17 @@ def sparse_attn_indexer(
+                 topk_tokens,
+             )
+ 
++            if dcp_world_size > 1:
++                # Local winners -> global ids -> group-wide top-k. The score
++                # gather needs workspace columns, so rebase the per-request
++                # positions by each row's K start (cu_seqlen_ks).
++                _dcp_merge_topk_into_buffer(
++                    logits,
++                    topk_indices,
++                    cp_kv_cache_interleave_size,
++                    col_offset=chunk.cu_seqlen_ks,
++                )
++
+     if has_decode:
+         decode_metadata = attn_metadata_narrowed.decode
+         assert decode_metadata is not None
+@@ -340,6 +411,9 @@ def sparse_attn_indexer(
              and num_rows <= 32
              and logits.stride(0) % 4 == 0  # TMA 16-byte alignment
              and current_platform.has_device_capability(90)
@@ -7083,6 +7328,82 @@ index fe2b268cd..d56825ef8 100644
          )
          use_persistent_topk = current_platform.is_cuda() and topk_tokens in (
              512,
+@@ -384,6 +458,16 @@ def sparse_attn_indexer(
+                 topk_tokens,
+             )
+ 
++        if dcp_world_size > 1:
++            # Decode logits columns are local-shard positions per row; merge
++            # before the (optional) unpack so padded rows simply ride along
++            # with -inf scores and stay -1.
++            _dcp_merge_topk_into_buffer(
++                logits,
++                topk_indices,
++                cp_kv_cache_interleave_size,
++            )
++
+         if decode_metadata.requires_padding:
+             # if padded, we need to unpack
+             # the topk indices removing padded tokens
+@@ -415,6 +499,8 @@ def sparse_attn_indexer_fake(
+     topk_indices_buffer: torch.Tensor | None,
+     skip_k_cache_insert: bool,
+     use_fp4_cache: bool = False,
++    dcp_world_size: int = 1,
++    cp_kv_cache_interleave_size: int = 1,
+ ) -> torch.Tensor:
+     return topk_indices_buffer
+ 
+@@ -471,6 +557,30 @@ class SparseAttnIndexer(CustomOp):
+                 "the current vLLM environment."
+             )
+ 
++        # Decode context parallelism: the op scores the local KV shard only
++        # and merges per-rank top-k candidates across the DCP group.
++        try:
++            from vllm.distributed.parallel_state import get_dcp_group
++
++            self.dcp_world_size = get_dcp_group().world_size
++        except AssertionError:
++            self.dcp_world_size = 1
++        from vllm.config import get_current_vllm_config
++
++        self.cp_kv_cache_interleave_size = (
++            get_current_vllm_config().parallel_config.cp_kv_cache_interleave_size
++        )
++        if self.dcp_world_size > 1:
++            assert max_model_len < MAX_FP32_EXACT_ID, (
++                "DCP sparse-topk exchanges candidate ids as exact fp32 "
++                f"values, which caps max_model_len at {MAX_FP32_EXACT_ID}; "
++                f"got {max_model_len}."
++            )
++            assert not use_fp4_cache, (
++                "DCP for the DSA indexer is not wired up for the FP4 "
++                "indexer cache."
++            )
++
+     def forward_native(
+         self,
+         hidden_states: torch.Tensor,
+@@ -518,6 +628,8 @@ class SparseAttnIndexer(CustomOp):
+             self.topk_indices_buffer,
+             self.skip_k_cache_insert,
+             self.use_fp4_cache,
++            self.dcp_world_size,
++            self.cp_kv_cache_interleave_size,
+         )
+ 
+     def forward_xpu(
+@@ -537,6 +649,9 @@ class SparseAttnIndexer(CustomOp):
+         weights: torch.Tensor,
+     ):
+         assert not self.use_fp4_cache, "AMD platform doesn't support fp4 cache yet"
++        assert self.dcp_world_size == 1, (
++            "DCP is not supported by the ROCm sparse_attn_indexer path."
++        )
+         assert isinstance(q_quant, torch.Tensor), (
+             "AMD sparse_attn_indexer expects a single FP8 q_quant tensor"
+         )
 diff --git a/vllm/model_executor/models/deepseek_mtp.py b/vllm/model_executor/models/deepseek_mtp.py
 index 88f33ac02..546f92265 100644
 --- a/vllm/model_executor/models/deepseek_mtp.py
@@ -9328,10 +9649,24 @@ index 2a944d061..d4807a5f7 100644
              # fp8_ds_mla packed layout: 512 NoPE + 16 scales + 128 RoPE.
              return (num_blocks, block_size, 656)
 diff --git a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
-index d802f5688..d192d3aa3 100644
+index d802f5688..37dabd57d 100644
 --- a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
 +++ b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
-@@ -62,10 +62,10 @@ class FlashInferMLASparseSM120Impl(SparseMLAAttentionImpl[FlashInferMLASparseMet
+@@ -32,6 +32,13 @@ def _kv_scale_format_for_model(model_type: str | None) -> str:
+ class FlashInferMLASparseSM120Impl(SparseMLAAttentionImpl[FlashInferMLASparseMetadata]):
+     """SM120 FlashInfer sparse-MLA implementation."""
+ 
++    # DCP support: the SM120 sparse kernels emit a per-(token, head) LSE that
++    # the MLA layer merges across ranks. NOTE: the kernels store LSE in the
++    # log2 domain (log2f(sum) + max, sentinel -1e30 for empty rows); the
++    # merge must run with is_lse_base_on_e=False (see returns_base2_lse).
++    can_return_lse_for_decode: bool = True
++    returns_base2_lse: bool = True
++
+     def __init__(
+         self,
+         num_heads: int,
+@@ -62,10 +69,10 @@ class FlashInferMLASparseSM120Impl(SparseMLAAttentionImpl[FlashInferMLASparseMet
          self.scale = float(scale)
          self.num_kv_heads = num_kv_heads
          self.kv_cache_dtype = kv_cache_dtype
@@ -9344,7 +9679,7 @@ index d802f5688..d192d3aa3 100644
              )
  
          self.kv_lora_rank: int = mla_args["kv_lora_rank"]
-@@ -79,7 +79,12 @@ class FlashInferMLASparseSM120Impl(SparseMLAAttentionImpl[FlashInferMLASparseMet
+@@ -79,7 +86,12 @@ class FlashInferMLASparseSM120Impl(SparseMLAAttentionImpl[FlashInferMLASparseMet
              model_type = getattr(
                  vllm_config.model_config.hf_text_config, "model_type", None
              )
@@ -9358,10 +9693,16 @@ index d802f5688..d192d3aa3 100644
  
          # Skip-topk layers are built with indexer=None and get the shared
          # buffer via mla_args instead (cf. FLASHMLA_SPARSE).
-@@ -100,6 +105,31 @@ class FlashInferMLASparseSM120Impl(SparseMLAAttentionImpl[FlashInferMLASparseMet
+@@ -100,6 +112,37 @@ class FlashInferMLASparseSM120Impl(SparseMLAAttentionImpl[FlashInferMLASparseMet
          self.supports_quant_query_input = False
          self._workspace_buffer: torch.Tensor | None = None
  
++        # DCP: the shared topk buffer holds *global* positions merged by the
++        # indexer; forward_mqa filters them down to this rank's local slots.
++        self.cp_kv_cache_interleave_size = (
++            vllm_config.parallel_config.cp_kv_cache_interleave_size
++        )
++
 +    def do_kv_cache_update(
 +        self,
 +        kv_c_normed: torch.Tensor,
@@ -9390,6 +9731,311 @@ index d802f5688..d192d3aa3 100644
      def forward_mqa(
          self,
          q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+@@ -111,23 +154,43 @@ class FlashInferMLASparseSM120Impl(SparseMLAAttentionImpl[FlashInferMLASparseMet
+             q = torch.cat(q, dim=-1)
+ 
+         num_actual_toks = q.shape[0]
++        # Under DCP the MLA layer all-gathers q along the head dim, so this
++        # rank attends with every head over its local KV shard; the layer
++        # LSE-merges and reduce-scatters the partial outputs afterwards.
++        num_heads = q.shape[1] if self.dcp_world_size > 1 else self.num_heads
+ 
+         assert self.topk_indices_buffer is not None
+         topk_indices = self.topk_indices_buffer[:num_actual_toks]
+ 
+-        topk_indices_physical = cast(
+-            torch.Tensor,
+-            triton_convert_req_index_to_global_index(
+-                attn_metadata.req_id_per_token[:num_actual_toks],
+-                attn_metadata.block_table,
+-                topk_indices,
+-                BLOCK_SIZE=attn_metadata.block_size,
+-                NUM_TOPK_TOKENS=topk_indices.shape[1],
+-            ),
++        # With DCP the buffer holds globally merged positions; entries owned
++        # by other ranks resolve to -1 and are skipped by the sparse kernel
++        # (interspersed -1 indices are masked, not just tail padding).
++        return_lse = self.need_to_return_lse_for_decode
++        valid_counts: torch.Tensor | None = None
++        conv = triton_convert_req_index_to_global_index(
++            attn_metadata.req_id_per_token[:num_actual_toks],
++            attn_metadata.block_table,
++            topk_indices,
++            BLOCK_SIZE=attn_metadata.block_size,
++            NUM_TOPK_TOKENS=topk_indices.shape[1],
++            dcp_world_size=self.dcp_world_size,
++            dcp_rank=self.dcp_rank,
++            cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
++            # Rows with no locally owned candidate are skipped by the kernel
++            # (their LSE lands at the -1e30 sentinel but the output row may
++            # keep stale pool memory) - track them so they can be zeroed
++            # before the cross-rank merge.
++            return_valid_counts=return_lse,
+         )
++        if return_lse:
++            topk_indices_physical, valid_counts = cast(
++                tuple[torch.Tensor, torch.Tensor], conv
++            )
++        else:
++            topk_indices_physical = cast(torch.Tensor, conv)
+ 
+         output = q.new_empty(
+-            (num_actual_toks, self.num_heads, self.kv_lora_rank),
++            (num_actual_toks, num_heads, self.kv_lora_rank),
+             dtype=q.dtype,
+         )
+ 
+@@ -153,5 +216,17 @@ class FlashInferMLASparseSM120Impl(SparseMLAAttentionImpl[FlashInferMLASparseMet
+             bmm2_scale=1.0,
+             sparse_mla_top_k=attn_metadata.topk_tokens,
+             kv_scale_format=self.kv_scale_format,
++            return_lse=return_lse,
+         )
++        if return_lse:
++            out, lse = out
++            out = out.squeeze(1)
++            # lse: [num_tokens, num_heads] fp32, log2 domain. Rows where this
++            # rank owns no selected candidate report the -1e30 LSE sentinel
++            # (zero weight in the merge), but their *output* rows are
++            # uninitialized pool memory - zero them so a stray NaN/Inf can't
++            # leak through the 0-weight multiply in the LSE correction.
++            assert valid_counts is not None
++            out.masked_fill_((valid_counts == 0).view(-1, 1, 1), 0.0)
++            return out, lse
+         return out.squeeze(1), None
+diff --git a/vllm/v1/attention/backends/mla/indexer.py b/vllm/v1/attention/backends/mla/indexer.py
+index 0bc7ca7aa..ae31f0175 100644
+--- a/vllm/v1/attention/backends/mla/indexer.py
++++ b/vllm/v1/attention/backends/mla/indexer.py
+@@ -26,6 +26,10 @@ from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_
+ from vllm.v1.attention.backends.utils import (
+     split_decodes_and_prefills,
+ )
++from vllm.v1.attention.ops.dcp_sparse_topk import (
++    dcp_local_count_from_global,
++    dcp_local_count_int,
++)
+ from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
+ from vllm.v1.worker.cp_utils import get_total_cp_world_size
+ 
+@@ -332,6 +336,32 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+         if isinstance(self.kv_cache_spec, MLAAttentionSpec):
+             self.compress_ratio = self.kv_cache_spec.compress_ratio
+ 
++        # Decode context parallelism: the indexer scores only the local KV
++        # shard, so decode/prefill K extents must be the *local* prefix
++        # counts rather than the global sequence lengths.
++        try:
++            from vllm.distributed.parallel_state import get_dcp_group
++
++            self.dcp_world_size = get_dcp_group().world_size
++            self.dcp_rank = get_dcp_group().rank_in_group
++        except AssertionError:
++            self.dcp_world_size = 1
++            self.dcp_rank = 0
++        self.cp_kv_cache_interleave_size = (
++            self.vllm_config.parallel_config.cp_kv_cache_interleave_size
++        )
++        if self.dcp_world_size > 1:
++            assert self.compress_ratio == 1, (
++                "DCP for the DSA indexer is only supported without KV "
++                "compression (DeepseekV4 compress_ratio > 1 is not wired up)."
++            )
++            # Address-stable buffer holding the DCP-local decode K extents.
++            self.dcp_local_seq_lens_buffer = torch.zeros(
++                (scheduler_config.max_num_batched_tokens,),
++                dtype=torch.int32,
++                device=self.device,
++            )
++
+         # Pre-allocate buffers for CUDA graph compatibility when
+         if self.compress_ratio > 1:
+             # compress_ratio > 1 (DeepseekV4)
+@@ -527,8 +557,35 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+             # slice below).
+             assert common_attn_metadata.seq_lens_cpu_upper_bound is not None
+             seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
++
++            # DCP: chunk boundaries feed a per-chunk all-gather in the indexer
++            # op, so they must be identical on every rank. Split by rank 0's
++            # local counts (the per-rank maximum, computable everywhere) and
++            # let each rank size its own gather/ks/ke from its true local
++            # counts below.
++            chunk_seq_lens_cpu = compressed_seq_lens_cpu
++            compressed_seq_lens_gpu = compressed_seq_lens
++            if self.dcp_world_size > 1:
++                chunk_seq_lens_cpu = dcp_local_count_from_global(
++                    compressed_seq_lens_cpu,
++                    self.dcp_world_size,
++                    0,
++                    self.cp_kv_cache_interleave_size,
++                )
++                compressed_seq_lens_gpu = dcp_local_count_from_global(
++                    compressed_seq_lens,
++                    self.dcp_world_size,
++                    self.dcp_rank,
++                    self.cp_kv_cache_interleave_size,
++                )
++                compressed_seq_lens_cpu = dcp_local_count_from_global(
++                    compressed_seq_lens_cpu,
++                    self.dcp_world_size,
++                    self.dcp_rank,
++                    self.cp_kv_cache_interleave_size,
++                )
+             chunk_specs = split_indexer_prefill_chunks(
+-                compressed_seq_lens_cpu[num_decodes:],
++                chunk_seq_lens_cpu[num_decodes:],
+                 prefill_query_lens_cpu,
+                 self.max_prefill_buffer_size,
+                 max_logits_bytes,
+@@ -537,18 +594,36 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+ 
+             chunks = []
+             for req_slice, query_slice in chunk_specs:
++                if self.dcp_world_size > 1:
++                    # Every rank must walk the same chunk list (each chunk
++                    # ends in an all-gather). Drop a chunk only when rank 0 -
++                    # whose local count upper-bounds all ranks - is empty,
++                    # which implies every rank is empty.
++                    rank0_total = int(
++                        chunk_seq_lens_cpu[req_slice.start : req_slice.stop]
++                        .sum()
++                        .item()
++                    )
++                    if rank0_total == 0:
++                        continue
+                 metadata = build_prefill_chunk_metadata(
+                     req_slice.start,
+                     req_slice.stop,
+                     query_start_loc,
+                     query_start_loc_cpu,
+                     seq_lens,
+-                    compressed_seq_lens,
++                    compressed_seq_lens_gpu,
+                     compressed_seq_lens_cpu,
+                     common_attn_metadata.block_table_tensor,
+                     self.compress_ratio,
+                     query_slice=query_slice,
+                     skip_kv_gather=query_slice.start > 0,
++                    dcp_world_size=self.dcp_world_size,
++                    dcp_rank=self.dcp_rank,
++                    cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
++                    # A rank with an empty local shard still builds the chunk
++                    # (ks/ke all zero) so it participates in the merge.
++                    allow_empty=self.dcp_world_size > 1,
+                 )
+                 # Skip when total_seq_lens is 0 (i.e., no compressed token).
+                 if metadata is not None:
+@@ -606,6 +681,26 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+                     self.expanded_seq_lens_buffer[num_decodes:num_decode_tokens] = 0
+                     seq_lens = self.expanded_seq_lens_buffer[:num_decode_tokens]
+ 
++            # DCP: replace the global per-row K extents with this rank's
++            # local prefix counts (the paged logits kernel and the topk both
++            # walk the local shard only). Copy into an owned buffer: on the
++            # plain-decode path seq_lens aliases common_attn_metadata.
++            if self.dcp_world_size > 1:
++                flat_seq_lens = seq_lens.reshape(-1)
++                num_rows = flat_seq_lens.shape[0]
++                self.dcp_local_seq_lens_buffer[:num_rows] = (
++                    dcp_local_count_from_global(
++                        flat_seq_lens,
++                        self.dcp_world_size,
++                        self.dcp_rank,
++                        self.cp_kv_cache_interleave_size,
++                    )
++                )
++                self.dcp_local_seq_lens_buffer[num_rows:] = 0
++                seq_lens = self.dcp_local_seq_lens_buffer[:num_rows].view(
++                    seq_lens.shape
++                )
++
+             # Non-MTP: deep_gemm paged MQA logits requires 2D context_lens
+             # (csrc/apis/attention.hpp). Unsqueeze to (B, 1) so downstream
+             # kernels see the same (B, next_n) layout as the MTP path.
+@@ -628,9 +723,21 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+                 schedule_metadata=self.scheduler_metadata_buffer,
+             )
+ 
++        # max_seq_len is consumed by the decode topk kernels as the scan
++        # bound over logits columns; under DCP those columns cover only the
++        # local shard, so hand the kernels the (exact) local maximum.
++        max_seq_len = common_attn_metadata.max_seq_len
++        if self.dcp_world_size > 1:
++            max_seq_len = dcp_local_count_int(
++                max_seq_len,
++                self.dcp_world_size,
++                self.dcp_rank,
++                self.cp_kv_cache_interleave_size,
++            )
++
+         attn_metadata = DeepseekV32IndexerMetadata(
+             seq_lens=common_attn_metadata.seq_lens,
+-            max_seq_len=common_attn_metadata.max_seq_len,
++            max_seq_len=max_seq_len,
+             slot_mapping=compressed_slot_mapping,
+             num_decodes=num_decodes,
+             num_decode_tokens=num_decode_tokens,
+@@ -655,9 +762,21 @@ def build_prefill_chunk_metadata(
+     compress_ratio: int,
+     query_slice: slice | None = None,
+     skip_kv_gather: bool = False,
++    dcp_world_size: int = 1,
++    dcp_rank: int = 0,
++    cp_kv_cache_interleave_size: int = 1,
++    allow_empty: bool = False,
+ ) -> DeepseekV32IndexerPrefillChunkMetadata | None:
++    """Build one indexer prefill chunk.
++
++    Under DCP (``dcp_world_size > 1``) ``compressed_seq_lens[_cpu]`` are this
++    rank's *local* shard counts: the K gather, ``cu_seq_lens``,
++    ``token_to_seq`` and the per-token causal extents ``ks``/``ke`` all live
++    in local-shard coordinates. ``allow_empty`` keeps zero-length chunks
++    alive (rank-aligned chunking requires every rank to visit every chunk).
++    """
+     total_seq_lens = compressed_seq_lens_cpu[start_idx:end_idx].sum().item()
+-    if total_seq_lens == 0:
++    if total_seq_lens == 0 and not allow_empty:
+         return None
+ 
+     num_reqs = end_idx - start_idx
+@@ -698,6 +817,9 @@ def build_prefill_chunk_metadata(
+         qs_stop,
+         BLOCK_SIZE=1024,
+         COMPRESS_RATIO=compress_ratio,
++        DCP_WORLD=dcp_world_size,
++        DCP_RANK=dcp_rank,
++        CP_INTERLEAVE=cp_kv_cache_interleave_size,
+     )
+ 
+     token_start = query_start_loc_cpu[start_idx].item()
+@@ -736,6 +858,9 @@ def _build_prefill_chunk_metadata_kernel(
+     query_slice_stop,
+     BLOCK_SIZE: tl.constexpr,
+     COMPRESS_RATIO: tl.constexpr,
++    DCP_WORLD: tl.constexpr,
++    DCP_RANK: tl.constexpr,
++    CP_INTERLEAVE: tl.constexpr,
+ ):
+     batch_idx = tl.program_id(0)
+ 
+@@ -765,6 +890,16 @@ def _build_prefill_chunk_metadata_kernel(
+ 
+         # Compute cu_seq_len_ke
+         seq_len_per_token = (start_pos + 1 + offset) // COMPRESS_RATIO
++        if DCP_WORLD > 1:
++            # DCP: K rows are this rank's local shard; the causal extent is
++            # the local count of the seq_len_per_token-long global prefix.
++            unit: tl.constexpr = DCP_WORLD * CP_INTERLEAVE
++            full = seq_len_per_token // unit
++            rem = seq_len_per_token - full * unit
++            local_rem = tl.minimum(
++                tl.maximum(rem - DCP_RANK * CP_INTERLEAVE, 0), CP_INTERLEAVE
++            )
++            seq_len_per_token = full * CP_INTERLEAVE + local_rem
+         tl.store(
+             cu_compressed_seq_len_ke_ptr + out_pos,
+             seq_start + seq_len_per_token,
 diff --git a/vllm/v1/attention/backends/mla/nvfp4_ds_mla_cache.py b/vllm/v1/attention/backends/mla/nvfp4_ds_mla_cache.py
 new file mode 100644
 index 000000000..c37d3729e
@@ -9879,6 +10525,220 @@ index df23f3437..962c098f8 100644
 +            slot_ids,
 +            mask=offset < index_width,
 +        )
+diff --git a/vllm/v1/attention/backends/mla/sparse_utils.py b/vllm/v1/attention/backends/mla/sparse_utils.py
+index e4bd0cf42..ca4996968 100644
+--- a/vllm/v1/attention/backends/mla/sparse_utils.py
++++ b/vllm/v1/attention/backends/mla/sparse_utils.py
+@@ -23,6 +23,12 @@ def _convert_req_index_to_global_index_kernel(
+     BLOCK_N: tl.constexpr,  # tile width along columns
+     HAS_PREFILL: tl.constexpr,
+     COUNT_VALID: tl.constexpr,  # whether to count valid indices
++    # decode-context-parallel sharding: token_indices hold *global* positions;
++    # only positions owned by DCP_RANK resolve to local slots, the rest emit
++    # -1 (skipped by the sparse kernels). DCP_WORLD == 1 folds to a no-op.
++    DCP_WORLD: tl.constexpr,
++    DCP_RANK: tl.constexpr,
++    CP_INTERLEAVE: tl.constexpr,
+     # strides (in elements)
+     bt_stride0,
+     bt_stride1,
+@@ -52,6 +58,12 @@ def _convert_req_index_to_global_index_kernel(
+     if HAS_PREFILL:
+         prefill_req_id = tl.load(prefill_request_id_ptr + token_id)
+         is_prefill = prefill_req_id >= 0
++    if DCP_WORLD > 1:
++        # Global position -> (owner rank, local position) under interleaved
++        # sharding; foreign positions become -1.
++        unit = tok // CP_INTERLEAVE
++        is_invalid_tok |= (unit % DCP_WORLD) != DCP_RANK
++        tok = (unit // DCP_WORLD) * CP_INTERLEAVE + tok % CP_INTERLEAVE
+     # Compute block id and in-block offset
+     block_id = tok // BLOCK_SIZE
+     inblock_off = tok % BLOCK_SIZE
+@@ -93,6 +105,9 @@ def triton_convert_req_index_to_global_index(
+     prefill_workspace_request_ids: torch.Tensor | None = None,
+     prefill_workspace_starts: torch.Tensor | None = None,
+     return_valid_counts: bool = False,
++    dcp_world_size: int = 1,
++    dcp_rank: int = 0,
++    cp_kv_cache_interleave_size: int = 1,
+ ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+     """
+     out[token_id, indice_id] =
+@@ -115,6 +130,11 @@ def triton_convert_req_index_to_global_index(
+ 
+     When return_valid_counts is True, also returns the count of valid (non -1)
+     indices per row, computed during the same kernel pass (no extra overhead).
++
++    When dcp_world_size > 1, token_indices are *global* token positions under
++    interleaved decode-context-parallel sharding: entries owned by other
++    ranks become -1 and owned entries are translated to this rank's local
++    slot ids via the (local) block_table.
+     """
+     assert req_id.dtype == torch.int32
+     assert block_table.dtype == torch.int32
+@@ -176,6 +196,9 @@ def triton_convert_req_index_to_global_index(
+         BLOCK_N,
+         HAS_PREFILL_WORKSPACE,
+         return_valid_counts,
++        dcp_world_size,
++        dcp_rank,
++        cp_kv_cache_interleave_size,
+         # strides
+         bt_stride0,
+         bt_stride1,
+diff --git a/vllm/v1/attention/ops/dcp_sparse_topk.py b/vllm/v1/attention/ops/dcp_sparse_topk.py
+new file mode 100644
+index 000000000..8a93910d6
+--- /dev/null
++++ b/vllm/v1/attention/ops/dcp_sparse_topk.py
+@@ -0,0 +1,146 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Decode-context-parallel helpers for sparse-MLA (DSA) top-k indexers.
++
++Under DCP the KV cache is interleaved across ranks in units of
++``cp_kv_cache_interleave_size`` tokens: global token position ``p`` lives on
++rank ``(p // interleave) % world`` at local position
++``(p // (world * interleave)) * interleave + p % interleave``.
++
++The DSA indexer computes per-query relevance logits against the *local* KV
++shard and selects a local top-k. The helpers here lift those local winners
++into global coordinates, exchange the (id, score) candidate lists across the
++DCP group and reduce them to the *global* top-k, which every rank then filters
++back down to its own slots for the sparse attention read.
++
++Scores are raw indexer logits (weighted ReLU dot products) with no
++per-sequence normalization, so they are directly comparable across ranks.
++"""
++
++import torch
++
++from vllm.distributed.parallel_state import GroupCoordinator
++
++# Candidate ids ride the all-gather as float32 lanes next to their scores.
++# float32 represents integers exactly up to 2**24, which bounds the maximum
++# indexable token position (1M context is well within it).
++MAX_FP32_EXACT_ID = 1 << 24
++
++
++def dcp_local_count_from_global(
++    global_lens: torch.Tensor,
++    dcp_world_size: int,
++    dcp_rank: int,
++    interleave: int,
++) -> torch.Tensor:
++    """Number of tokens of a ``global_lens``-token prefix stored on this rank.
++
++    Works elementwise on any integer tensor (per-request seq_lens or
++    per-query-token causal lengths alike).
++    """
++    unit = dcp_world_size * interleave
++    full = global_lens // unit
++    rem = global_lens - full * unit
++    return full * interleave + (rem - dcp_rank * interleave).clamp_(
++        min=0, max=interleave
++    )
++
++
++def dcp_local_count_int(
++    global_len: int,
++    dcp_world_size: int,
++    dcp_rank: int,
++    interleave: int,
++) -> int:
++    """Python-int twin of :func:`dcp_local_count_from_global`."""
++    unit = dcp_world_size * interleave
++    full, rem = divmod(global_len, unit)
++    return full * interleave + min(max(rem - dcp_rank * interleave, 0), interleave)
++
++
++def dcp_local_pos_to_global(
++    local_idx: torch.Tensor,
++    dcp_world_size: int,
++    dcp_rank: int,
++    interleave: int,
++) -> torch.Tensor:
++    """Map local token positions to global positions; ``-1`` stays ``-1``."""
++    unit = local_idx // interleave
++    global_idx = (
++        unit * (dcp_world_size * interleave)
++        + dcp_rank * interleave
++        + local_idx % interleave
++    )
++    return torch.where(local_idx < 0, local_idx, global_idx)
++
++
++def dcp_gather_topk_scores(
++    logits: torch.Tensor,
++    topk_indices: torch.Tensor,
++    col_offset: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """Fetch the logit score for every locally selected candidate.
++
++    ``topk_indices`` hold per-request positions (``-1`` = padding). For the
++    prefill path the request's K rows start at ``col_offset[row]`` within the
++    shared logits workspace; decode logits are already request-relative.
++    Padded entries get ``-inf`` so they lose every comparison in the merge.
++    """
++    idx = topk_indices.clamp(min=0).to(torch.int64)
++    if col_offset is not None:
++        idx = idx + col_offset.to(torch.int64).unsqueeze(1)
++    # Guard the gather against padded rows pointing past the logits width
++    # (possible for zero-length rows whose clamp(0) still lands out of range
++    # only when the logits tensor is narrower than 1 column - never in
++    # practice - but clamp anyway for CUDA-graph padded rows).
++    idx = idx.clamp_(max=logits.shape[1] - 1)
++    scores = logits.gather(1, idx).to(torch.float32)
++    return scores.masked_fill_(topk_indices < 0, float("-inf"))
++
++
++def dcp_merge_global_topk(
++    local_global_ids: torch.Tensor,
++    local_scores: torch.Tensor,
++    topk: int,
++    dcp_group: GroupCoordinator,
++) -> torch.Tensor:
++    """All-gather per-rank candidates and reduce to the global top-``topk``.
++
++    ``local_global_ids``: int32 ``[rows, topk]`` global positions, ``-1`` pad.
++    ``local_scores``: float32 ``[rows, topk]``, ``-inf`` on padding.
++
++    Returns int32 ``[rows, topk]`` global ids (``-1`` pad), identical on every
++    rank: candidate sets are disjoint per rank (ownership partitions
++    positions), the gathered layout is rank-major on every rank, and topk over
++    the same tensor is deterministic.
++
++    Correctness of the reduction: any position in the true global top-k is,
++    restricted to its owner rank, within that rank's local top-k, so the union
++    of local top-k lists always contains the global top-k.
++    """
++    rows = local_global_ids.shape[0]
++    world = dcp_group.world_size
++
++    # Single collective: scores and ids share one fp32 tensor. ids <= 2**24
++    # are exact in fp32 (asserted at engine start via max_model_len).
++    packed = torch.empty(
++        (rows, 2, topk), dtype=torch.float32, device=local_scores.device
++    )
++    packed[:, 0].copy_(local_scores)
++    packed[:, 1].copy_(local_global_ids.to(torch.float32))
++
++    # [rows, 2, topk] -> [world * rows, 2, topk], rank-major.
++    gathered = dcp_group.all_gather(packed, dim=0)
++    gathered = gathered.view(world, rows, 2, topk)
++
++    all_scores = (
++        gathered[:, :, 0].permute(1, 0, 2).reshape(rows, world * topk)
++    )
++    all_ids = gathered[:, :, 1].permute(1, 0, 2).reshape(rows, world * topk)
++
++    top_scores, top_pos = torch.topk(all_scores, k=topk, dim=1, sorted=True)
++    merged = all_ids.gather(1, top_pos).to(torch.int32)
++    # Positions that never existed (fewer than topk real candidates in total)
++    # carry -inf scores; restore the -1 padding convention.
++    merged.masked_fill_(top_scores == float("-inf"), -1)
++    return merged
 diff --git a/vllm/v1/attention/ops/merge_attn_states.py b/vllm/v1/attention/ops/merge_attn_states.py
 index cf4338fb1..f0577501e 100644
 --- a/vllm/v1/attention/ops/merge_attn_states.py
@@ -12023,7 +12883,7 @@ index 4ab45b2ae..35a89634e 100644
 +        " `ptd_token_id` for parallel drafting."
      )
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index 74938a823..27135b752 100644
+index 74938a823..87114b894 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
 @@ -4,6 +4,7 @@
@@ -12173,7 +13033,7 @@ index 74938a823..27135b752 100644
          # Run the model.
          # Use persistent buffers for CUDA graphs.
          # When spec decode is enabled, defer connector finalization
-@@ -4337,6 +4404,128 @@ class GPUModelRunner(
+@@ -4337,6 +4404,142 @@ class GPUModelRunner(
                  **model_kwargs,
              )
  
@@ -12216,7 +13076,9 @@ index 74938a823..27135b752 100644
 +                    else:
 +                        _max_miss = _miss
 +                    if _miss > 0:
-+                        _btier.force_promote(max_promote=None)
++                        _btier.force_promote(
++                            max_promote=None,
++                            pin=_w2d.fp_continue(0, _max_miss))
 +                    _btier.kpi_step(
 +                        _max_miss, _max_miss > _w2d.base_miss_tol())
 +                    # Replay to a FIXED POINT (bounded): the corrected early
@@ -12258,9 +13120,21 @@ index 74938a823..27135b752 100644
 +                        else:
 +                            _max_miss = _miss
 +                        if _miss > 0:
-+                            _btier.force_promote(max_promote=None)
++                            _btier.force_promote(
++                                max_promote=None,
++                                pin=_w2d.fp_continue(_replays, _max_miss))
 +                    if _replays:
 +                        _btier.kpi_fp(_replays, _max_miss)
++                    # close the base seen window HERE for PP: non-last
++                    # ranks early-return before the shared end-of-step
++                    # hook (see the step_end call after the gate block).
++                    # The FP4 window is only closed on prefill-shaped
++                    # steps — a decode fire decision arrives later via the
++                    # worker (gate_reforward) and consumes it there.
++                    _btier.step_end()
++                    if (_w2d._TIER is not None
++                            and max_num_scheduled_tokens > 4):
++                        _w2d._TIER.step_end()
 +            except Exception as e:  # noqa: BLE001 - never crash serving
 +                logger.warning(
 +                    "moe_w2 base-cache PP stage replay skipped: %s", e)
@@ -12302,7 +13176,7 @@ index 74938a823..27135b752 100644
          with record_function_or_nullcontext("gpu_model_runner: postprocess"):
              if self.use_aux_hidden_state_outputs:
                  # True when EAGLE 3 is used.
-@@ -4395,6 +4584,189 @@ class GPUModelRunner(
+@@ -4395,6 +4598,219 @@ class GPUModelRunner(
                  assert broadcasted is not None
                  logits = broadcasted["logits"]
  
@@ -12347,7 +13221,13 @@ index 74938a823..27135b752 100644
 +                    # the step's ~top_k*n_layers weighted contributions were
 +                    # zeroed (bounded approximation, delta/gate class).
 +                    if _miss > 0:
-+                        _btier.force_promote(max_promote=None)
++                        # pin only when a replay will actually re-read the
++                        # step (otherwise the fetch serves FUTURE steps and
++                        # pinning it just starves the eviction — see
++                        # force_promote's pin doc)
++                        _btier.force_promote(
++                            max_promote=None,
++                            pin=_w2d.fp_continue(0, _max_miss))
 +                    # KPI: per-step replay rate + missing pairs (windowed
 +                    # INFO line) — the pool-sizing signal.
 +                    _btier.kpi_step(
@@ -12397,7 +13277,9 @@ index 74938a823..27135b752 100644
 +                        else:
 +                            _max_miss = _miss
 +                        if _miss > 0:
-+                            _btier.force_promote(max_promote=None)
++                            _btier.force_promote(
++                                max_promote=None,
++                                pin=_w2d.fp_continue(_replays, _max_miss))
 +                    if _replays:
 +                        _btier.kpi_fp(_replays, _max_miss)
 +            except Exception as e:  # noqa: BLE001 - never crash serving
@@ -12489,10 +13371,32 @@ index 74938a823..27135b752 100644
 +            except Exception as e:  # noqa: BLE001 - gate must never crash serving
 +                logger.warning("moe_w2 confidence gate re-forward skipped: %s", e)
 +
++        # moe_w2: the step is fully executed (base replays + gate replay
++        # done) — close both tiers' SEEN windows so the eviction exclusion
++        # and force_promote's hit-pinning stay scoped to ONE step. Without
++        # this a prefill's accumulated marks (61 ensure_resident layers)
++        # pinned the whole pool at the next decode step (measured: [pool
++        # 2123, pinned 2123], hundreds of unpromotable experts, corrupted
++        # first decode tokens).
++        if moe_w2_gate is not None and not self.is_pooling_model:
++            try:
++                from vllm.model_executor.layers.quantization.utils import (
++                    moe_w2_delta as _w2d_end)
++                if _w2d_end._BASE_TIER is not None:
++                    _w2d_end._BASE_TIER.step_end()
++                # under PP a pending gate fire consumes the FP4 window in
++                # gate_reforward() (driven by the worker AFTER this call);
++                # force_promote zeroes it there.
++                if _w2d_end._TIER is not None and not getattr(
++                        self, "_gate_fire", False):
++                    _w2d_end._TIER.step_end()
++            except Exception:  # noqa: BLE001 - never crash serving
++                pass
++
          self.execute_model_state = ExecuteModelState(
              scheduler_output,
              logits,
-@@ -4416,6 +4788,95 @@ class GPUModelRunner(
+@@ -4416,6 +4832,95 @@ class GPUModelRunner(
  
          return None
  
@@ -12588,7 +13492,7 @@ index 74938a823..27135b752 100644
      def _input_fits_in_drafter(
          self, common_attn_metadata: CommonAttentionMetadata | None
      ) -> bool:
-@@ -4441,6 +4902,12 @@ class GPUModelRunner(
+@@ -4441,6 +4946,12 @@ class GPUModelRunner(
              # receive sampled token ids from the last PP rank.
              if self.use_async_scheduling and not get_pp_group().is_last_rank:
                  self._pp_receive_prev_sampled_token_ids_to_input_batch()
@@ -12601,7 +13505,7 @@ index 74938a823..27135b752 100644
              # In case of PP with kv transfer, we need to pass through the
              # kv_connector_output
              return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
-@@ -4605,6 +5072,23 @@ class GPUModelRunner(
+@@ -4605,6 +5116,23 @@ class GPUModelRunner(
              # tokens on the CPU, so they are run after bookkeeping.
              propose_draft_token_ids(valid_sampled_token_ids)
  
@@ -12625,7 +13529,7 @@ index 74938a823..27135b752 100644
          # Finalize KV connector (wait_for_save + clear metadata) after
          # draft model runs. Deferred from target model forward to allow
          # draft model to also save its KV cache.
-@@ -4696,13 +5180,35 @@ class GPUModelRunner(
+@@ -4696,13 +5224,35 @@ class GPUModelRunner(
      def _pp_broadcast_prev_sampled_token_ids(
          self, sampled_token_ids: torch.Tensor
      ) -> None:
@@ -12666,7 +13570,7 @@ index 74938a823..27135b752 100644
          # Skip for chunked prefill: sampled tokens are dummy
          # and will be discarded, no need to broadcast.
          if not self._is_all_reqs_chunked_prefill():
-@@ -4711,16 +5217,33 @@ class GPUModelRunner(
+@@ -4711,16 +5261,33 @@ class GPUModelRunner(
              )
  
      def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
@@ -12704,7 +13608,7 @@ index 74938a823..27135b752 100644
  
          # construct `prev_req_id_to_index` here so `_prepare_input_ids`
          # can map req_id -> previous batch row
-@@ -4731,18 +5254,155 @@ class GPUModelRunner(
+@@ -4731,18 +5298,155 @@ class GPUModelRunner(
              if i in discard_req_indices_set:
                  continue
              prev_req_id_to_index[req_id] = i
@@ -12865,7 +13769,7 @@ index 74938a823..27135b752 100644
          draft_token_ids, req_ids = self._get_draft_token_ids_cpu()
          return DraftTokenIds(req_ids, draft_token_ids)
  
-@@ -5209,6 +5869,40 @@ class GPUModelRunner(
+@@ -5209,6 +5913,40 @@ class GPUModelRunner(
                          )
                          eplb_models += 1
  
@@ -12906,7 +13810,7 @@ index 74938a823..27135b752 100644
                  self._setup_eagle3_aux_hidden_state_outputs()
  
                  # Resolve the MoE model, unwrapping VLM wrappers if needed.
-@@ -5969,7 +6663,8 @@ class GPUModelRunner(
+@@ -5969,7 +6707,8 @@ class GPUModelRunner(
              else:
                  hidden_states = outputs
  
@@ -12916,7 +13820,7 @@ index 74938a823..27135b752 100644
                  self.speculative_config.use_eagle()
                  or self.speculative_config.uses_draft_model()
                  or self.speculative_config.uses_extract_hidden_states()
-@@ -6875,8 +7570,9 @@ class GPUModelRunner(
+@@ -6875,8 +7614,9 @@ class GPUModelRunner(
          # because some of them change the threshold at init time.
          self.calculate_reorder_batch_threshold()
  
@@ -12928,7 +13832,7 @@ index 74938a823..27135b752 100644
              self.speculative_config.use_eagle()
              or self.speculative_config.uses_draft_model()
          ):
-@@ -6929,7 +7625,8 @@ class GPUModelRunner(
+@@ -6929,7 +7669,8 @@ class GPUModelRunner(
          )
  
          # Initialize drafter's cudagraph dispatcher if using spec decode.

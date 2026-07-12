@@ -13,8 +13,13 @@ Checks:
  2. the coupling transient: an FP4-mapped expert whose base slot is gone
     contributes exactly ZERO and bumps the miss counter (fetch+replay
     contract), never garbage;
- 3. eviction coupling: base _take_slots_batch (emergency included) never
-    victimizes an expert mapped in the coupled FP4 tier.
+ 3. eviction coupling: base _take_slots_batch NEVER victimizes an expert
+    mapped in the coupled FP4 tier (hard exclusion — these are the gate's
+    quality-critical promotions and a base-evicted pair zeroes inside gate
+    replays, which never refetch);
+ 4. under full-pool pressure the take serves only the uncoupled slots and
+    leaves every coupled mapping intact and consistent (the base pool must
+    be sized with the FP4 pool's coupled floor in mind).
 
 Run (inside the vllm image): python3 test_three_tier_split.py
 """
@@ -169,16 +174,38 @@ ok = ok and miss > 0 and rel2 < 0.06
 btier.slot_table[0, victim] = vb     # restore
 btier._mirror[0, victim] = vb
 
-# ---- 3. eviction coupling: FP4-mapped experts are never victims ---------
+# ---- 3. eviction coupling: FP4-mapped spared while others exist ---------
+btier.step_begin()                   # new step: releases pin scopes
 btier.seen.zero_()
 btier._seen_host.zero_()
 btier._tick += 10                    # everything cold
+n_uncoupled = int((btier._mirror[0] >= 0).sum()) - len(promoted)
 with btier._lock:
-    taken = btier._take_slots_batch(E, emergency=True)
+    taken = btier._take_slots_batch(n_uncoupled, emergency=True)
 still = [e for e in promoted if int(btier._mirror[0, e]) >= 0]
-print(f"eviction pressure: took {len(taken)} slots; FP4-mapped intact "
-      f"{len(still)}/{len(promoted)}")
-ok = ok and len(still) == len(promoted) and len(taken) > 0
+print(f"eviction pressure (k={n_uncoupled} = all uncoupled): took "
+      f"{len(taken)} slots; FP4-mapped intact {len(still)}/{len(promoted)}")
+ok = ok and len(still) == len(promoted) and len(taken) == n_uncoupled
+
+# ---- 4. full-pool pressure: coupled slots survive, tables consistent ----
+# the check-3 slots are re-owned by this step's fetches (step-pinned,
+# hard) — the only takeable victims left are still-mapped UNCOUPLED slots
+uncoupled_left = int((btier._mirror[0] >= 0).sum()) - len(promoted)
+k4 = len(promoted)
+with btier._lock:
+    for s in taken:
+        btier._own(s, 0, int(btier._owner_ei[s]))
+        btier._step_pins.add(s)
+    taken2 = btier._take_slots_batch(k4, emergency=True)
+still2 = [e for e in promoted if int(btier._mirror[0, e]) >= 0]
+consistent = all(
+    int(btier._mirror[0, e]) < 0 or int(btier.slot_table[0, e]) >= 0
+    for e in range(E))
+print(f"full-pool pressure: took {len(taken2)}/{k4} (uncoupled left: "
+      f"{uncoupled_left}), FP4-mapped intact {len(still2)}/{len(promoted)}, "
+      f"tables consistent: {consistent}")
+ok = (ok and len(taken2) == uncoupled_left
+      and len(still2) == len(promoted) and consistent)
 
 print("RESULT:", "PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

@@ -41,9 +41,12 @@ vllm/v1/attention/backends/flashinfer.py
 vllm/v1/attention/backends/mla/cubit_sparse_mla.py
 vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
 vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
+vllm/v1/attention/backends/mla/indexer.py
 vllm/v1/attention/backends/mla/nvfp4_ds_mla_cache.py
 vllm/v1/attention/backends/mla/sparse_mla_env.py
 vllm/v1/attention/backends/mla/sparse_swa.py
+vllm/v1/attention/backends/mla/sparse_utils.py
+vllm/v1/attention/ops/dcp_sparse_topk.py
 vllm/v1/attention/ops/merge_attn_states.py
 vllm/v1/attention/ops/triton_decode_attention.py
 vllm/v1/core/sched/scheduler.py
