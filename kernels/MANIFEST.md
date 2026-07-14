@@ -3,6 +3,57 @@
 Hand‑written SASS assembled by `cubit` (pinned @ `5912400`). Cubins are **SM120‑only**.
 Assemble: `cubit asm sass/<SASS> -o <cubin> --kernel <kernel> --mercury-stub sass/qmma_e4m3.merc.stub`.
 
+## Activation format rev `_a32` (group‑size‑flexible A scales) — the LIVE set
+
+All MoE GEMM cubins the server loads carry the `_a32` filename suffix: the
+A‑side f32 scale plane is read at **PER‑32 stride** (f32 `[rows, K/32]`,
+desc `as` row stride `(K/32)*4`) and folded into the split‑K masters **once
+per k32**. Broadcasting one scale over consecutive 32‑groups is identical to
+quantizing at a coarser group, so ONE cubin set serves activation groups
+{32, 64, 128} per GEMM — selected host‑side (`VLLM_MOE_W2_A32_G1/G2`,
+`VLLM_MOE_W2_A32_UE8M0`). Regcount stays 64 = 4 CTA/SM on `moe_w2_mm`; the
+per‑k32 fold costs ≤6% on decode‑shape kernel micro‑bench (e2e within the
+2×6000 anchor band).
+
+**Production defaults: G1=128 G2=128 UE8M0=1** — numerically the a128
+format (its per_token_group_quant inherited the platform's DeepGEMM‑E8M0
+power‑of‑2 rounding). The per‑32 variants this rev was built to test
+(activation‑precision handoff, plan A) were **E2E‑falsified** on GSM8K‑200
+(2×6000, quintal τ1.0, weights bit‑exact):
+
+| A format (G1/G2, scale) | accuracy | tokens avg |
+|---|---|---|
+| native FP8+MXFP4 (anchor) | 97.0% | 116 |
+| a128 lineage (anchor) | 97.0% | 125 |
+| 128/128 ue8m0 (= default, `_a32` kernels) | **97.0%** (flips 1↔1) | **122** |
+| 32/128 f32 | 96.5% | 124 |
+| 32/32 f32 | 95.5% | 127 |
+| 32/32 e8m0 (native MXFP8 A format) | 95.5% | 122 |
+
+Finer A groups do NOT shorten completions — the +8–11% token inflation vs
+native does not come from activation‑scale granularity (nor from the
+mid‑pipeline requant; the 32/128 mix isolates it) — and they consistently
+cost accuracy against the 2‑bit/quintal weight planes. Op‑level the finer
+groups measure BETTER (bf16‑reference worst_rel 1.0–1.2× lower), so the
+loss is a serving‑distribution effect, not a kernel defect.
+
+The e8m0‑per‑32 build also validated QMMA.SF's **sfa** operand as a working
+alternative fold path: per‑row UE8M0 bytes, thread map HW‑probed
+(`gen/gen_moe_sfa_probe.py` + `gen/moe_sfa_probe_check.py`, PASS: lane *t*
+supplies the LOW byte for A row `8*(t&1) + (t>>2)`), host quant verified
+byte‑identical to flashinfer `mxfp8_quantize` (`2^ceil(log2(amax/448))`).
+The probe pair stays in `gen/` as the validated sfa documentation for any
+future MX revisit.
+
+**Format coherence is enforced by filename**: the loader
+(`moe_w2_cubit._ensure_ready`) only opens `*_a32.cubin`, and
+`_require_kernels` asserts the complete set — a stale/partial cubin dir
+fails at weight load instead of silently mixing scale strides. The retired
+`a128` files (no suffix) remain on disk ONLY for in‑flight a128 serving
+sessions and drop out at the next regen. Retired for good (not regenerated
+in `_a32`): the `mc2` prefill variant and the `MB=2` experiment — both
+superseded by MC=4/AFRAG, never launched by the serving path.
+
 ## Split FP4 MoE GEMM — moe_w4q_mm (serving: opt‑in `VLLM_MOE_W2_DELTA_SPLIT=1`, default off)
 **Bit‑exact** FP4 GEMM reading the resident 2‑bit base plane + a **radix‑5
 "quintal" refinement plane at 2.5 bits/elem**: the base code narrows the e2m1
@@ -26,19 +77,20 @@ of all 16 nibbles).
 
 | cubin (`cubins-sm120/`) | SASS (`sass/`) | kernel | purpose |
 |---|---|---|---|
-| `moe_w4q_mm_k4096.cubin` | `moe_w4q_mm_k4096.sass` | `moe_w4q_mm` | quintal split FP4, K=4096 (DS4 w13) |
-| `moe_w4q_mm_k2048.cubin` | `moe_w4q_mm_k2048.sass` | `moe_w4q_mm` | quintal split FP4, K=2048 (DS4 w2) |
-| `moe_w4q_mm_k1024.cubin` | `moe_w4q_mm_k1024.sass` | `moe_w4q_mm` | quintal split FP4, K=1024 (TP2 w2) |
-| `moe_w4q_mm_k512.cubin` | `moe_w4q_mm_k512.sass` | `moe_w4q_mm` | quintal split FP4, K=512 (TP4 w2), NWARP=4 |
-| `moe_w4q_mm_k6144.cubin` | `moe_w4q_mm_k6144.sass` | `moe_w4q_mm` | quintal split FP4, K=6144 (GLM‑5.x) |
-| `moe_w4q_mm_k7168.cubin` | `moe_w4q_mm_k7168.sass` | `moe_w4q_mm` | quintal split FP4, K=7168 (Kimi‑K2.x) |
+| `moe_w4q_mm_k4096_a32.cubin` | `moe_w4q_mm_k4096_a32.sass` | `moe_w4q_mm` | quintal split FP4, K=4096 (DS4 w13) |
+| `moe_w4q_mm_k2048_a32.cubin` | `moe_w4q_mm_k2048_a32.sass` | `moe_w4q_mm` | quintal split FP4, K=2048 (DS4 w2) |
+| `moe_w4q_mm_k1024_a32.cubin` | `moe_w4q_mm_k1024_a32.sass` | `moe_w4q_mm` | quintal split FP4, K=1024 (TP2 w2) |
+| `moe_w4q_mm_k512_a32.cubin` | `moe_w4q_mm_k512_a32.sass` | `moe_w4q_mm` | quintal split FP4, K=512 (TP4 w2), NWARP=4 |
+| `moe_w4q_mm_k6144_a32.cubin` | `moe_w4q_mm_k6144_a32.sass` | `moe_w4q_mm` | quintal split FP4, K=6144 (GLM‑5.x) |
+| `moe_w4q_mm_k7168_a32.cubin` | `moe_w4q_mm_k7168_a32.sass` | `moe_w4q_mm` | quintal split FP4, K=7168 (Kimi‑K2.x) |
 
 ## Split FP4 MoE GEMM — moe_w4s_mm (LEGACY — superseded by moe_w4q_mm, not loaded by the server)
 2‑bit refinement variant (half the slot bytes, but mag 0 merges into 0.5 —
 the split‑FP4 zero loss). Kept for history/A‑B tooling: `gen/gen_moe_w4s.py`,
 `gen/moe_w4s_check.py` (NOTE: its golden reference CONTAINS the merge),
 `gen/moe_w4s_nesting_study.py` (the GLM study that chose the merge). Pack tag
-`fp4s` (orphaned; `fp4q` is the live tag).
+`fp4s` (orphaned; `fp4q` is the live tag). Still the **a128** activation
+format (f32 per‑128 scales) — never regenerated for `_a32`.
 
 | cubin (`cubins-sm120/`) | SASS (`sass/`) | kernel | purpose |
 |---|---|---|---|
@@ -52,30 +104,24 @@ the split‑FP4 zero loss). Kept for history/A‑B tooling: `gen/gen_moe_w4s.py`
 ## 2‑bit MoE GEMM — the core contribution (no upstream equivalent)
 | cubin (`cubins-sm120/`) | SASS (`sass/`) | kernel | purpose |
 |---|---|---|---|
-| `moe_w2_mm_k4096.cubin` | `moe_w2_mm.sass` | `moe_w2_mm` | 2‑bit MoE GEMM, MC=1 (decode), K=4096 (w13) |
-| `moe_w2_mm_k2048.cubin` | `moe_w2_mm_k2048.sass` | `moe_w2_mm` | 2‑bit MoE GEMM, MC=1 (decode), K=2048 (w2) |
-| `moe_w2_mm_mc2_k4096.cubin` | `moe_w2_mm_mc2.sass` | `moe_w2_mm` | MC=2 (prefill), K=4096 |
-| `moe_w2_mm_mc2_k2048.cubin` | `moe_w2_mm_mc2_k2048.sass` | `moe_w2_mm` | MC=2 (prefill), K=2048 |
-| `moe_w2_mm_mc4_k4096.cubin` | (via `gen/gen_moe_w2.py` MC=4) | `moe_w2_mm` | MC=4 (prefill, full QMMA‑M), K=4096 |
-| `moe_w2_mm_mc4_k2048.cubin` | (via `gen/gen_moe_w2.py` MC=4) | `moe_w2_mm` | MC=4 (prefill), K=2048 |
-| `moe_w2_mm_k1024.cubin` | `moe_w2_mm_k1024.sass` | `moe_w2_mm` | 2‑bit MoE GEMM, MC=1, **K=1024** (w2 under TP2) |
-| `moe_w2_mm_mc2_k1024.cubin` | `moe_w2_mm_mc2_k1024.sass` | `moe_w2_mm` | MC=2 (prefill), K=1024 |
-| `moe_w2_mm_mc4_k1024.cubin` | `moe_w2_mm_mc4_k1024.sass` | `moe_w2_mm` | MC=4 (prefill), K=1024 |
-| `moe_w2_mm_k512.cubin` | `moe_w2_mm_k512.sass` | `moe_w2_mm` | 2‑bit MoE GEMM, MC=1, **K=512** (w2 under TP4), NWARP=4 |
-| `moe_w2_mm_mc2_k512.cubin` | `moe_w2_mm_mc2_k512.sass` | `moe_w2_mm` | MC=2 (prefill), K=512 |
-| `moe_w2_mm_mc4_k512.cubin` | `moe_w2_mm_mc4_k512.sass` | `moe_w2_mm` | MC=4 (prefill), K=512 |
-| `moe_w2_mm_k6144.cubin` | `moe_w2_mm_k6144.sass` | `moe_w2_mm` | 2‑bit MoE GEMM, MC=1, **K=6144** (gate‑up @ hidden 6144 — **GLM‑5.x**) |
-| `moe_w2_mm_mc2_k6144.cubin` | `moe_w2_mm_mc2_k6144.sass` | `moe_w2_mm` | MC=2 (prefill), K=6144 |
-| `moe_w2_mm_mc4_k6144.cubin` | `moe_w2_mm_mc4_k6144.sass` | `moe_w2_mm` | MC=4 (prefill), K=6144 |
-| `moe_w2_mm_k7168.cubin` | `moe_w2_mm_k7168.sass` | `moe_w2_mm` | 2‑bit MoE GEMM, MC=1, **K=7168** (gate‑up @ hidden 7168 — **Kimi‑K2.x**) |
-| `moe_w2_mm_mc2_k7168.cubin` | `moe_w2_mm_mc2_k7168.sass` | `moe_w2_mm` | MC=2 (prefill), K=7168 |
-| `moe_w2_mm_mc4_k7168.cubin` | `moe_w2_mm_mc4_k7168.sass` | `moe_w2_mm` | MC=4 (prefill), K=7168 |
-| `moe_w2_mm_mc4afrag_k4096.cubin` | `moe_w2_mm_mc4afrag_k4096.sass` | `moe_w2_mm` | **AFRAG** (prefill, fragment‑major A), K=4096 |
-| `moe_w2_mm_mc4afrag_k2048.cubin` | `moe_w2_mm_mc4afrag_k2048.sass` | `moe_w2_mm` | AFRAG (prefill), K=2048 |
-| `moe_w2_mm_mc4afrag_k1024.cubin` | `moe_w2_mm_mc4afrag_k1024.sass` | `moe_w2_mm` | AFRAG (prefill), K=1024 (TP2) |
-| `moe_w2_mm_mc4afrag_k512.cubin` | `moe_w2_mm_mc4afrag_k512.sass` | `moe_w2_mm` | AFRAG (prefill), K=512 (TP4), NWARP=4 |
-| `moe_w2_mm_mc4afrag_k6144.cubin` | `moe_w2_mm_mc4afrag_k6144.sass` | `moe_w2_mm` | AFRAG (prefill), K=6144 (GLM‑5.x) |
-| `moe_w2_mm_mc4afrag_k7168.cubin` | `moe_w2_mm_mc4afrag_k7168.sass` | `moe_w2_mm` | AFRAG (prefill), K=7168 (Kimi‑K2.x) |
+| `moe_w2_mm_k4096_a32.cubin` | `moe_w2_mm_k4096_a32.sass` | `moe_w2_mm` | 2‑bit MoE GEMM, MC=1 (decode), K=4096 (w13) |
+| `moe_w2_mm_k2048_a32.cubin` | `moe_w2_mm_k2048_a32.sass` | `moe_w2_mm` | 2‑bit MoE GEMM, MC=1 (decode), K=2048 (w2) |
+| `moe_w2_mm_mc4_k4096_a32.cubin` | `moe_w2_mm_mc4_k4096_a32.sass` | `moe_w2_mm` | MC=4 (prefill, full QMMA‑M), K=4096 |
+| `moe_w2_mm_mc4_k2048_a32.cubin` | `moe_w2_mm_mc4_k2048_a32.sass` | `moe_w2_mm` | MC=4 (prefill), K=2048 |
+| `moe_w2_mm_k1024_a32.cubin` | `moe_w2_mm_k1024_a32.sass` | `moe_w2_mm` | 2‑bit MoE GEMM, MC=1, **K=1024** (w2 under TP2) |
+| `moe_w2_mm_mc4_k1024_a32.cubin` | `moe_w2_mm_mc4_k1024_a32.sass` | `moe_w2_mm` | MC=4 (prefill), K=1024 |
+| `moe_w2_mm_k512_a32.cubin` | `moe_w2_mm_k512_a32.sass` | `moe_w2_mm` | 2‑bit MoE GEMM, MC=1, **K=512** (w2 under TP4), NWARP=4 |
+| `moe_w2_mm_mc4_k512_a32.cubin` | `moe_w2_mm_mc4_k512_a32.sass` | `moe_w2_mm` | MC=4 (prefill), K=512 |
+| `moe_w2_mm_k6144_a32.cubin` | `moe_w2_mm_k6144_a32.sass` | `moe_w2_mm` | 2‑bit MoE GEMM, MC=1, **K=6144** (gate‑up @ hidden 6144 — **GLM‑5.x**) |
+| `moe_w2_mm_mc4_k6144_a32.cubin` | `moe_w2_mm_mc4_k6144_a32.sass` | `moe_w2_mm` | MC=4 (prefill), K=6144 |
+| `moe_w2_mm_k7168_a32.cubin` | `moe_w2_mm_k7168_a32.sass` | `moe_w2_mm` | 2‑bit MoE GEMM, MC=1, **K=7168** (gate‑up @ hidden 7168 — **Kimi‑K2.x**) |
+| `moe_w2_mm_mc4_k7168_a32.cubin` | `moe_w2_mm_mc4_k7168_a32.sass` | `moe_w2_mm` | MC=4 (prefill), K=7168 |
+| `moe_w2_mm_mc4afrag_k4096_a32.cubin` | `moe_w2_mm_mc4afrag_k4096_a32.sass` | `moe_w2_mm` | **AFRAG** (prefill, fragment‑major A), K=4096 |
+| `moe_w2_mm_mc4afrag_k2048_a32.cubin` | `moe_w2_mm_mc4afrag_k2048_a32.sass` | `moe_w2_mm` | AFRAG (prefill), K=2048 |
+| `moe_w2_mm_mc4afrag_k1024_a32.cubin` | `moe_w2_mm_mc4afrag_k1024_a32.sass` | `moe_w2_mm` | AFRAG (prefill), K=1024 (TP2) |
+| `moe_w2_mm_mc4afrag_k512_a32.cubin` | `moe_w2_mm_mc4afrag_k512_a32.sass` | `moe_w2_mm` | AFRAG (prefill), K=512 (TP4), NWARP=4 |
+| `moe_w2_mm_mc4afrag_k6144_a32.cubin` | `moe_w2_mm_mc4afrag_k6144_a32.sass` | `moe_w2_mm` | AFRAG (prefill), K=6144 (GLM‑5.x) |
+| `moe_w2_mm_mc4afrag_k7168_a32.cubin` | `moe_w2_mm_mc4afrag_k7168_a32.sass` | `moe_w2_mm` | AFRAG (prefill), K=7168 (Kimi‑K2.x) |
 
 2‑bit planes = sign‑symmetric `{−4,−1,1,4}` + UE8M0 block‑32 scales; PRMT‑LUT in‑register
 decode → `QMMA.SF` tensor‑core. Regcount 64 → 4 CTA/SM.
@@ -98,18 +144,19 @@ expert stays intact, no intra‑layer shard) → it reuses the existing K=2048/4
 Generators `gen/gen_moe_w2.py <out.sass> <K>` and `gen/gen_moe_w4.py <out.sass> <K>` emit any K;
 **NWARP = split‑K warps is auto‑chosen as K/NWARP must be a multiple of 128 (K≥1024→8, K=512→4)**,
 and the loader (`moe_w2_cubit.py::_nwarp_for_k`) launches the matching thread count per K. Op‑validated
-by `gen/moe_w2_check.py` / `gen/moe_w4_check.py` (K=512 rel ~2–3e‑3, deterministic; M up to 16).
+by `gen/moe_w2_check.py` / `gen/moe_w4_check.py` (K=512 rel ~2–3e‑3, deterministic; M up to 16;
+`_a32` PASS across all K on RTX PRO 6000, AFRAG bit‑exact vs MC=4 per K via `gen/moe_w2_afrag_check.py`).
 
 ## FP4 "delta" tier GEMM
 | cubin | SASS | kernel | purpose |
 |---|---|---|---|
-| `moe_w4_mm_k4096.cubin` | `moe_w4_mm.sass` | `moe_w4_mm` | FP4 (e2m1) hot‑expert delta GEMM, K=4096 |
-| `moe_w4_mm_k2048.cubin` | `moe_w4_mm_k2048.sass` | `moe_w4_mm` | FP4 delta GEMM, K=2048 |
-| `moe_w4_mm_k1024.cubin` | `moe_w4_mm_k1024.sass` | `moe_w4_mm` | FP4 delta GEMM, **K=1024** (w2 under TP2) |
-| `moe_w4_mm_k512.cubin` | `moe_w4_mm_k512.sass` | `moe_w4_mm` | FP4 delta GEMM, **K=512** (w2 under TP4), NWARP=4 |
-| `moe_w4_mm_k6144.cubin` | `moe_w4_mm_k6144.sass` | `moe_w4_mm` | FP4 delta GEMM, **K=6144** (gate‑up @ hidden 6144 — **GLM‑5.x**) |
-| `moe_w4_mm_k7168.cubin` | `moe_w4_mm_k7168.sass` | `moe_w4_mm` | FP4 delta GEMM, **K=7168** (gate‑up @ hidden 7168 — **Kimi‑K2.x**) |
-| `moe_w4_mm_k8192.cubin` | `moe_w4_mm_k8192.sass` | `moe_w4_mm` | FP4 GEMM, **K=8192** (dense wo_b — dense‑FP4 PoC, pairs=1 desc) |
+| `moe_w4_mm_k4096_a32.cubin` | `moe_w4_mm_k4096_a32.sass` | `moe_w4_mm` | FP4 (e2m1) hot‑expert delta GEMM, K=4096 |
+| `moe_w4_mm_k2048_a32.cubin` | `moe_w4_mm_k2048_a32.sass` | `moe_w4_mm` | FP4 delta GEMM, K=2048 |
+| `moe_w4_mm_k1024_a32.cubin` | `moe_w4_mm_k1024_a32.sass` | `moe_w4_mm` | FP4 delta GEMM, **K=1024** (w2 under TP2) |
+| `moe_w4_mm_k512_a32.cubin` | `moe_w4_mm_k512_a32.sass` | `moe_w4_mm` | FP4 delta GEMM, **K=512** (w2 under TP4), NWARP=4 |
+| `moe_w4_mm_k6144_a32.cubin` | `moe_w4_mm_k6144_a32.sass` | `moe_w4_mm` | FP4 delta GEMM, **K=6144** (gate‑up @ hidden 6144 — **GLM‑5.x**) |
+| `moe_w4_mm_k7168_a32.cubin` | `moe_w4_mm_k7168_a32.sass` | `moe_w4_mm` | FP4 delta GEMM, **K=7168** (gate‑up @ hidden 7168 — **Kimi‑K2.x**) |
+| `moe_w4_mm_k8192_a32.cubin` | `moe_w4_mm_k8192_a32.sass` | `moe_w4_mm` | FP4 GEMM, **K=8192** (dense wo_b — dense‑FP4 PoC, pairs=1 desc) |
 
 ## Sparse‑MLA prefill (SM120)
 | cubin | SASS | kernel | purpose |

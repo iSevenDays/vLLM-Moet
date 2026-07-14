@@ -81,6 +81,19 @@ def pack_scales(s):
     return s.view(n // 16, 16, ks).transpose(1, 2).contiguous().flatten()
 
 
+def quant_a32(a):
+    """[M, K] f32 -> a32 activations: e4m3 codes + exact f32 per-32-group
+    scales + f32 dequant (amax/448 rule, same as production group-128 quant
+    just 4x finer; the e8m0-scale variant lost GSM8K accuracy — see
+    gen_moe_w2.py)."""
+    m, k = a.shape
+    ab = a.view(m, k // 32, 32)
+    a_s = (ab.abs().amax(-1).clamp_min(1e-10) / 448.0)
+    a8 = (ab / a_s[..., None]).clamp(-448, 448).to(torch.float8_e4m3fn).view(m, k)
+    deq = a8.float() * a_s.repeat_interleave(32, 1)
+    return a8, a_s, deq
+
+
 cu = Cuda()
 fn = cu.load_kernel(CUBIN, "moe_w4q_mm")
 fn_s = cu.load_kernel(W4S_CUBIN, "moe_w4s_mm") if W4S_CUBIN else None
@@ -92,19 +105,15 @@ for e in range(E):
     nibs = torch.randint(0, 16, (N, K), dtype=torch.uint8)
     nibs.view(-1)[:16] = torch.arange(16, dtype=torch.uint8)  # all nibbles
     sexp = torch.randint(120, 132, (N, K // 32), dtype=torch.uint8)
-    a = torch.randn(M, K) * 0.5
-    ab = a.view(M, K // 128, 128)
-    a_s = (ab.abs().amax(-1).clamp_min(1e-10) / 448.0)
-    a8 = (ab / a_s[..., None]).clamp(-448, 448).to(torch.float8_e4m3fn).view(M, K)
+    a8, a_s, a_deq = quant_a32(torch.randn(M, K) * 0.5)
 
     code = NIBBLE_TO_CODE[nibs.long()]
     scale = torch.exp2(sexp.float() - 127.0).repeat_interleave(32, 1)
     w_true = E2M1[nibs.long()] * scale        # TRUE FP4 — merge-free
-    a_full = a8.float() * a_s.float().repeat_interleave(128, 1)
-    refs.append(a_full @ w_true.T)
+    refs.append(a_deq @ w_true.T)
 
     d_a = cu.to_device(a8.view(torch.uint8).numpy())
-    d_as = cu.to_device(a_s.float().numpy().astype(np.float32).view(np.uint8))
+    d_as = cu.to_device(a_s.float().numpy().view(np.uint8))
     d_base = cu.to_device(pack_fragment_major(code).numpy())
     d_ref = cu.to_device(pack_quintal_fragment_major(nibs).numpy())
     d_bs = cu.to_device(pack_scales(sexp).numpy())

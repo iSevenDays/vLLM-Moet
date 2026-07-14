@@ -19,9 +19,6 @@ from vllm.model_executor.layers.quantization.utils import moe_w2_cubit  # noqa: 
 from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (  # noqa: E402
     mxfp4_to_codes, pack_fragment_major, pack_scales,
 )
-from vllm.model_executor.layers.quantization.utils.fp8_utils import (  # noqa: E402
-    per_token_group_quant_fp8,
-)
 
 assert moe_w2_cubit._ensure_ready(), "cubins not found"
 dev = torch.device("cuda")
@@ -58,9 +55,8 @@ topk_w = torch.rand(T, TOPK, device=dev) * 0.5
 
 got = moe_w2_cubit._moe_w2_forward(x, topk_w, topk_ids, 0)
 
-# ---- reference with the same activation-quant numerics
-a8, as8 = per_token_group_quant_fp8(x, 128)
-a_deq = a8.float() * as8.repeat_interleave(128, 1)
+# ---- reference with the same activation-quant numerics (a32 per-32)
+a_deq = moe_w2_cubit.a32_dequant_ref(x, gemm=1)
 ref = torch.zeros(T, H, device=dev)
 for t in range(T):
     for j in range(TOPK):
@@ -68,8 +64,8 @@ for t in range(T):
         w13d = dequant(w13_pack[e], s13[e])
         c13 = a_deq[t] @ w13d.T
         act = torch.nn.functional.silu(c13[:I]) * c13[I:]
-        q2, qs2 = per_token_group_quant_fp8(act.to(torch.bfloat16).unsqueeze(0), 128)
-        act_deq = q2.float() * qs2.repeat_interleave(128, 1)
+        act_deq = moe_w2_cubit.a32_dequant_ref(
+            act.to(torch.bfloat16).unsqueeze(0), gemm=2)
         w2d = dequant(w2_pack[e], s2[e])
         ref[t] += float(topk_w[t, j]) * (act_deq[0] @ w2d.T)
 
@@ -128,8 +124,8 @@ for t in range(T):
         w13d = (dq13(w13_pack[e], s13[e]))
         c13 = a_deq[t] @ w13d.T
         act = torch.nn.functional.silu(c13[:I]) * c13[I:]
-        q2, qs2 = per_token_group_quant_fp8(act.to(torch.bfloat16).unsqueeze(0), 128)
-        act_deq = q2.float() * qs2.repeat_interleave(128, 1)
+        act_deq = moe_w2_cubit.a32_dequant_ref(
+            act.to(torch.bfloat16).unsqueeze(0), gemm=2)
         w2d = dq2(w2_pack[e], s2[e])
         ref2[t] += float(topk_w[t, j]) * (act_deq[0] @ w2d.T)
 
@@ -179,8 +175,8 @@ for t in range(T):
         w13d = dq(w13_pack[e], s13[e])
         c13 = a_deq[t] @ w13d.T
         act = torch.nn.functional.silu(c13[:I]) * c13[I:]
-        q2, qs2 = per_token_group_quant_fp8(act.to(torch.bfloat16).unsqueeze(0), 128)
-        act_deq = q2.float() * qs2.repeat_interleave(128, 1)
+        act_deq = moe_w2_cubit.a32_dequant_ref(
+            act.to(torch.bfloat16).unsqueeze(0), gemm=2)
         w2d = dq(w2_pack[e], s2[e])
         ref3[t] += float(topk_w[t, j]) * (act_deq[0] @ w2d.T)
 

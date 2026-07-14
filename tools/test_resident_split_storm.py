@@ -38,9 +38,6 @@ from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (  # noq
     mxfp4_to_codes, mxfp4_to_nibbles, pack_fragment_major,
     pack_quintal_fragment_major, pack_scales, quintal_dequant,
 )
-from vllm.model_executor.layers.quantization.utils.fp8_utils import (  # noqa: E402
-    per_token_group_quant_fp8,
-)
 
 assert moe_w2_cubit._ensure_ready(), "cubins not found"
 moe_w2_delta._SPLIT = True
@@ -102,8 +99,9 @@ for li, l in enumerate(layers):
     host_rows[li] = torch.cat((rf13, rf2), dim=1)   # snapshot for I1/I3
 
 x = (torch.randn(T, H, device=dev) * 0.3).to(torch.bfloat16)
-a8, as8 = per_token_group_quant_fp8(x, 128)
-a_deq = a8.float() * as8.repeat_interleave(128, 1)
+# reference activations through the SAME a32 (per-32 f32-scale) roundtrip
+# the production forward applies
+a_deq = moe_w2_cubit.a32_dequant_ref(x, gemm=1)
 
 
 def deq2(pack, sc):
@@ -127,9 +125,8 @@ def reference(li, topk_ids, topk_w, fp4):
             dq = deq4 if e in fp4 else deq2
             c13 = a_deq[t] @ dq(l["w13"][e], l["s13"][e]).T
             act = torch.nn.functional.silu(c13[:I]) * c13[I:]
-            q2, qs2 = per_token_group_quant_fp8(
-                act.to(torch.bfloat16).unsqueeze(0), 128)
-            ad = q2.float() * qs2.repeat_interleave(128, 1)
+            ad = moe_w2_cubit.a32_dequant_ref(
+                act.to(torch.bfloat16).unsqueeze(0), gemm=2)
             ref[t] += float(topk_w[t, j]) * (ad[0] @ dq(l["w2"][e], l["s2"][e]).T)
     return ref
 

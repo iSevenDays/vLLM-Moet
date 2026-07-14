@@ -29,9 +29,6 @@ from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (  # noq
     mxfp4_to_codes, mxfp4_to_nibbles, pack_fp4_fragment_major,
     pack_fragment_major, pack_scales,
 )
-from vllm.model_executor.layers.quantization.utils.fp8_utils import (  # noqa: E402
-    per_token_group_quant_fp8,
-)
 
 assert moe_w2_cubit._ensure_ready(), "cubins not found"
 dev = torch.device("cuda")
@@ -143,8 +140,8 @@ def check_invariants(it, tier_, expected_row, label):
 
 
 x = (torch.randn(T, H, device=dev) * 0.3).to(torch.bfloat16)
-a8, as8 = per_token_group_quant_fp8(x, 128)
-a_deq = a8.float() * as8.repeat_interleave(128, 1)
+# a32 per-32 roundtrip — the production activation format
+a_deq = moe_w2_cubit.a32_dequant_ref(x, gemm=1)
 w2cache = {e: dequant2(w13_pack[e], s13[e]) for e in range(E)}
 w2cache2 = {e: dequant2(w2_pack[e], s2[e]) for e in range(E)}
 w4cache = {e: dequant4(w13_pack[e], s13[e]) for e in range(E)}
@@ -160,8 +157,8 @@ def reference(topk_ids, topk_w, fp4_set):
             wb = w4cache2[e] if e in fp4_set else w2cache2[e]
             c13 = a_deq[t] @ wa.T
             act = torch.nn.functional.silu(c13[:I]) * c13[I:]
-            q2, qs2 = per_token_group_quant_fp8(act.to(torch.bfloat16).unsqueeze(0), 128)
-            act_deq = q2.float() * qs2.repeat_interleave(128, 1)
+            act_deq = moe_w2_cubit.a32_dequant_ref(
+                act.to(torch.bfloat16).unsqueeze(0), gemm=2)
             ref[t] += float(topk_w[t, j]) * (act_deq[0] @ wb.T)
     return ref
 

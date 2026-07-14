@@ -1,29 +1,45 @@
 #!/usr/bin/env python3
-"""Generate sass/moe_w2_mm.sass — M<=4 GEMM over 2-bit tensor-sym planes.
+"""Generate sass/moe_w2_mm*_a32.sass — M<=4 GEMM over 2-bit tensor-sym
+planes, per-32 f32-scaled A (a32 format rev).
 
-C[M,N] (bf16) = A(fp8 e4m3, [M,K]) @ W(2-bit codes {-4,-1,1,4} fragment-
-major plane, block-32 UE8M0 scales) ^T, with per-token-group-128 f32
-activation scales folded per kb128 (the proven skinny fold structure).
+C[M,N] (bf16) = A(fp8 e4m3 + f32 per-32-group scales, [M,K]) @ W(2-bit
+codes {-4,-1,1,4} fragment-major plane, block-32 UE8M0 scales) ^T.
 
-Differences vs gen_skinny_fp8 (ABI2 fold):
-  - B source: 2-bit plane (N*K/4 bytes). Per lane per k64: LDG.E.64 of the
-    8-byte fragment chunk -> PRMT-LUT decode to e4m3 bytes on the INT pipe.
-  - B scales: block-32 UE8M0 bytes feed QMMA.SF's sfb DIRECTLY per k32
-    per TILE (sfb scales the lane's QMMA column = one W row; tile0/tile1
-    cover different rows -> separate bytes). sfa stays neutral; the A f32
-    scale folds per kb128.
-  - Per-expert indirection: d_b/d_bs/d_a/d_as/d_c base pointers are read
-    from a DESC TABLE indexed by blockIdx.y (one launch covers all
-    (expert, token-group) pairs of a layer): desc = 6 x u64 per pair
-    {a, as, b, bs, c, m_rows}. K/N are compile-time per cubin.
-  - Scales plane layout (packer pack_scales): sbyte[nb, ks, row16] at
-    offset (nb*(K/32) + ks)*16 + r, r = row inside the 16-row block.
-    Lane (g,t) loads r=g (tile0) and r=8+g (tile1) per k32: 4x LDG.E.U8
-    per k64, L1-hot (64B/k64 shared by the whole CTA).
+a32 vs the original a128 format: the A-side scale was f32 per-token-
+group-128, folded into the f32 masters once per kb128 (FFMA). a32
+reads the scale plane at PER-32 stride (f32 [rows, K/32], desc `as`
+row stride (K/32)*4) and folds once per k32 — broadcasting one scale
+over consecutive 32-groups is identical to quantizing at a coarser
+group, so ONE cubin set serves activation groups {32, 64, 128},
+selected host-side (VLLM_MOE_W2_A32_G1/G2 + _UE8M0).
 
-Geometry: grid.x = N/16, grid.y = num pairs; NWARP=8 split-K (the
-acceptance-parity-proven structure), smem reduce, bf16 epilogue --
-all inherited verbatim from skinny.
+Measured outcome (GSM8K-200, 2x6000 quintal tau 1.0; the reason the
+per-32 groups this rev was built for are NOT the default): finer A
+groups did not shorten completions and cost accuracy vs the 2-bit/
+quintal weight planes — 32/32 f32 95.5%/127tok, 32/32 e8m0 (native
+MXFP8 A format, via QMMA.SF sfa) 95.5%/122, 32/128 f32 96.5%/124,
+while 128/128+ue8m0 (the exact a128 numerics on these kernels)
+reproduces 97.0%/122 (a128 anchor 97.0%/125, native 97.0%/116).
+Production defaults = 128/128/ue8m0; op-level the finer groups
+measure BETTER (bf16-ref worst_rel 1.0-1.2x lower), so the loss is
+a serving-distribution effect, not a kernel defect.
+
+Differences vs gen_skinny_fp8 inherited by the a128 lineage and kept:
+  - B source: 2-bit plane (N*K/4 bytes). Per lane per k64: LDG.E.64 of
+    the 8-byte fragment chunk -> PRMT-LUT decode to e4m3 on the INT pipe.
+  - B scales: block-32 UE8M0 bytes feed QMMA.SF's sfb per k32 per TILE;
+    sfa stays neutral.
+  - Per-expert indirection: desc = 6 x u64 per pair {a, as, b, bs, c,
+    m_rows} indexed by blockIdx.y; K/N compile-time per cubin.
+  - Scales plane layout (pack_scales): sbyte[nb, ks, row16] at offset
+    (nb*(K/32) + ks)*16 + r.
+
+Geometry: grid.x = N/16, grid.y = num pairs; NWARP split-K, smem
+reduce, bf16 epilogue. MC=1 (decode, M<=4) and MC=4 (prefill, full
+m16 QMMA tile) ship; AFRAG (fragment-major A codes) rides on MC=4.
+The a128-era MC=2 and MB=2 experiments are RETIRED here (superseded
+by MC=4/AFRAG; never launched by the server) — regenerate from git
+history if the bench ever needs them.
 """
 
 import os
@@ -43,27 +59,16 @@ def _nwarp(k):
 
 NWARP = int(os.environ.get("MOEW2_NWARP", "0")) or _nwarp(K)
 MC = int(os.environ.get("MOEW2_MC", "1"))      # m-chunks per pair-entry
-# MC=1: c0/c1 only (rows 0..7);  MC=2: + chunk1 at +4 rows (rows 0..11);
-# MC=4: fold the QMMA's c2/c3 quadrants too -> rows 8..15 in the SAME decode
-#       pass = the FULL m16 tile (16 tokens, no wasted rows), one QMMA set.
-assert MC in (1, 2, 4)
-# MB = m16-tile blocking factor (PREFILL lever). MB=2 processes TWO m16 tiles
-# (32 tokens/pair-entry) per CTA, decoding each 2-bit weight fragment ONCE and
-# re-issuing the QMMA set against a 2nd token sub-tile. Profile finding: prefill
-# is L1/load-issue bound (DRAM 17%, L2 hit 89%), with ~18 decode-ALU ops/QMMA the
-# dominant cost -> amortizing decode+weight-loads across 2 sub-tiles cuts ~40% of
-# total work. Costs 2x accumulator regs (regcount 128 -> 2 CTA/SM). Requires the
-# full m16 tile (MC=4) as the sub-tile primitive.
-MB = int(os.environ.get("MOEW2_MB", "1"))
-assert MB in (1, 2)
-if MB == 2:
-    assert MC == 4, "MB=2 requires MC=4 (full m16 sub-tile)"
+# MC=1: decode (rows 0..7 via c0/c1; rows 8..15 stay zero);  MC=4: the c2/c3
+# QMMA quadrants carry rows 8..15 in the SAME decode pass = the FULL m16 tile.
+# With sfa applying the per-row A scale in-instruction, MC=4 no longer needs
+# a second scale register or split masters: the QMMA quad IS the master.
+assert MC in (1, 4), "a32 supports MC=1 (decode) and MC=4 (prefill) only"
 # AFRAG=1: the activation A is pre-packed FRAGMENT-MAJOR so each lane's whole
 # m16k32 QMMA A-fragment (4 words) is contiguous -> ONE LDG.E.128 replaces the 4
 # strided 4-byte LDG.E per k32. Cuts A-load instructions 4x (8->2 per k64). A is
 # 55% of the LDG mix and the kernel is L1/load-issue bound at 4 CTA/SM, so this
-# is the occupancy-NEUTRAL lever (regcount unchanged -> still 4 CTA/SM, unlike
-# MB=2 which halves occupancy). The packer is pack_a_fragment_major (bench/glue).
+# is the occupancy-NEUTRAL lever. The packer is pack_a_fragment_major/glue.
 AFRAG = int(os.environ.get("MOEW2_AFRAG", "0"))
 assert AFRAG in (0, 1)
 if AFRAG:
@@ -81,20 +86,19 @@ def L(s=""):
     OUT.append(s)
 
 
-L("// moe_w2_mm — M<=4 GEMM over 2-bit tensor-sym planes (GENERATED by")
-L("// tools/gen_moe_w2.py — edit the generator, not this file).")
+L("// moe_w2_mm — M<=4 GEMM over 2-bit tensor-sym planes, per-32 f32 A scales")
+L("// (a32 — GENERATED by gen/gen_moe_w2.py; edit the generator, not this file).")
 L("// PRMT-LUT decode {-4,-1,1,4} -> e4m3; block-32 UE8M0 via QMMA.SF sfb;")
-L("// A-side f32 scales folded per kb128; per-(expert,token-group) desc")
-L("// table indexed by CTAID.Y. Skinny-fold lineage (multi-CTA safe).")
+L("// A f32 scales folded per k32 (a128 folded per kb128 — the 4x-coarser")
+L("// groups were the last activation-precision gap vs native);")
+L("// per-(expert,token-group) desc table indexed by CTAID.Y.")
 L(".entry moe_w2_mm")
-# MB=2 carries 2x the accumulator/A state -> no regcount-64 renumber; declare the
-# full file up to the stub-reserved top pair (regcount 128 = 2 CTA/SM).
-L(f"    .reg R0-R{125 if MB == 2 else 95}")
+L("    .reg R0-R95")
 L("    .param u64 d_desc")        # [pairs][6] u64 table
 L("    .param u32 ldb")           # K (bytes per A row; codes row = K/4)
 L("    .param u32 n_k64")
 L("    .param u32 ldc")           # N*2
-L("    .param u32 n_kb128")
+L("    .param u32 n_kb128")       # K/128 (As row stride = n_kb128*16 B = K/8)
 L(f"    .shared .align 16 smem[{SMEM}]")
 L()
 L("    // ---- prologue ----")
@@ -129,21 +133,11 @@ L("    ISETP.EQ.AND P4, PT, R79, RZ, PT ;")
 L("    @P4 EXIT ;")
 L("    LDC R78, c[0x0][0x390] ;                 // ldc")
 L()
-L("    // P2: g < m_rows (rows 0..7); P5: chunk1 (MC=2, g<m_rows-4) OR the")
-L("    //     c2/c3 upper-half rows 8..15 (MC=4, g<m_rows-8 i.e. g+8<m_rows)")
+L("    // P2: g < m_rows (A row-g loads); P5 (MC=4): g+8 < m_rows (c2/c3 rows)")
 L("    ISETP.LT.AND P2, PT, R87, R79, PT ;")
-L("    ISETP.EQ.AND P3, PT, R88, RZ, P2 ;")
-if MC == 2:
-    L("    IADD3 R0, PT, PT, R79, -0x4, RZ ;")
-    L("    ISETP.LT.AND P5, PT, R87, R0, PT ;")
-elif MC == 4:
+if MC == 4:
     L("    IADD3 R0, PT, PT, R79, -0x8, RZ ;")
     L("    ISETP.LT.AND P5, PT, R87, R0, PT ;")  # P5: g+8 < m_rows
-if MB == 2:
-    L("    IADD3 R0, PT, PT, R79, -0x10, RZ ;")
-    L("    ISETP.LT.AND P6, PT, R87, R0, PT ;")  # P6: g+16 < m_rows (rows 16..23)
-    L("    IADD3 R0, PT, PT, R79, -0x18, RZ ;")
-    L("    ISETP.LT.AND P7, PT, R87, R0, PT ;")  # P7: g+24 < m_rows (rows 24..31)
 L()
 L(f"    // B plane ptr: (ctaid.x*(K/64) + wid*(KSLICE/64)) blocks of 256B,")
 L("    // + lane*8 inside the block")
@@ -164,7 +158,7 @@ L("    SHF.L.U32 R1, R1, 0x4, RZ ;              // *16")
 L("    IADD3 R1, PT, PT, R1, R87, RZ ;          // + g")
 L("    IMAD.WIDE.U32 R74, R1, 0x1, R74 ;        // -> R74: lane's sbyte ptr")
 L()
-L("    // A row ptr (row g, direct fp8) + As ptr (f32 [M, K/128])")
+L("    // A row ptr (row g, direct fp8)")
 if AFRAG:
     L(f"    // A-frag ptr: base + wid*(16*KSLICE) + lane*32 ; LDG.128 per k32")
     L(f"    IMAD R0, R85, {hex(16 * KSLICE)}, RZ ;   // wid * 16*KSLICE bytes")
@@ -175,61 +169,39 @@ else:
     L("    IMAD.WIDE.U32 R64, R89, 0x1, R64 ;       // + 4t")
     L(f"    IMAD R0, R85, {hex(KSLICE)}, RZ ;")
     L("    IMAD.WIDE.U32 R64, R0, 0x1, R64 ;        // + wid K-slice")
-L("    SHF.L.U32 R0, R84, 0x2, RZ ;             // As row stride = n_kb128*4")
+L("    // As ptr (f32 [rows, K/32] — per-32 groups, 4x finer than a128)")
+L("    SHF.L.U32 R0, R84, 0x4, RZ ;             // As row stride = n_kb128*16 = K/8")
 L("    IMAD.WIDE.U32 R66, R87, R0, R66 ;        // + g*stride")
-L(f"    IMAD.WIDE.U32 R66, R85, {hex((KSLICE // 128) * 4)}, R66 ;")
-if MB == 2:
-    L("    // sub-tile1 (tokens 16..31) bases: A1 = A0 + 16*K ; As1 = As0 + 16*stride")
-    L("    IMAD.WIDE.U32 R60, R82, 0x10, R64 ;      // R60: A1 row ptr (row 16+g)")
-    L("    IMAD.WIDE.U32 R58, R0, 0x10, R66 ;       // R58: As1 ptr (row 16+g)")
+L(f"    IMAD.WIDE.U32 R66, R85, {hex(KSLICE // 8)}, R66 ;  // + wid slice")
 L()
-L("    // constants: pad A words zero, LUT, neutral sfa, kb accs zero")
+L("    // constants: pad A words zero, LUT, neutral sfa, As regs zero, accs zero")
 L("    MOV R28, 0x7f7f7f7f ;                    // sfa neutral")
-for r in (5, 7, 21, 23, 4, 6, 20, 22, 30, 31, 40, 41, 42, 43, 44, 45, 46, 47):
+_zero = [5, 7, 21, 23, 4, 6, 20, 22, 30, 31, 40, 41, 42, 43, 44, 45, 46, 47]
+if MC == 4:
+    _zero += [10, 11]                            # As[g+8] k32a/b (MC=4 folds)
+for r in _zero:
     L(f"    MOV R{r}, RZ ;")
 L("    MOV R27, 0x4838b8c8 ;                    // PRMT LUT: -4,-1,1,4 e4m3")
-# MC=2: R50/51/54/55 are repurposed as pointers (A/As), do NOT zero them here
-# (the ACC store emits RZ for those padded-row slots instead).
-_acc_init = [48, 49, 52, 53] if MC == 2 else [48, 49, 50, 51, 52, 53, 54, 55]
-for r in _acc_init:
+for r in list(range(ACC0, ACC0 + 4)) + list(range(ACC1, ACC1 + 4)):
     L(f"    MOV R{r}, RZ ;")
-if MB == 2:
-    # sub-tile1: acc1 R96-103, masters1 R104-111, A1 data R112-119, As1 R120/121.
-    # Zero A1/As1 so predicated-off (pad) rows multiply 0 into the masters.
-    for r in range(96, 122):
-        L(f"    MOV R{r}, RZ ;")
-if MC == 2:
-    # chunk-1 kb-locals (R48-55 -> moved: locals ch1 = R16-19 unusable...
-    # map: ch1 locals R58-61(c0) R62-63+R72-73(c1)?? NO - see emit: ch1
-    # locals = R90? Final map: ch1 kb-locals 40..47 SHARED via reuse is
-    # impossible; ch1 locals live in R58-65?? R64+ are pointers. We use
-    # R12-R19 (desc regs dead after prologue, A pads unused for ch1).
-    for r in (12, 13, 14, 15, 16, 17, 18, 19):
-        L(f"    MOV R{r}, RZ ;")          # ch1 kb-locals c0=R12-15 c1=R16-19
-    for r in (58, 59, 62, 63):           # ch1 masters (60/61 -> Bs ptr;
-        L(f"    MOV R{r}, RZ ;")          # 72/73 freed -> RZ in ACC store)
-    L("    MOV R31, RZ ;                            // ch1 As")
 L()
 
 
 def emit_k64(j):
-    """One k64: load 8B codes + 4 sbytes + A bytes; decode; 4x QMMA; fold/2."""
+    """One k64: load 8B codes + 4 B-sbytes + 2(4) A f32 scales + A bytes;
+    decode; per k32: 2x QMMA into kb-accs then FFMA fold into the masters
+    (the a128 fold ran once per kb128 — per-32 A groups fold every k32)."""
     plane_off = 0x100 * j           # 256B per k64 block (32 lanes x 8B)
     aoff = 0x40 * j
     soff = 0x20 * j                 # 2 k32 x 16 row bytes per k64
-    kb = j // 2
-    L(f"    // ---- k64 {j} (kb128 {kb}) ----")
-    if j % 2 == 0:
-        L(f"    @P2 LDG.E R30, desc[UR4][R66.64+{hex(kb * 4)}] ;  // As[g,kb] f32")
-        if MC == 2:
-            as_ck = 4 * ((globals().get("K") or K) // 128) * 4
-            L(f"    @P5 LDG.E R31, desc[UR4][R66.64+{hex(kb * 4 + as_ck)}] ;  // ch1 As")
-        elif MC == 4:
-            as_ck = 8 * ((globals().get("K") or K) // 128) * 4  # +8 rows
-            L(f"    @P5 LDG.E R31, desc[UR4][R66.64+{hex(kb * 4 + as_ck)}] ;  // As[g+8,kb]")
-        if MB == 2:
-            L(f"    @P6 LDG.E R120, desc[UR4][R58.64+{hex(kb * 4)}] ;        // As[g+16,kb]")
-            L(f"    @P7 LDG.E R121, desc[UR4][R58.64+{hex(kb * 4 + as_ck)}] ;  // As[g+24,kb]")
+    as_off = 8 * j                  # 2 f32 scales per k64
+    L(f"    // ---- k64 {j} ----")
+    L(f"    @P2 LDG.E R30, desc[UR4][R66.64+{hex(as_off)}] ;      // As[g, k32a]")
+    L(f"    @P2 LDG.E R31, desc[UR4][R66.64+{hex(as_off + 4)}] ;  // As[g, k32b]")
+    if MC == 4:
+        as_ck = 8 * ((globals().get("K") or K) // 8)             # +8 rows (K/8 B each)
+        L(f"    @P5 LDG.E R10, desc[UR4][R66.64+{hex(as_off + as_ck)}] ;      // As[g+8, k32a]")
+        L(f"    @P5 LDG.E R11, desc[UR4][R66.64+{hex(as_off + 4 + as_ck)}] ;  // As[g+8, k32b]")
     # 2-bit fragment chunk: R24 = bytes [t0a_lo, t0a_hi, t0b_lo, t0b_hi],
     #                       R25 = tile1 likewise
     L(f"    LDG.E.64 R24, desc[UR4][R8.64+{hex(plane_off)}] ;     // codes 8B")
@@ -243,9 +215,6 @@ def emit_k64(j):
         # pad rows are zero in the buffer and masked at store).
         L(f"    LDG.E.128 R4, desc[UR4][R64.64+{hex(0x400 * j)}] ;        // A-frag k32a rows0-15 -> R4-7")
         L(f"    LDG.E.128 R20, desc[UR4][R64.64+{hex(0x400 * j + 0x10)}] ;  // A-frag k32b rows0-15 -> R20-23")
-        if MB == 2:
-            L(f"    LDG.E.128 R112, desc[UR4][R60.64+{hex(0x400 * j)}] ;      // sub1 A-frag k32a rows16-31")
-            L(f"    LDG.E.128 R116, desc[UR4][R60.64+{hex(0x400 * j + 0x10)}] ;  // sub1 A-frag k32b rows16-31")
     else:
         L(f"    @P2 LDG.E R4, desc[UR4][R64.64+{hex(aoff)}] ;         // A w0 lo (a0 row g)")
         L(f"    @P2 LDG.E R6, desc[UR4][R64.64+{hex(aoff + 0x10)}] ;  // A w2 (a2 row g)")
@@ -259,17 +228,6 @@ def emit_k64(j):
             L(f"    @P5 LDG.E R7, desc[UR4][R64.64+{hex(aoff + 0x10 + a_ck)}] ;   // a3 k32a row g+8")
             L(f"    @P5 LDG.E R21, desc[UR4][R64.64+{hex(aoff + 0x20 + a_ck)}] ;  // a1 k32b row g+8")
             L(f"    @P5 LDG.E R23, desc[UR4][R64.64+{hex(aoff + 0x30 + a_ck)}] ;  // a3 k32b row g+8")
-            if MB == 2:
-                # sub-tile1 A: rows 16..23 (P6) + rows 24..31 (P7), base R60 (=A0+16*K).
-                # fragment {R112..R115}=k32a, {R116..R119}=k32b; even=low rows, odd=high.
-                L(f"    @P6 LDG.E R112, desc[UR4][R60.64+{hex(aoff)}] ;          // rows16-23 k32a q0")
-                L(f"    @P6 LDG.E R114, desc[UR4][R60.64+{hex(aoff + 0x10)}] ;   // rows16-23 k32a q1")
-                L(f"    @P6 LDG.E R116, desc[UR4][R60.64+{hex(aoff + 0x20)}] ;   // rows16-23 k32b q0")
-                L(f"    @P6 LDG.E R118, desc[UR4][R60.64+{hex(aoff + 0x30)}] ;   // rows16-23 k32b q1")
-                L(f"    @P7 LDG.E R113, desc[UR4][R60.64+{hex(aoff + a_ck)}] ;          // rows24-31 k32a q0")
-                L(f"    @P7 LDG.E R115, desc[UR4][R60.64+{hex(aoff + 0x10 + a_ck)}] ;   // rows24-31 k32a q1")
-                L(f"    @P7 LDG.E R117, desc[UR4][R60.64+{hex(aoff + 0x20 + a_ck)}] ;   // rows24-31 k32b q0")
-                L(f"    @P7 LDG.E R119, desc[UR4][R60.64+{hex(aoff + 0x30 + a_ck)}] ;   // rows24-31 k32b q1")
     L("    // spread 2-bit codes to nibble selectors + PRMT decode")
     # byte b of R24 -> selector word; chunk order [t0a_lo, t0a_hi, t0b_lo,
     # t0b_hi]; decode into B regs: k32a tile0 pair (R32,R33), k32b (R34,R35)
@@ -290,66 +248,32 @@ def emit_k64(j):
         L("    IMAD R1, R3, 0x10, R1 ;")
         L("    IMAD R1, R0, 0x40, R1 ;")
         L(f"    PRMT R{dst}, R27, R1, RZ ;               // 4x e4m3 bytes")
-    L("    // QMMA per k32 per m-chunk; sfb = lane's COLUMN row scale")
-    L("    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R4.ROW, R32.COL, R40, R28, R26, UR6 ;")
-    L("    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R4.ROW, R36.COL, R44, R28, R29, UR6 ;")
-    L("    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R20.ROW, R34.COL, R40, R28, R56, UR6 ;")
-    L("    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R20.ROW, R38.COL, R44, R28, R57, UR6 ;")
-    if MB == 2:
-        L("    // sub-tile1: SAME decoded weight R32-39 + scale bytes, 2nd token tile")
-        L("    QMMA.SF.16832.F32.E4M3.E4M3.E8 R96, R112.ROW, R32.COL, R96, R28, R26, UR6 ;")
-        L("    QMMA.SF.16832.F32.E4M3.E4M3.E8 R100, R112.ROW, R36.COL, R100, R28, R29, UR6 ;")
-        L("    QMMA.SF.16832.F32.E4M3.E4M3.E8 R96, R116.ROW, R34.COL, R96, R28, R56, UR6 ;")
-        L("    QMMA.SF.16832.F32.E4M3.E4M3.E8 R100, R116.ROW, R38.COL, R100, R28, R57, UR6 ;")
-    if MC == 2:
-        ck = 4 * (globals().get("K") or K)
-        L(f"    @P5 LDG.E R4, desc[UR4][R64.64+{hex(aoff + ck)}] ;       // ch1 A")
-        L(f"    @P5 LDG.E R6, desc[UR4][R64.64+{hex(aoff + 0x10 + ck)}] ;")
-        L(f"    @P5 LDG.E R20, desc[UR4][R64.64+{hex(aoff + 0x20 + ck)}] ;")
-        L(f"    @P5 LDG.E R22, desc[UR4][R64.64+{hex(aoff + 0x30 + ck)}] ;")
-        L("    QMMA.SF.16832.F32.E4M3.E4M3.E8 R12, R4.ROW, R32.COL, R12, R28, R26, UR6 ;")
-        L("    QMMA.SF.16832.F32.E4M3.E4M3.E8 R16, R4.ROW, R36.COL, R16, R28, R29, UR6 ;")
-        L("    QMMA.SF.16832.F32.E4M3.E4M3.E8 R12, R20.ROW, R34.COL, R12, R28, R56, UR6 ;")
-        L("    QMMA.SF.16832.F32.E4M3.E4M3.E8 R16, R20.ROW, R38.COL, R16, R28, R57, UR6 ;")
-        L(f"    @P2 LDG.E R4, desc[UR4][R64.64+{hex(aoff + 0x40)}] ;     // ch0 A next" if False else "    // (ch0 A for next k64 loaded at its emit)")
-    if j % 2 == 1:
-        L(f"    // fold kb128 {kb}: master += acc_kb * As (B scale already in SF)")
-        L("    FFMA R48, R40, R30, R48 ;")
-        L("    FFMA R49, R41, R30, R49 ;")
-        L("    FFMA R52, R44, R30, R52 ;")
-        L("    FFMA R53, R45, R30, R53 ;")
+    def fold(x, y):
+        """masters += kb-acc * As (x = As[g] reg, y = As[g+8] reg), acc reset.
+        B block scale is already applied in-QMMA via sfb."""
+        L(f"    FFMA R48, R40, {x}, R48 ;")
+        L(f"    FFMA R49, R41, {x}, R49 ;")
+        L(f"    FFMA R52, R44, {x}, R52 ;")
+        L(f"    FFMA R53, R45, {x}, R53 ;")
         L("    MOV R40, RZ ; MOV R41, RZ ;")
         L("    MOV R44, RZ ; MOV R45, RZ ;")
         if MC == 4:
-            # c2/c3 (rows g+8) scaled by As[g+8] (R31) -> masters R50/51 (t0),
-            # R54/55 (t1); reset the c2/c3 acc slots for the next kb128.
-            L("    FFMA R50, R42, R31, R50 ;")
-            L("    FFMA R51, R43, R31, R51 ;")
-            L("    FFMA R54, R46, R31, R54 ;")
-            L("    FFMA R55, R47, R31, R55 ;")
+            L(f"    FFMA R50, R42, {y}, R50 ;")
+            L(f"    FFMA R51, R43, {y}, R51 ;")
+            L(f"    FFMA R54, R46, {y}, R54 ;")
+            L(f"    FFMA R55, R47, {y}, R55 ;")
             L("    MOV R42, RZ ; MOV R43, RZ ;")
             L("    MOV R46, RZ ; MOV R47, RZ ;")
-        if MB == 2:
-            L("    // fold sub-tile1: rows16-23 *As[g+16] (R120), rows24-31 *As[g+24] (R121)")
-            L("    FFMA R104, R96, R120, R104 ;")
-            L("    FFMA R105, R97, R120, R105 ;")
-            L("    FFMA R108, R100, R120, R108 ;")
-            L("    FFMA R109, R101, R120, R109 ;")
-            L("    FFMA R106, R98, R121, R106 ;")
-            L("    FFMA R107, R99, R121, R107 ;")
-            L("    FFMA R110, R102, R121, R110 ;")
-            L("    FFMA R111, R103, R121, R111 ;")
-            L("    MOV R96, RZ ; MOV R97, RZ ;")
-            L("    MOV R100, RZ ; MOV R101, RZ ;")
-            L("    MOV R98, RZ ; MOV R99, RZ ;")
-            L("    MOV R102, RZ ; MOV R103, RZ ;")
-        if MC == 2:
-            L("    FFMA R58, R12, R31, R58 ;")
-            L("    FFMA R59, R13, R31, R59 ;")
-            L("    FFMA R62, R16, R31, R62 ;")
-            L("    FFMA R63, R17, R31, R63 ;")
-            L("    MOV R12, RZ ; MOV R13, RZ ;")
-            L("    MOV R16, RZ ; MOV R17, RZ ;")
+
+    L("    // QMMA + fold per k32 (sfb = lane's COLUMN row scale, tile-exact)")
+    L("    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R4.ROW, R32.COL, R40, R28, R26, UR6 ;")
+    L("    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R4.ROW, R36.COL, R44, R28, R29, UR6 ;")
+    L("    // fold k32a: masters += acc * As[·, k32a]")
+    fold("R30", "R10")
+    L("    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R20.ROW, R34.COL, R40, R28, R56, UR6 ;")
+    L("    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R20.ROW, R38.COL, R44, R28, R57, UR6 ;")
+    L("    // fold k32b: masters += acc * As[·, k32b]")
+    fold("R31", "R11")
 
 
 n_k64 = KSLICE // 64
@@ -377,15 +301,13 @@ L("    // ---- epilogue: smem split-K reduce + bf16 store (skinny lineage) ----"
 L("    IMAD R0, R85, 0x400, RZ ;")
 L("    SHF.L.U32 R1, R86, 0x4, RZ ;")
 L("    IADD3 R0, PT, PT, R0, R1, RZ ;")
-# slots 2,3 of each ACC are the c2/c3 (row g+8) outputs. MC=1/2 don't fold them
-# -> store RZ (frees R50/51/54/55 for the MC=2 pointer renumber). MC=4 folds them
-# into R50/51/54/55 (rows 8..15) -> store the real masters.
-def _acc_slot(base, i):
-    return f"R{base + i}" if (i < 2 or MC == 4) else "RZ"
+# Master slots 2,3 (c2/c3 = rows 8..15) are folded only at MC=4; at MC=1 they
+# stay exactly zero (never folded, A rows 8..15 never loaded) and the store
+# predicate row < m_rows masks them anyway.
 for i in range(4):
-    L(f"    STS [R0+{hex(i * 4)}], {_acc_slot(ACC0, i)} ;")
+    L(f"    STS [R0+{hex(i * 4)}], R{ACC0 + i} ;")
 for i in range(4):
-    L(f"    STS [R0+{hex(0x200 + i * 4)}], {_acc_slot(ACC1, i)} ;")
+    L(f"    STS [R0+{hex(0x200 + i * 4)}], R{ACC1 + i} ;")
 L("    BAR.SYNC.DEFER_BLOCKING 0x0 ;")
 L()
 
@@ -434,34 +356,6 @@ def emit_reduce_store(slot_base, row_off=0):
 
 for base in range(0, 256, min(NTHR, 256)):
     emit_reduce_store(base)
-if MB == 2:
-    L("    // ---- sub-tile1 epilogue: reuse smem slots, store rows 16..31 ----")
-    L("    BAR.SYNC.DEFER_BLOCKING 0x0 ;")    # sub-tile0 reduce reads done
-    L("    IMAD R0, R85, 0x400, RZ ;")
-    L("    SHF.L.U32 R1, R86, 0x4, RZ ;")
-    L("    IADD3 R0, PT, PT, R0, R1, RZ ;")
-    for i, r in enumerate((104, 105, 106, 107)):     # tile0 c0,c1,c2,c3 (rows16-23/24-31)
-        L(f"    STS [R0+{hex(i * 4)}], R{r} ;")
-    for i, r in enumerate((108, 109, 110, 111)):     # tile1
-        L(f"    STS [R0+{hex(0x200 + i * 4)}], R{r} ;")
-    L("    BAR.SYNC.DEFER_BLOCKING 0x0 ;")
-    for base in range(0, 256, min(NTHR, 256)):
-        emit_reduce_store(base, row_off=16)
-if MC == 2:
-    L("    // ---- chunk-1 epilogue: same smem slots, rows +4 ----")
-    L("    BAR.SYNC.DEFER_BLOCKING 0x0 ;")
-    L("    IMAD R0, R85, 0x400, RZ ;")
-    L("    SHF.L.U32 R1, R86, 0x4, RZ ;")
-    L("    IADD3 R0, PT, PT, R0, R1, RZ ;")
-    # tile0 valid = R58,59 (slots 0,1); tile1 valid = R62,63; the rest are padded
-    # zero rows -> RZ, freeing R60/61 (Bs ptr) and R72/73 for the MC=2 renumber.
-    for i, r in enumerate((58, 59, "RZ", "RZ")):
-        L(f"    STS [R0+{hex(i * 4)}], {r if isinstance(r, str) else f'R{r}'} ;")
-    for i, r in enumerate((62, 63, "RZ", "RZ")):
-        L(f"    STS [R0+{hex(0x200 + i * 4)}], {r if isinstance(r, str) else f'R{r}'} ;")
-    L("    BAR.SYNC.DEFER_BLOCKING 0x0 ;")
-    for base in range(0, 256, min(NTHR, 256)):
-        emit_reduce_store(base, row_off=4)
 L("    EXIT ;")
 
 # OCCUPANCY: regcount = (max_reg+32)&~31 (main.rs) -> need max_reg<=63 for
@@ -470,57 +364,29 @@ L("    EXIT ;")
 # ctaid.x/ldc/d_c/m_rows) are RECOMPUTED in the epilogue so their loop-spanning
 # live intervals vanish; they must land OUTSIDE the reduce's scratch set
 # {R2-5,14-26,30,31}. NB: R62/R63 are ILLEGAL as MOV-dest / LDG-addr-base on
-# SM120 -> never target them with a pointer (FFMA/STS dest is fine, see MC=2 ch1).
-# MC=4 keeps the full c0..c3 fragment live (8 masters R48-55 + 2 As R30/31). Its
-# extra loop-live regs (R31, R50/51/54/55) and extra A loads (R5/7/21/23) are NOT
-# remap TARGETS below and the MC=4 loop has the SAME free set as MC=1 (no ch1) ->
-# the MC=1 <=R61 renumber applies verbatim, giving regcount 64 = 4 CTA/SM (same
-# occupancy as MC=2 but 16 tokens/pair). If it ever stops fitting, drop MC=4 from
-# the branch to fall back to the un-renumbered R0-R92 = regcount 96.
-_remap = _maxreg = None
-if MC in (1, 4) and MB != 2:
-    # R12-R19 are free in the MC=1/MC=4 loop (ch1-only) -> Bs + ctaid.y/m_rows there.
-    _remap = {
-        64: 58, 65: 59, 66: 60, 67: 61,                    # A, As (loop-live)
-        74: 16, 75: 17,                                    # Bs (loop-live; R16/17 free)
-        68: 32, 69: 33,                                    # d_b base (prologue)
-        80: 34, 81: 35, 82: 36, 83: 37, 84: 38, 85: 39,    # tid,ctaid.x,K,nk64,nkb128,wid
-        86: 44, 87: 45, 88: 46, 89: 47, 92: 18,            # lane,g,t,4t,ctaid.y
-        76: 42, 77: 43, 78: 41, 79: 40,                    # d_c, ldc, m_rows
-    }
-    _maxreg = 61
-elif MC == 2:
-    # MC=2 loop fills R0-R63; the ONLY <=63 slots free across the loop are the
-    # padded-row master pairs (R50/51, R54/55, R60/61 -- now stored as RZ) ->
-    # put the 3 loop pointers there. R62/63 stay as real ch1 tile1 masters.
-    # Prologue-only IDs -> R6/7 + R13-R19 (A-pad / ch1 acc_kb, free pre-loop);
-    # epilogue-recomputed -> R40-47 (ch0 acc_kb, dead post-loop, non-scratch).
-    _remap = {
-        64: 50, 65: 51, 66: 54, 67: 55,                    # A, As -> freed zero pairs
-        74: 60, 75: 61,                                    # Bs -> freed zero pair
-        68: 6, 69: 7,                                       # d_b base (prologue-only)
-        82: 20, 83: 15, 84: 16, 87: 17, 88: 18, 89: 19,    # K,nk64,nkb128,g,t,4t (prologue)
-        # NB: K is LOADED before the desc LDG.128 R12 (writes R12-15) and used
-        # after -> it must NOT live in R12-15; R20 (A-word) is free pre-loop.
-        92: 13,                                            # ctaid.y (epilogue desc reload)
-        80: 40, 85: 41, 76: 42, 77: 43,                    # tid,wid,d_c(EVEN pair) recomputed
-        86: 44, 81: 45, 78: 46, 79: 47,                    # lane,ctaid.x,ldc,m_rows recomputed
-        62: 10, 63: 11,                                    # ch1 tile1 masters off R62/63
-    }
-    # R62/R63 are RESERVED at regcount 64 (mercury QMMA stub lands at the top of
-    # the allocation) -> ch1 tile1 masters move to R10/R11 (ex-bs-base, free in
-    # the loop). Same reason MC=1 stays within R0-R61.
-    _maxreg = 61
-if _remap is not None:
-    import re as _re
-    def _occ(s):
-        if ".reg R0-R95" in s:
-            return s.replace("R0-R95", f"R0-R{_maxreg}")
-        for _a in sorted(_remap, reverse=True):   # desc order: extra safety
-            s = _re.sub(rf"\bR{_a}\b", f"R{_remap[_a]}", s)
-        return s
-    OUT = [_occ(s) for s in OUT]
+# SM120 -> never target them with a pointer. Prologue-only IDs may land on the
+# kb-acc slots R40-47 (their live ranges end at the constants section, which
+# zeroes the accs); MC=4's As[g+8] pair lives in R10/R11 (desc-load scratch,
+# dead after the prologue, NOT a remap target). The a128 renumber applies
+# verbatim to both MC=1 and MC=4: regcount 64 = 4 CTA/SM.
+_remap = {
+    64: 58, 65: 59, 66: 60, 67: 61,                    # A, As (loop-live)
+    74: 16, 75: 17,                                    # Bs (loop-live; R16/17 free)
+    68: 32, 69: 33,                                    # d_b base (prologue)
+    80: 34, 81: 35, 82: 36, 83: 37, 84: 38, 85: 39,    # tid,ctaid.x,K,nk64,nkb128,wid
+    86: 44, 87: 45, 88: 46, 89: 47, 92: 18,            # lane,g,t,4t,ctaid.y
+    76: 42, 77: 43, 78: 41, 79: 40,                    # d_c, ldc, m_rows
+}
+_maxreg = 61
+import re as _re
+def _occ(s):
+    if ".reg R0-R95" in s:
+        return s.replace("R0-R95", f"R0-R{_maxreg}")
+    for _a in sorted(_remap, reverse=True):   # desc order: extra safety
+        s = _re.sub(rf"\bR{_a}\b", f"R{_remap[_a]}", s)
+    return s
+OUT = [_occ(s) for s in OUT]
 
-path = sys.argv[1] if len(sys.argv) > 1 else "sass/moe_w2_mm.sass"
+path = sys.argv[1] if len(sys.argv) > 1 else "sass/moe_w2_mm_a32.sass"
 open(path, "w").write("\n".join(OUT) + "\n")
-print(f"wrote {path} ({len(OUT)} lines, K={K}, NWARP={NWARP})")
+print(f"wrote {path} ({len(OUT)} lines, K={K}, NWARP={NWARP}, MC={MC}, AFRAG={AFRAG})")
