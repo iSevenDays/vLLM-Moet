@@ -2060,10 +2060,10 @@ index 000000000..10770e789
 +        "on" if _verify() else "off")
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
-index 000000000..f7604e2c6
+index 000000000..fd0565127
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
-@@ -0,0 +1,2533 @@
+@@ -0,0 +1,2554 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Routed experts on 2-bit tensor-sym planes (cubit moe_w2) for the
@@ -2928,6 +2928,27 @@ index 000000000..f7604e2c6
 +            "PINNED HOST RAM (base cache; the GPU holds the "
 +            "VLLM_MOE_W2_BASE_CACHE_GB slot pool)",
 +            per_layer / 2**30, n_layers, total_gib)
++        # host-side preflight, same rationale as the VRAM one: a pinned
++        # arena that outgrows host RAM dies mid-load as a bare
++        # cudaHostAlloc failure (or the OOM-killer takes the engine with
++        # NO traceback at all). Warn with the remedies while the boot log
++        # is still short. MemAvailable is the kernel's own estimate;
++        # /proc is Linux-only — skip silently elsewhere.
++        try:
++            with open("/proc/meminfo") as fh:
++                kb = {l.split(":")[0]: int(l.split()[1]) for l in fh}
++            avail_gib = kb.get("MemAvailable", 0) / 2**20
++            if total_gib > avail_gib * 0.9:
++                logger.warning(
++                    "moe_w2 base cache: projected pinned host planes "
++                    "(%.1f GiB) exceed 90%% of MemAvailable (%.1f GiB) — "
++                    "expect a host-alloc failure or the OOM-killer "
++                    "(engine dies with no traceback). Cap the pinned "
++                    "arena with VLLM_MOE_W2_BASE_RAM_GB and give the "
++                    "spill an NVMe home via VLLM_MOE_W2_STORE_DIR",
++                    total_gib, avail_gib)
++        except OSError:
++            pass
 +        return
 +    free_b, total_b = torch.cuda.mem_get_info()
 +    logger.info(

@@ -101,7 +101,14 @@ VRAM reality on Ada: DS4-Flash planes are ~1.73 GiB/layer × 43 layers ≈
 Ada cards you MUST run the base cache: `VLLM_MOE_W2_BASE_CACHE_GB=<pool
 GiB>` keeps planes in pinned host RAM and streams a GPU slot pool
 (start around 4–8 GiB on a 4090 and watch the miss/replay counters), or
-shard with TP, or serve a smaller model.
+shard with TP, or serve a smaller model. The same budget line covers the
+host side: when the pinned projection exceeds 90% of `MemAvailable` the
+boot warns (a pinned arena that outgrows host RAM dies as a bare
+cudaHostAlloc failure — or the OOM-killer takes the engine with no
+traceback at all); cap it with `VLLM_MOE_W2_BASE_RAM_GB` and give the
+spill an NVMe home via `VLLM_MOE_W2_STORE_DIR`. A corrected, annotated
+launcher for exactly this configuration ships as
+`docker/serve_sm89_ds4.sh`.
 
 Env cheat sheet (spellings that have already burned a deploy cycle):
 `VLLM_MOE_W2_PLANES_CACHE` (plural — persists built planes across
