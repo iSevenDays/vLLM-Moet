@@ -1668,10 +1668,10 @@ index 32a2d8689..3e83d5a87 100644
              mn=r,
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
-index 000000000..a972bbc7b
+index 000000000..01fdf5917
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
-@@ -0,0 +1,2113 @@
+@@ -0,0 +1,2167 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Routed experts on 2-bit tensor-sym planes (cubit moe_w2) for the
@@ -1908,7 +1908,9 @@ index 000000000..a972bbc7b
 +    return os.getenv("VLLM_MOE_W2", "0") == "1"
 +
 +
-+@functools.cache
++_cutoff_cache: int | None = None
++
++
 +def _layer_cutoff() -> int:
 +    """Main-stack layer count: layers >= this are the MTP drafter. Taken from
 +    the model config when available (43 for DS4-Flash, 78 for GLM-5.2, 61 for
@@ -1917,19 +1919,33 @@ index 000000000..a972bbc7b
 +    get_text_config() unwraps composite VLM configs (KimiK25Config keeps
 +    num_hidden_layers on .text_config; a bare hf_config lookup would raise
 +    and silently fall back to 43, sending layers 43+ down the stock path);
-+    for text-only configs it returns self."""
++    for text-only configs it returns self.
++
++    Manual memoization on SUCCESS ONLY (was @functools.cache): a transient
++    config-not-current exception must not freeze the guessed 43 forever —
++    on a 78-layer GLM that silently sent layers 43+ down the stock path
++    (mixed precision, no log — review finding 2.4). The fallback is now
++    loud and uncached."""
++    global _cutoff_cache
++    if _cutoff_cache is not None:
++        return _cutoff_cache
 +    v = os.getenv("VLLM_MOE_W2_NUM_LAYERS")
 +    if v is not None:
-+        return int(v)
++        _cutoff_cache = int(v)
++        return _cutoff_cache
 +    try:
 +        from vllm.config import get_current_vllm_config
 +        cfg = get_current_vllm_config().model_config.hf_config
 +        cfg = cfg.get_text_config()
 +        n = cfg.num_hidden_layers
 +        if n:
-+            return int(n)
-+    except Exception:  # noqa: BLE001
-+        pass
++            _cutoff_cache = int(n)
++            return _cutoff_cache
++    except Exception as e:  # noqa: BLE001
++        logger.error(
++            "moe_w2 _layer_cutoff: no current vllm config (%s) — TEMPORARY "
++            "uncached fallback 43 (DS4 layout); set VLLM_MOE_W2_NUM_LAYERS "
++            "explicitly if this repeats past load.", e)
 +    return 43
 +
 +
@@ -1979,6 +1995,16 @@ index 000000000..a972bbc7b
 +    try:
 +        torch.cuda.init()
 +        torch.zeros(1, device="cuda")
++        # Hand-written SASS = sm_120 ONLY, and the cubins carry no PTX to
++        # JIT elsewhere. Refuse EARLY with a clear message instead of the
++        # late shape-assert at weight load (review finding 2.6): SM121
++        # (GB10/DGX Spark), SM100 and SM90 cannot run these kernels.
++        cap = torch.cuda.get_device_capability()
++        if cap != (12, 0):
++            raise RuntimeError(
++                f"moe_w2 cubins are sm_120-only (hand-written SASS, no "
++                f"PTX); this device reports sm_{cap[0]}{cap[1]}. Unset "
++                "VLLM_MOE_W2 on this hardware.")
 +        cu = _driver()
 +        # ONLY `_a32` cubins load (activation format rev: f32 A scales at
 +        # PER-32-GROUP granularity, folded per k32). The a128 lineage reads
@@ -1988,6 +2014,11 @@ index 000000000..a972bbc7b
 +        # fails loudly in _require_kernels (no old/new mixing possible).
 +        # The a128-era mc2 prefill experiment is retired (superseded by
 +        # mc4/AFRAG; never launched by the serving path).
++        # K set: the shipped families cover DS4/GLM/Kimi at TP1-8;
++        # VLLM_MOE_W2_KS extends it WITHOUT a code edit when a new model
++        # brings a new contraction (comma-separated; cubins must exist).
++        ks = tuple(int(x) for x in os.getenv(
++            "VLLM_MOE_W2_KS", "7168,6144,4096,2048,1024,512").split(","))
 +        for tier, kern in (("w2", b"moe_w2_mm"), ("w4", b"moe_w4_mm"),
 +                           ("w4q", b"moe_w4q_mm"), ("w2mc4", b"moe_w2_mm")):
 +            # GEMM contraction K: gate-up needs K=hidden (4096 DS4-Flash,
@@ -1995,7 +2026,7 @@ index 000000000..a972bbc7b
 +            # 1024 @ TP2, 512 @ TP4). Cubins are loaded opportunistically --
 +            # the plane builders assert the shapes the model actually needs
 +            # are present (_require_kernels fails loudly at weight load).
-+            for k in (7168, 6144, 4096, 2048, 1024, 512):
++            for k in ks:
 +                if tier == "w2mc4":
 +                    fname = f"moe_w2_mm_mc4_k{k}_a32.cubin"
 +                else:
@@ -2013,7 +2044,7 @@ index 000000000..a972bbc7b
 +        global _afrag_ok
 +        if _AFRAG:
 +            try:
-+                for k in (7168, 6144, 4096, 2048, 1024, 512):
++                for k in ks:
 +                    path = os.path.join(
 +                        _DIR, f"moe_w2_mm_mc4afrag_k{k}_a32.cubin")
 +                    if not os.path.exists(path):
@@ -2862,6 +2893,26 @@ index 000000000..a972bbc7b
 +    if (_WS.get("slots", 0) < slots or _WS.get("tokens", 0) < tokens
 +            or _WS.get("inter") != inter or _WS.get("hidden") != hidden
 +            or _WS.get("n_experts", 0) < n_experts):
++        # Captured graphs bake these buffer ADDRESSES; a realloc after any
++        # capture would leave every captured replay reading freed memory.
++        # The system invariant is "profile_run maxes the sizes before
++        # capture" — enforce it instead of assuming it (review 2.5): any
++        # growth after the first capture (or during one) is a hard error.
++        if _WS.get("frozen"):
++            raise RuntimeError(
++                f"moe_w2 workspace growth after graph capture: have "
++                f"slots={_WS.get('slots')}, tokens={_WS.get('tokens')}, "
++                f"need slots={slots}, tokens={tokens}. Captured graphs "
++                "hold the old buffers - the profile run must cover the "
++                "largest schedulable batch (check max_num_batched_tokens/"
++                "max_num_seqs vs the profile shapes).")
++        if torch.cuda.is_available() and torch.cuda.is_initialized() \
++                and torch.cuda.is_current_stream_capturing():
++            raise RuntimeError(
++                "moe_w2 workspace realloc DURING cudagraph capture "
++                f"(slots {_WS.get('slots', 0)}->{slots}, tokens "
++                f"{_WS.get('tokens', 0)}->{tokens}) - the profile run "
++                "must pre-size the workspaces.")
 +        slots = max(slots, _WS.get("slots", 0))
 +        tokens = max(tokens, _WS.get("tokens", 0))
 +        n_experts = max(n_experts, _WS.get("n_experts", 0))
@@ -3477,6 +3528,9 @@ index 000000000..a972bbc7b
 +    cap = d.shape[1]
 +    miss_rows = None
 +    use_pf4 = False        # prefill-FP4 (resident mode only; see _PREFILL_FP4)
++    if torch.cuda.is_current_stream_capturing():
++        # first capture freezes the workspace sizes (see _workspaces)
++        _WS["frozen"] = True
 +    if base_mode:
 +        # BASE cache: 2-bit planes come from the base tier's GPU pool; a live
 +        # pair with a non-resident expert contributes zero and bumps the miss
@@ -3787,10 +3841,10 @@ index 000000000..a972bbc7b
 +    return enabled() and _ensure_ready()
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
 new file mode 100644
-index 000000000..925853ccf
+index 000000000..8b6de80da
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
-@@ -0,0 +1,2043 @@
+@@ -0,0 +1,2088 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""FP4 delta tier for the 1-GPU 2-bit MoE path (quality restoration).
@@ -4737,7 +4791,14 @@ index 000000000..925853ccf
 +            ev = torch.cuda.Event()
 +            ev.record(self._stream)
 +        ev.synchronize()           # bytes resident BEFORE mapping
-+        self.slot_table[li, ei] = slot
++        # The MANAGER thread runs this: its slot_table write must order
++        # against graph replays on the forward stream. Today that ordering
++        # comes from the thread's current stream being the LEGACY default
++        # stream (device-wide serializing) — make that explicit instead of
++        # accidental (review 2.5: a vLLM move to per-thread streams would
++        # silently break the mapping-after-bytes guarantee).
++        with torch.cuda.stream(torch.cuda.default_stream(self.dev)):
++            self.slot_table[li, ei] = slot
 +        self._mirror[li, ei] = slot
 +        self._own(slot, li, ei)
 +        self._n_promoted += 1
@@ -5679,32 +5740,70 @@ index 000000000..925853ccf
 +        fire_floor = int(len(d._store) * top_k * (1 + n_spec)
 +                         * min(max(max_num_seqs, 1), 4) * fp_growth)
 +        if d.n_slots < fire_floor:
-+            # Graceful degradation (same philosophy as the residency
-+            # ladder VRAM->host->NVMe: degrade SPEED, never correctness,
-+            # never refuse work that can be done slower): fires switch to
-+            # the EAGER LAYER-WISE replay - each MoE layer's routed set is
-+            # promoted just-in-time before its GEMMs (ensure_resident,
-+            # layer-scoped pins), so the pool only ever needs ONE layer's
-+            # union and the fire contract holds in full. Costs: the
-+            # replay runs eagerly (no CUDA graph) + per-fire H2D traffic;
-+            # second-order misses vanish structurally (each layer sees
-+            # its ACTUAL routing), so the FP loop is unnecessary here.
++            # Sub-floor pools serve in DEGRADED mode: a fire can only
++            # PARTIALLY upgrade its step, and the measured-sound operating
++            # point is the INCREMENTAL cap (GATE_MAX_PROMOTE default 64) —
++            # uncapped sub-floor churns the pool wholesale (measured 94.5%
++            # / +110% tokens; GPQA 60.6% vs 70.2% capped, McNemar p=0.002).
++            # The flag below is READ BY NOTHING yet: the eager layer-wise
++            # fire (full contract at any pool size) is a SPEC, not a
++            # feature — see internal/EAGER_FIRE_NEXT_SESSION.md. The
++            # warning must not promise it (review finding 2.4).
 +            d._sub_floor = True
 +            logger.warning(
 +                "moe_w2 FP4 need-pool is below the FIRE FLOOR: %d slots "
 +                "< %d (%d MoE layers x top-%d x (1+%d spec) x %d seqs x "
 +                "%.2f FP-growth = ~%.1f GiB). Serving continues in "
 +                "DEGRADED mode: gate fires can only PARTIALLY upgrade "
-+                "their step (consider an explicit GATE_MAX_PROMOTE cap, "
-+                "e.g. 64 — measured best sub-floor operating point). The "
-+                "EAGER LAYER-WISE fire path (full contract fidelity at a "
-+                "decode cost, keyed off this _sub_floor flag) is speced "
-+                "in internal/EAGER_FIRE_NEXT_SESSION.md. For graph-mode "
-+                "fires raise VLLM_MOE_W2_DELTA_GB or reduce "
-+                "num_speculative_tokens/max_num_seqs.",
++                "their step; promotions stay capped by GATE_MAX_PROMOTE "
++                "(default 64 = the measured-best sub-floor operating "
++                "point; do NOT set 0/unlimited here — measured churn "
++                "regression). tau->1 does NOT converge to native on a "
++                "sub-floor pool. For full graph-mode fires raise "
++                "VLLM_MOE_W2_DELTA_GB or reduce num_speculative_tokens/"
++                "max_num_seqs.",
 +                d.n_slots, fire_floor, len(d._store), top_k, n_spec,
 +                max_num_seqs, fp_growth,
 +                fire_floor * d.slot_bytes / 2**30)
++
++    # ---- config-coherence guards (review finding 2.3): contradictory
++    # env combinations used to fail silently or pay dead per-step costs.
++    from vllm.model_executor.layers.quantization.utils import (
++        moe_w2_cubit, moe_w2_gate)
++    if moe_w2_gate.enabled() and _TIER is None:
++        # gate without a delta tier: the decision (topk + logsumexp +
++        # .item() sync) would run EVERY step and force_promote would
++        # no-op forever — pure hot-path waste. Disable loudly.
++        moe_w2_gate.disable(
++            "VLLM_MOE_W2_GATE=1 but no FP4 delta tier exists "
++            "(VLLM_MOE_W2_DELTA_GB unset/0) — the gate cannot promote "
++            "anything; disabling to avoid a dead per-step sync.")
++    decode_cap = max(max_num_seqs, 1) * (1 + n_spec)
++    if moe_w2_cubit._PREFILL_T < decode_cap:
++        raise ValueError(
++            f"VLLM_MOE_W2_PREFILL_T={moe_w2_cubit._PREFILL_T} is below "
++            f"the largest decode step of this config (max_num_seqs x "
++            f"(1 + num_speculative_tokens) = {decode_cap}): captured "
++            "decode graphs would bake the PREFILL code path (wrong tier "
++            "machinery inside full-graph replays). Raise PREFILL_T to "
++            f">= {decode_cap} (default 96) or shrink the config.")
++    try:
++        from vllm.config import get_current_vllm_config
++        pc = get_current_vllm_config().parallel_config
++        if _BASE_TIER is not None and (
++                getattr(pc, "use_ubatching", False)
++                or getattr(pc, "ubatch_size", 0)):
++            raise ValueError(
++                "BASE cache x micro-batching (ubatch/DBO) is unsupported: "
++                "the in-graph miss counter is zeroed at layer 0 of EVERY "
++                "forward, so the second ubatch erases the first ubatch's "
++                "misses -> the runner skips the restore replay and serves "
++                "ZEROED expert contributions. Disable ubatching or the "
++                "base cache.")
++    except ValueError:
++        raise
++    except Exception:  # noqa: BLE001 - config introspection best-effort
++        pass
 +
 +
 +def gate_armed() -> bool:
@@ -5836,10 +5935,10 @@ index 000000000..925853ccf
 +    return _TIER
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_gate.py b/vllm/model_executor/layers/quantization/utils/moe_w2_gate.py
 new file mode 100644
-index 000000000..c00bd7b28
+index 000000000..dbc599815
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_gate.py
-@@ -0,0 +1,221 @@
+@@ -0,0 +1,231 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Confidence-gated FP4 re-forward for the 2-bit MoE path (directive 2 / Step B).
@@ -5928,7 +6027,7 @@ index 000000000..c00bd7b28
 +# one step's routed union are refused at boot (the FIRE FLOOR hardstop in
 +# moe_w2_delta.check_pool_floor); FORCE_POOL=1 configs run degraded and
 +# should set an explicit cap.
-+_MAX_PROMOTE = int(os.getenv("VLLM_MOE_W2_GATE_MAX_PROMOTE", "0"))
++_MAX_PROMOTE = int(os.getenv("VLLM_MOE_W2_GATE_MAX_PROMOTE", "64"))
 +_FIRE_FP_MAX = max(int(os.getenv("VLLM_MOE_W2_GATE_FP_MAX", "3")), 1)
 +
 +
@@ -5960,6 +6059,16 @@ index 000000000..c00bd7b28
 +
 +def enabled() -> bool:
 +    return _ENABLED
++
++
++def disable(reason: str) -> None:
++    """Turn the gate off at runtime (boot-time config-coherence guard):
++    a gate without a promotable tier pays its per-step decision sync for
++    nothing. Loud by design."""
++    global _ENABLED
++    if _ENABLED:
++        logger.warning("moe_w2 gate DISABLED: %s", reason)
++    _ENABLED = False
 +
 +
 +def signal() -> str:
@@ -7685,250 +7794,6 @@ index 000000000..fd83f500b
 +    _count[name] = _count.get(name, 0) + len(pairs)
 +    logger.info("[prefill-timer] %-14s total %8.1f ms over %5d spans",
 +                name, _total_ms[name], _count[name])
-diff --git a/vllm/model_executor/layers/quantization/utils/skinny_fp8_cubit.py b/vllm/model_executor/layers/quantization/utils/skinny_fp8_cubit.py
-new file mode 100644
-index 000000000..adf4754de
---- /dev/null
-+++ b/vllm/model_executor/layers/quantization/utils/skinny_fp8_cubit.py
-@@ -0,0 +1,238 @@
-+# SPDX-License-Identifier: Apache-2.0
-+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-+"""cubit hand-written SASS skinny w8a8 FP8 GEMM (SM120, experimental, opt-in).
-+
-+Replaces `w8a8_triton_block_scaled_mm` for decode-shaped dense GEMMs
-+(M <= 4 tokens) with a hand-scheduled SASS kernel (`skinny_fp8_mm`, ABI 2):
-+per-CTA 16 output columns, in-CTA split-K, QMMA.SF with in-flight UE8M0
-+block scaling, bf16 [M, N] epilogue.
-+
-+ABI 2 (fragment-major weights, direct activations):
-+  - B: fp8e4m3 [N, K] repacked ONCE per layer to fragment-major (per 64-byte
-+    k-block, lane t's 16 bytes contiguous) -> one LDG.E.128 per tile per k64,
-+    79% DRAM roofline at K=4096 (was 68% with narrow loads). The repacked
-+    copy is cached next to the layer's weight (dual-residency).
-+  - A: fp8e4m3 [M, K] row-major read DIRECTLY (no act-pack kernel, no
-+    qn/sfa staging buffers): at M <= 4 the QMMA A-fragment is mostly pad
-+    zeros; the kernel loads the few real bytes under a g<M predicate.
-+  - As: f32 [M, K/128] POW2 scales read directly; the kernel extracts the
-+    e8m0 exponent in-flight (activations must be quantized with
-+    use_ue8m0=True -- the linear kernel class does).
-+  - Bs: [N/128, K/128] power-of-two scales converted once to E8M0 bytes.
-+  - N % 16 == 0, K in the per-K cubin set, M <= 4.
-+  - Launches via the CUDA driver API on the current torch stream:
-+    CUDA-graph capturable (same discipline as cubit_sparse_mla).
-+
-+Any unsupported shape or setup failure -> caller falls back to Triton.
-+"""
-+
-+import ctypes
-+import functools
-+import json
-+import os
-+
-+import torch
-+
-+from vllm.logger import init_logger
-+
-+logger = init_logger(__name__)
-+
-+_MAX_M = 4
-+_KERN = b"skinny_fp8_mm"
-+_DIR = os.getenv("VLLM_W8A8_SKINNY_CUBIT_DIR", "/cubit-share")
-+# Dual-residency control: fragment-major copies are cached ONLY for these K
-+# (comma list). K=4096 shapes carry ~73% of the measured win for ~half the
-+# extra VRAM (~1.7 GiB at TP2); K=1024 shapes are only 1.06-1.24x and fall
-+# back to Triton when not listed. "all" = every supported K.
-+_REPACK_KS = os.getenv("VLLM_W8A8_SKINNY_REPACK_KS", "2048,4096,7168")
-+
-+_cu = None
-+_state = "uninit"           # uninit | ready | unavailable
-+_fns: dict[int, tuple[ctypes.c_void_p, int]] = {}   # K -> (fn, nthreads)
-+_B_CACHE: dict = {}         # id(weight) -> fragment-major fp8 byte tensor
-+_BS_CACHE: dict = {}        # id(weight_scale) -> e8m0 byte tensor
-+
-+
-+def _driver():
-+    global _cu
-+    if _cu is None:
-+        cu = ctypes.CDLL("libcuda.so.1")
-+        cu.cuLaunchKernel.argtypes = [ctypes.c_void_p] + [ctypes.c_uint] * 6 + [
-+            ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
-+            ctypes.c_void_p]
-+        cu.cuModuleLoad.argtypes = [ctypes.POINTER(ctypes.c_void_p),
-+                                    ctypes.c_char_p]
-+        cu.cuModuleGetFunction.argtypes = [ctypes.POINTER(ctypes.c_void_p),
-+                                           ctypes.c_void_p, ctypes.c_char_p]
-+        _cu = cu
-+    return _cu
-+
-+
-+def _ck(r, what):
-+    if r:
-+        raise RuntimeError(f"skinny_fp8_cubit: CUDA error {r} in {what}")
-+
-+
-+def _ensure_ready() -> bool:
-+    """Load every ABI-2 FOLD-mode per-K cubin from the manifest. Eager-only.
-+
-+    fold = the kernel consumes the EXACT f32 activation/weight scales
-+    (folded per kb128 in-kernel); no ue8m0 requant anywhere -> numerics
-+    match the Triton path and MTP acceptance is unaffected.
-+    """
-+    global _state
-+    if _state == "ready":
-+        return True
-+    if _state == "unavailable":
-+        return False
-+    try:
-+        man_path = os.path.join(_DIR, "skinny_fp8_manifest.json")
-+        with open(man_path) as f:
-+            manifest = json.load(f)
-+        cu = _driver()
-+        for k_str, meta in manifest.items():
-+            if int(meta.get("abi", 1)) != 2 or meta.get("scale") != "fold":
-+                continue
-+            path = os.path.join(_DIR, f"skinny_fp8_mm_k{k_str}.cubin")
-+            if not os.path.isfile(path):
-+                continue
-+            mod = ctypes.c_void_p()
-+            _ck(cu.cuModuleLoad(ctypes.byref(mod), path.encode()),
-+                "cuModuleLoad")
-+            fn = ctypes.c_void_p()
-+            _ck(cu.cuModuleGetFunction(ctypes.byref(fn), mod, _KERN),
-+                "cuModuleGetFunction")
-+            _fns[int(k_str)] = (fn, int(meta["nwarp"]) * 32)
-+        if not _fns:
-+            raise FileNotFoundError(f"no ABI-2 fold-mode cubins in {_DIR}")
-+        _state = "ready"
-+        logger.info("skinny_fp8_cubit: loaded fold-mode cubins for K=%s",
-+                    sorted(_fns.keys()))
-+        return True
-+    except Exception as e:  # noqa: BLE001 - any failure means Triton fallback
-+        logger.warning("skinny_fp8_cubit unavailable (%s); Triton fallback", e)
-+        _state = "unavailable"
-+        return False
-+
-+
-+def supported_k(k: int) -> bool:
-+    return _state == "ready" and k in _fns
-+
-+
-+def repack_allowed(k: int) -> bool:
-+    ks = _REPACK_KS.strip()
-+    if ks.lower() == "all":
-+        return True
-+    return str(k) in {x.strip() for x in ks.split(",")}
-+
-+
-+def weight_fragment_major(weight: torch.Tensor) -> torch.Tensor | None:
-+    """[N, K] fp8 row-major -> fragment-major copy (cached per layer).
-+
-+    Per 64-byte k-block: lane t's 16 bytes (4B x {lo0, hi0, lo1, hi1})
-+    land contiguously at offset 16t -> the kernel's LDG.E.128.
-+    Returns None when K is not in the repack allow-list (VRAM control).
-+    """
-+    key = id(weight)
-+    cached = _B_CACHE.get(key)
-+    if cached is not None:
-+        return cached
-+    n, k = weight.shape
-+    if not repack_allowed(k):
-+        return None
-+    w8 = weight.view(torch.uint8)
-+    packed = (w8.view(n, k // 64, 4, 4, 4).permute(0, 1, 3, 2, 4)
-+              .contiguous().view(n, k))
-+    _B_CACHE[key] = packed
-+    return packed
-+
-+
-+def weight_scale_f32(weight_scale: torch.Tensor) -> torch.Tensor:
-+    """[N/128, K/128] checkpoint scales -> contiguous f32 (cached).
-+
-+    Fold mode consumes the scales EXACTLY as the Triton path does; no
-+    power-of-two requant anywhere.
-+    """
-+    key = id(weight_scale)
-+    cached = _BS_CACHE.get(key)
-+    if cached is not None:
-+        return cached
-+    ws = weight_scale
-+    if ws.dtype != torch.float32:
-+        ws = ws.float()
-+    ws = ws.contiguous()
-+    _BS_CACHE[key] = ws
-+    return ws
-+
-+
-+_DEBUG = os.getenv("VLLM_W8A8_SKINNY_DEBUG", "0") == "1"
-+_hit_shapes: set = set()
-+_miss_shapes: set = set()
-+
-+
-+def skinny_mm(
-+    A: torch.Tensor,         # [M, K] fp8e4m3 row-major
-+    As: torch.Tensor,        # [M, K/128] f32 scales (ARBITRARY, fold mode)
-+    B_packed: torch.Tensor,  # [N, K] fragment-major (weight_fragment_major)
-+    Bs_bytes: torch.Tensor,  # [N/128, K/128] f32 scales (weight_scale_f32)
-+) -> torch.Tensor | None:
-+    """Returns C [M, N] bf16, or None when the shape is unsupported."""
-+    M, K = A.shape
-+    N = B_packed.shape[0]
-+    if M > _MAX_M or N % 16 or not supported_k(K):
-+        if _DEBUG:
-+            key = (M, N, K, "shape")
-+            if key not in _miss_shapes:
-+                _miss_shapes.add(key)
-+                logger.info("skinny MISS (shape) M=%d N=%d K=%d", M, N, K)
-+        return None
-+    if As.dtype != torch.float32 or not As.is_contiguous():
-+        if _DEBUG:
-+            key = (M, N, K, str(As.dtype), As.is_contiguous())
-+            if key not in _miss_shapes:
-+                _miss_shapes.add(key)
-+                logger.info("skinny MISS (As %s contig=%s) M=%d N=%d K=%d",
-+                            As.dtype, As.is_contiguous(), M, N, K)
-+        return None
-+    if _DEBUG:
-+        key = (M, N, K)
-+        if key not in _hit_shapes:
-+            _hit_shapes.add(key)
-+            logger.info("skinny HIT M=%d N=%d K=%d", M, N, K)
-+    fn, nthr = _fns[K]
-+
-+    C = torch.empty(M, N, dtype=torch.bfloat16, device=A.device)
-+    cu = _driver()
-+    stream = ctypes.c_void_p(
-+        torch.cuda.current_stream(A.device).cuda_stream)
-+    args = [ctypes.c_uint64(A.data_ptr()),
-+            ctypes.c_uint64(As.data_ptr()),
-+            ctypes.c_uint64(B_packed.data_ptr()),
-+            ctypes.c_uint64(Bs_bytes.data_ptr()),
-+            ctypes.c_uint64(C.data_ptr()),
-+            ctypes.c_uint32(K),
-+            ctypes.c_uint32(K // 64),
-+            ctypes.c_uint32(N * 2),
-+            ctypes.c_uint32(K // 128),
-+            ctypes.c_uint32(M)]
-+    argv = (ctypes.c_void_p * len(args))(
-+        *[ctypes.cast(ctypes.byref(x), ctypes.c_void_p) for x in args])
-+    _ck(cu.cuLaunchKernel(fn, N // 16, 1, 1, nthr, 1, 1, 0, stream, argv,
-+                          None), "launch")
-+    return C
-+
-+
-+@functools.cache
-+def enabled() -> bool:
-+    if os.getenv("VLLM_W8A8_SKINNY_CUBIT", "0") != "1":
-+        return False
-+    from vllm.platforms import current_platform
-+    cap = current_platform.get_device_capability()
-+    major = getattr(cap, "major", None) or (cap[0] if cap else None)
-+    if major != 12:
-+        return False
-+    # cuModuleLoad needs a live CUDA context (kernel selection can run before
-+    # the first tensor op on this device)
-+    torch.cuda.init()
-+    torch.zeros(1, device="cuda")
-+    return _ensure_ready()
 diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
 index fe2b268cd..28cbf1458 100644
 --- a/vllm/model_executor/layers/sparse_attn_indexer.py

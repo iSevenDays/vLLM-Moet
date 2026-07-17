@@ -25,7 +25,6 @@ vllm/model_executor/layers/quantization/utils/moe_w2_planes.py
 vllm/model_executor/layers/quantization/utils/moe_w2_planes_cache.py
 vllm/model_executor/layers/quantization/utils/moe_w2_store.py
 vllm/model_executor/layers/quantization/utils/prefill_timers.py
-vllm/model_executor/layers/quantization/utils/skinny_fp8_cubit.py
 vllm/model_executor/layers/sparse_attn_indexer.py
 vllm/model_executor/models/deepseek_mtp.py
 vllm/model_executor/models/qwen3_dflash.py
