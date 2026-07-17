@@ -169,3 +169,40 @@ by `gen/moe_w2_check.py` / `gen/moe_w4_check.py` (K=512 rel ~2–3e‑3, determi
 
 Validation (vs torch/Triton reference, rel ~1–3e‑3, deterministic): `tools/test_moe_w2_planes.py`,
 `tools/test_moe_w2_forward.py`, `tools/test_mqa_logits.py`.
+
+## Ada (sm_89) Triton emulation — moe_w2_mm port (no cubins)
+
+Ada has FP8 e4m3 tensor cores but **no QMMA/QMMA.SF and no FP4**, so the
+SM120 cubins cannot run there. `triton/moe_w2_sm89.py` emulates the same
+GEMM: identical host‑packed planes (fragment‑major 2‑bit codes, block‑32
+UE8M0 bytes, a32 activations) through the unchanged 6‑field desc ABI;
+codes decode to BF16 in registers ({−4,−1,1,4} and 2^(sb−127) are exact in
+bf16), a standard BF16 MMA accumulates in FP32, and BOTH per‑32 scales
+fold as one [M,N] outer product per 32‑group (Ada's MMA has no
+scale‑factor operand). Experts still read from HBM at 2 bits/elem — the
+Moet bandwidth win survives; only the tensor‑core instruction changes.
+
+| source (`triton/`) | kernel | registered `_fns` keys | purpose |
+|---|---|---|---|
+| `moe_w2_sm89.py` | `moe_w2_mm_sm89` | `("w2", K)` + `("w2mc4", K)`, K ∈ {512, 1024, 2048, 4096, 6144, 7168} | 2‑bit MoE GEMM emulation, decode AND prefill (one kernel, `m_rows` mask) |
+
+The file is the published mirror of
+`vllm/model_executor/layers/quantization/utils/moe_w2_sm89.py` on the fork
+branch (the loader imports the vllm copy; keep them byte‑identical). The
+loader branches on `cap == (8, 9)` in `moe_w2_cubit._ensure_ready`;
+`_launch` stays arch‑blind (a registered callable launches Triton, a
+`c_void_p` launches the cubin). AFRAG is a QMMA A‑fragment LDG.128
+optimization and is **not** ported (prefill falls back to `w2mc4`); the
+w4/w4q delta tiers are **not** ported — serve Ada with
+`VLLM_MOE_W2_DELTA=0`, `--kv-cache-dtype fp8`.
+
+Validation status: `gen/moe_w2_sm89_cpu_check.py` (CPU golden of the
+addressing + numerics, runs anywhere) **PASS** for every K
+{512,1024,2048,4096,6144,7168} — byte‑exact fragment‑major addressing (0
+mismatches over all rows/k), worst_rel 2.5–3.2e‑3 vs the f32 reference
+(same band as the SM120 cubins), 4‑run identical. On‑silicon op gate
+`gen/moe_w2_check_sm89.py` (same reference math and verdict as
+`moe_w2_check.py`: worst_rel < 2.5e‑2 AND 4 runs byte‑identical) and the
+e2e suites (`tools/test_moe_w2_forward.py` rel<0.06/cos>0.999) **pending
+sm_89 hardware** — this dev box has none; run them on the first Ada card
+before serving.
