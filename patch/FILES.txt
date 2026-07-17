@@ -24,6 +24,7 @@ vllm/model_executor/layers/quantization/utils/moe_w2_gate.py
 vllm/model_executor/layers/quantization/utils/moe_w2_looka.py
 vllm/model_executor/layers/quantization/utils/moe_w2_planes.py
 vllm/model_executor/layers/quantization/utils/moe_w2_planes_cache.py
+vllm/model_executor/layers/quantization/utils/moe_w2_sm89.py
 vllm/model_executor/layers/quantization/utils/moe_w2_store.py
 vllm/model_executor/layers/quantization/utils/prefill_timers.py
 vllm/model_executor/layers/sparse_attn_indexer.py

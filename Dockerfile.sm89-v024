@@ -1,0 +1,72 @@
+# vLLM-Moet on official vLLM v0.24.0 — Ada / sm_89 (RTX 4090, RTX 2000-6000 Ada)
+#
+# Produces a serving image = official vllm/vllm-openai:v0.24.0 with our
+# patch applied. On Ada the 2-bit MoE expert GEMMs run through the Triton
+# EMULATION path (moe_w2_sm89.py, shipped INSIDE the patch): same
+# host-packed planes and descriptor ABI as SM120, 2-bit codes decoded to
+# BF16 in registers, UE8M0 + a32 scales folded as explicit multiplies —
+# Ada has FP8 tensor cores but no QMMA/QMMA.SF and no FP4. Experts still
+# stream from HBM at 2 bits/elem; only the tensor-core instruction changes.
+#
+# Differences vs Dockerfile.sm120-v024 (see docs/ada-sm89-port.md):
+#   1. NO DeepGEMM nv-dev build. The family-120 fork (a6b593d2) exists only
+#      for Blackwell FP4 host paths; the official image's stock DeepGEMM
+#      serves any FP8 non-MoE JIT on Ada. If an import-path probe ever
+#      shows the runtime insisting on a newer stock pin, install upstream
+#      891d57b4 the same way the sm120 file builds a6b593d2 — never the
+#      family-120 fork.
+#   2. flashinfer 0.6.14 KEPT (runs on Ada; the SM120 sparse-MLA fix it
+#      carries is family-120-gated and unreachable here). The cu130
+#      jit-cache wheel must match the image's CUDA toolkit — the v0.24.0
+#      image ships CUDA 13.0.
+#   3. NO cubin COPY, no VLLM_MOE_W2_CUBIT_DIR: the sm_89 kernels are
+#      Triton source inside the patched vllm tree, JIT-compiled on first
+#      use (warmup covers it before cudagraph capture).
+#   4. NO NVFP4 KV cache bake — Blackwell-only. Serve --kv-cache-dtype fp8.
+#   5. The sparse-MLA SM120 attention path is Blackwell-only too; DS4/GLM
+#      attention on Ada routes through stock FlashInfer/FlashAttention.
+#
+# Before relying on the base image, verify it ships sm_89 compiled-in:
+#   docker run --rm vllm/vllm-openai:v0.24.0 \
+#     python3 -c "import torch; print(torch.cuda.get_arch_list())"
+# (official v0.24.0 wheels build 8.0;8.6;8.9;9.0;… — if 8.9 is absent you
+# are facing a from-source torch rebuild, not this Dockerfile).
+#
+# Build (from the repo root):
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm89-v024 -t vllm-moet-sm89:v024 .
+#
+# Serve (2-bit MVP: DELTA off, fp8 KV; single 24-48 GB Ada card or TP):
+#   docker run --rm --gpus all --network host --ipc host --shm-size 64g \
+#     -v /path/to/model:/model:ro \
+#     -e VLLM_MOE_W2=1 -e VLLM_MOE_W2_DELTA=0 \
+#     vllm-moet-sm89:v024 \
+#     --model /model --trust-remote-code --kv-cache-dtype fp8 \
+#     --gpu-memory-utilization 0.90 --max-model-len 16384 \
+#     --port 8000
+#
+# The w4/w4q FP4 delta tiers are NOT ported to Ada: leave
+# VLLM_MOE_W2_DELTA=0 (the loader's _require_kernels fails loudly if set).
+
+FROM vllm/vllm-openai:v0.24.0
+
+# pip in recent official images may be PEP668-managed; the flag is a no-op
+# otherwise. git is needed only to apply the patch.
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
+# 1. flashinfer 0.6.14 (+ cu130 jit-cache; the 0.6.12 cubin pkg must go —
+#    there is no 0.6.14 build of it and the version check would trip)
+RUN pip uninstall -y --break-system-packages flashinfer-cubin || true
+RUN pip install --no-cache-dir --break-system-packages flashinfer-python==0.6.14 \
+    && pip install --no-cache-dir --break-system-packages \
+        --index-url https://flashinfer.ai/whl/cu130 \
+        "flashinfer-jit-cache==0.6.14+cu130"
+
+# 2. our patch, applied to the installed package (pure-Python delta; brings
+#    the moe_w2 path INCLUDING the sm_89 Triton kernels moe_w2_sm89.py)
+COPY patch/vllm-moet-v0.24.0.patch /tmp/vllm-moet.patch
+RUN cd "$(python3 -c 'import vllm, os; print(os.path.dirname(os.path.dirname(vllm.__file__)))')" \
+    && git apply --verbose /tmp/vllm-moet.patch \
+    && python3 -c "from vllm.model_executor.layers.quantization.utils import moe_w2_cubit; print('moe_w2 hook OK')" \
+    && python3 -c "from vllm.model_executor.layers.quantization.utils import moe_w2_sm89; print('sm_89 triton kernels OK')" \
+    && rm /tmp/vllm-moet.patch
