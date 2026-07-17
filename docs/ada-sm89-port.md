@@ -100,11 +100,22 @@ above it. Decode its last line:
   Python exception; its traceback IS in the log, scroll up.
 - `Failed core proc(s): {}` (**empty set**) — the engine died with NO
   Python exception; there is no traceback to find. Two suspects:
-  host OOM-killer (`sudo dmesg -T | grep -iE "oom|killed process" |
-  tail -5`, plus `free -g`; `docker inspect --format '{{.State.OOMKilled}}'`
-  only catches container-limit kills, not host ones) or a native crash —
-  the image bakes `PYTHONFAULTHANDLER=1`, so segfault/abort stacks land
-  in `docker logs`.
+  OOM-kill (`docker inspect --format '{{.State.OOMKilled}}'`; confirm
+  scope with `sudo dmesg -T | grep -iE "oom|killed process" | tail -5`
+  and `free -g`) or a native crash — the image bakes
+  `PYTHONFAULTHANDLER=1`, so segfault/abort stacks land in
+  `docker logs`.
+- `OOMKilled=true` **plus zero `moe_w2` lines** = the engine died in
+  host RAM during checkpoint shard staging, before the first plane
+  build. This exact signature (three deploy cycles' worth) was the
+  mxfp4 stream-build gap: `arm_stream_build` only recognized the NVFP4
+  param layout, so mxfp4 checkpoints (DS4-Flash official) silently
+  staged the FULL ~140+ GiB expert checkpoint in host RAM. Fixed
+  (fork `45f8a5249`): stream-build now arms for mxfp4 — first-boot
+  peak staging is O(layers in flight), a few GiB — and any remaining
+  fallback to full staging logs a loud `moe_w2: stream-build NOT
+  armed` warning projecting the footprint against `MemAvailable`.
+  Watch for `moe_w2 STREAM-BUILD armed` in a healthy boot.
 
 Before reading any log, confirm WHICH build produced it: `docker exec
 <name> cat /opt/moet-checks/SOURCE.txt` prints the vllm fork SHA the

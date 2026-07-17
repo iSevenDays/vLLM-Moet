@@ -1375,7 +1375,7 @@ index 7cdb04cfb..64813139b 100644
          assert self.moe_kernel is not None
          return self.moe_kernel.apply(
 diff --git a/vllm/model_executor/layers/quantization/modelopt.py b/vllm/model_executor/layers/quantization/modelopt.py
-index d51a2dd31..2fe74cc55 100644
+index d51a2dd31..2641ebb6b 100644
 --- a/vllm/model_executor/layers/quantization/modelopt.py
 +++ b/vllm/model_executor/layers/quantization/modelopt.py
 @@ -1,6 +1,7 @@
@@ -1502,7 +1502,7 @@ index d51a2dd31..2fe74cc55 100644
          raise ValueError(
              f"{self.__class__.__name__} uses the new modular kernel initialization "
              "logic. This function should not be called."
-@@ -1548,10 +1644,56 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
+@@ -1548,10 +1644,57 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
          )
          layer.register_parameter("w2_input_scale", w2_input_scale)
  
@@ -1526,6 +1526,7 @@ index d51a2dd31..2fe74cc55 100644
 +                # peak host RAM stays O(layers in flight), not
 +                # O(checkpoint). Fallback: classic all-layers CPU staging.
 +                if not moe_w2_cubit.arm_stream_build(layer):
++                    moe_w2_cubit.warn_full_staging(layer, "nvfp4 arm failed")
 +                    for pname in ("w13_weight", "w13_weight_scale",
 +                                  "w2_weight", "w2_weight_scale"):
 +                        p_ = getattr(layer, pname)
@@ -1559,7 +1560,7 @@ index d51a2dd31..2fe74cc55 100644
  
          # Use a single gscale for w13.
          if self.moe.is_act_and_mul and not torch.allclose(
-@@ -1655,6 +1797,19 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
+@@ -1655,6 +1798,19 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
          shared_experts: SharedExperts | None,
          shared_experts_input: torch.Tensor | None,
      ) -> torch.Tensor:
@@ -1579,7 +1580,7 @@ index d51a2dd31..2fe74cc55 100644
          assert not self.is_monolithic
          assert self.moe_kernel is not None
          return self.moe_kernel.apply(
-@@ -2473,6 +2628,9 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
+@@ -2473,6 +2629,9 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
  
          # Excluded layers
          if self.is_layer_excluded(prefix):
@@ -1590,10 +1591,10 @@ index d51a2dd31..2fe74cc55 100644
                  return UnquantizedLinearMethod()
              return None
 diff --git a/vllm/model_executor/layers/quantization/mxfp4.py b/vllm/model_executor/layers/quantization/mxfp4.py
-index 1b2a8a74b..3afdb16fd 100644
+index 1b2a8a74b..7941c6454 100644
 --- a/vllm/model_executor/layers/quantization/mxfp4.py
 +++ b/vllm/model_executor/layers/quantization/mxfp4.py
-@@ -617,6 +617,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+@@ -617,6 +617,28 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
              )
              layer.register_parameter("w2_bias", w2_bias)
              set_weight_attrs(w2_bias, extra_weight_attrs)
@@ -1612,25 +1613,35 @@ index 1b2a8a74b..3afdb16fd 100644
 +                set_weight_attrs(newp, attrs)
 +                if pname.endswith("_scale"):
 +                    newp.quant_method = "block"
++            # stream-build: requant each layer the moment its last expert
++            # tensor lands and drop its staging in place — peak host RAM
++            # stays O(layers in flight) instead of the full checkpoint
++            # (~140+ GB on DS4-Flash; the silent full-staging fallback
++            # here OOM-killed three Ada deploy cycles with no traceback).
++            if not moe_w2_cubit.arm_stream_build(layer):
++                moe_w2_cubit.warn_full_staging(layer, "mxfp4 arm failed")
  
      def _setup_kernel(
          self,
-@@ -722,6 +737,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+@@ -722,6 +744,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
              )
  
      def process_weights_after_loading(self, layer):
 +        # VLLM_MOE_W2: build 2-bit tensor-sym planes; skip Marlin/other backends.
 +        from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
 +        if moe_w2_cubit.is_w2_layer(getattr(layer, "layer_name", "")):
-+            key = len(moe_w2_cubit._LAYERS)
-+            moe_w2_cubit.build_layer_planes(layer, key)
++            key = getattr(layer, "_moe_w2_stream_key", None)
++            if key is None:
++                key = len(moe_w2_cubit._LAYERS)
++            if not getattr(layer, "_moe_w2_stream_built", False):
++                moe_w2_cubit.build_layer_planes(layer, key)
 +            layer._moe_w2_key = key
 +            return
 +
          w13 = layer.w13_weight
          w2 = layer.w2_weight
          w13_scale = layer.w13_weight_scale
-@@ -779,6 +802,19 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+@@ -779,6 +812,19 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
          shared_experts: SharedExperts | None,
          shared_experts_input: torch.Tensor | None,
      ) -> torch.Tensor:
@@ -2060,10 +2071,10 @@ index 000000000..10770e789
 +        "on" if _verify() else "off")
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
-index 000000000..271460dbf
+index 000000000..c147703ab
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
-@@ -0,0 +1,2555 @@
+@@ -0,0 +1,2615 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Routed experts on 2-bit tensor-sym planes (cubit moe_w2) for the
@@ -2767,8 +2778,15 @@ index 000000000..271460dbf
 +                f"and report the checkpoint")
 +        pend[self._pname] -= 1
 +        if all(v == 0 for v in pend.values()):
-+            key = self._layer._moe_w2_create_key
-+            build_layer_planes_nvfp4(self._layer, key)
++            # nvfp4 layers got their key from the create-time planner
++            # (plan_pack_skip always runs first there); mxfp4 layers have
++            # no planner — build order IS the key, as their classic
++            # process_weights path always did.
++            key = getattr(self._layer, "_moe_w2_create_key", None)
++            if key is None:
++                key = len(_LAYERS)
++            self._layer._moe_w2_stream_key = key
++            self._layer._moe_w2_stream_builder(self._layer, key)
 +            # Drop the staging storage IN PLACE on the ORIGINAL Parameter
 +            # objects. _finish_layer replaced the layer's attributes with
 +            # stub Parameters, but load_weights' params_dict (built once,
@@ -2785,11 +2803,49 @@ index 000000000..271460dbf
 +        return ret
 +
 +
++_full_staging_warned = False
++
++
++def warn_full_staging(layer, why: str) -> None:
++    """One-time LOUD warning when a w2 layer falls back to classic
++    full-checkpoint host staging (stream-build did not arm). The silent
++    version of this state OOM-killed three Ada deploy cycles in a row:
++    every expert tensor of every layer accumulates in host RAM before
++    the first requant, and on a host smaller than the checkpoint the
++    kernel's OOM-killer ends the engine with no Python traceback."""
++    global _full_staging_warned
++    if _full_staging_warned:
++        return
++    _full_staging_warned = True
++    per_layer = 0
++    for pname in ("w13_weight", "w13_weight_scale", "w2_weight",
++                  "w2_weight_scale"):
++        p = getattr(layer, pname, None)
++        if p is not None:
++            per_layer += p.data.numel() * p.data.element_size()
++    total_gib = per_layer * _layer_cutoff() / 2**30
++    avail = ""
++    try:
++        with open("/proc/meminfo") as fh:
++            kb = {l.split(":")[0]: int(l.split()[1]) for l in fh}
++        avail = (f"; MemAvailable now "
++                 f"{kb.get('MemAvailable', 0) / 2**20:.1f} GiB")
++    except Exception:  # noqa: BLE001 — diagnostics must not fail the boot
++        pass
++    logger.warning(
++        "moe_w2: stream-build NOT armed (%s) — the FULL expert checkpoint "
++        "(~%.1f GiB over %d layers) will stage in host RAM before the "
++        "first requant%s. On a smaller host this ends as a tracebackless "
++        "OOM-kill mid-load. Expected on exotic layouts only; report the "
++        "checkpoint format if you see this on DS4/GLM/Kimi.",
++        why, total_gib, _layer_cutoff(), avail)
++
++
 +def arm_stream_build(layer) -> bool:
 +    """Arm the streaming per-layer build on a layer plan_pack_skip missed
 +    (first boot, or a store that does not yet hold it). Expected loads per
 +    param: w13-side shards land twice per expert (w1, w3), w2-side once —
-+    exact counts over ALL SIX params the requant reads (including scale_2:
++    exact counts over the layout's FULL param set (nvfp4: six incl. scale_2:
 +    building before they land would bake uninitialized per-tensor scales
 +    into the planes AND the caches), so completeness needs no
 +    checkpoint-ordering assumption.
@@ -2809,10 +2865,24 @@ index 000000000..271460dbf
 +        E = layer.w13_weight.shape[0]
 +    except Exception:  # noqa: BLE001 - unexpected layout: staged path
 +        return False
-+    expected = {"w13_weight": 2 * E, "w13_weight_scale": 2 * E,
-+                "w13_weight_scale_2": 2 * E,
-+                "w2_weight": E, "w2_weight_scale": E,
-+                "w2_weight_scale_2": E}
++    if hasattr(layer, "w13_weight_scale_2"):
++        # NVFP4 (modelopt) layout — per-tensor scale_2 params ride along
++        expected = {"w13_weight": 2 * E, "w13_weight_scale": 2 * E,
++                    "w13_weight_scale_2": 2 * E,
++                    "w2_weight": E, "w2_weight_scale": E,
++                    "w2_weight_scale_2": E}
++        builder = build_layer_planes_nvfp4
++    else:
++        # mxfp4 layout (DS4-Flash official checkpoints): same shard
++        # cardinality (w13 lands twice per expert - w1, w3 - w2 once),
++        # no scale_2. Until this branch existed, mxfp4 checkpoints
++        # SILENTLY fell back to staging the full expert checkpoint in
++        # host RAM (~140+ GB on DS4-Flash) - an OOM-kill with no
++        # traceback on any host smaller than the checkpoint, and the
++        # root cause of three burned Ada deploy cycles.
++        expected = {"w13_weight": 2 * E, "w13_weight_scale": 2 * E,
++                    "w2_weight": E, "w2_weight_scale": E}
++        builder = build_layer_planes
 +    big = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
 +    wrappers = {}
 +    for pname in expected:
@@ -2822,6 +2892,7 @@ index 000000000..271460dbf
 +            return False                # leave the layer fully staged
 +        wrappers[pname] = (p, _StreamLoader(layer, pname, inner))
 +    layer._moe_w2_pending = expected
++    layer._moe_w2_stream_builder = builder
 +    # originals of the BIG params: their storage is dropped in place at
 +    # build time, and their SHAPES feed the lazy materialization
 +    layer._moe_w2_stream_orig = tuple(getattr(layer, p) for p in big)
