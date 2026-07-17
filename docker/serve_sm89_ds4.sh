@@ -37,6 +37,7 @@ MAXLEN=${MAXLEN:-16384}
 UTIL=${UTIL:-0.90}
 BASE_GB=${BASE_GB:-6}
 NAME=${NAME:-moet}
+IMG=${IMG:-vllm-moet-sm89:v024}
 
 mkdir -p "$CACHE/planes" "$CACHE/jit"
 docker rm -f "$NAME" 2>/dev/null || true
@@ -50,7 +51,7 @@ docker run -d --name "$NAME" --gpus '"device=0"' --network "$NETWORK" --ipc host
   -e VLLM_MOE_W2_PLANES_CACHE=/plane-cache \
   -e TRITON_CACHE_DIR=/root/.cache/triton \
   -e TORCHINDUCTOR_CACHE_DIR=/root/.cache/torchinductor \
-  vllm-moet-sm89:v024 \
+  "$IMG" \
   --model /model --served-model-name deepseek-v4-flash --trust-remote-code \
   --kv-cache-dtype fp8 --block-size 256 --max-model-len "$MAXLEN" \
   --gpu-memory-utilization "$UTIL" --max-num-batched-tokens 2048 --max-num-seqs 4 \
@@ -58,9 +59,15 @@ docker run -d --name "$NAME" --gpus '"device=0"' --network "$NETWORK" --ipc host
   --speculative-config '{"method": "deepseek_mtp", "num_speculative_tokens": 2}' \
   --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"],"cudagraph_capture_sizes":[1,2,4,8,12,16,24]}' \
   --port 8000
+BUILD=$(docker exec "$NAME" cat /opt/moet-checks/SOURCE.txt 2>/dev/null | grep -v '^#' | head -1 || true)
 echo "started $NAME (sm_89, base-cache ${BASE_GB} GiB, network=$NETWORK, max-model-len=$MAXLEN, util=$UTIL)"
+echo "image build (vllm fork SHA): ${BUILD:-UNKNOWN - pre-observability image, REBUILD from current main}"
 echo "healthy-boot markers:  docker logs -f $NAME 2>&1 | grep -E 'moe_w2'"
-echo "  1) 'sm_89 Triton emulation ready on <GPU> ... self-test worst_rel=...'"
-echo "  2) 'moe_w2 planes: ... -> PINNED HOST RAM (base cache ...)'"
+echo "  1) 'moe_w2: env ... does NOTHING — did you mean ...' (only if you typoed a knob)"
+echo "  2) 'sm_89 Triton emulation ready on <GPU> ... self-test worst_rel=...'"
+echo "  3) 'moe_w2 planes: ... -> PINNED HOST RAM (base cache ...)'"
 echo "on failure:            docker logs $NAME 2>&1 | grep -B2 -A30 -E 'EngineCore.*(Error|Traceback)|moe_w2'"
 echo "                       docker inspect $NAME --format '{{.State.ExitCode}} {{.State.OOMKilled}}'"
+echo "  'Failed core proc(s): {}' (empty set) = EngineCore died with NO Python exception:"
+echo "    host OOM-killer  -> sudo dmesg -T | grep -iE 'oom|killed process' | tail -5   (and: free -g)"
+echo "    native crash     -> faulthandler stacks are in docker logs (PYTHONFAULTHANDLER=1 is baked in)"

@@ -94,7 +94,23 @@ docker inspect <name> --format '{{.State.ExitCode}} {{.State.OOMKilled}}'   # ho
 
 The APIServer traceback ending in `wait_for_engine_startup` only says
 "the engine died" — the real error is in the `(EngineCore pid=…)` lines
-above it (or absent entirely if the host OOM-killer struck).
+above it. Decode its last line:
+
+- `Failed core proc(s): {'EngineCore_0': …}` — the engine raised a
+  Python exception; its traceback IS in the log, scroll up.
+- `Failed core proc(s): {}` (**empty set**) — the engine died with NO
+  Python exception; there is no traceback to find. Two suspects:
+  host OOM-killer (`sudo dmesg -T | grep -iE "oom|killed process" |
+  tail -5`, plus `free -g`; `docker inspect --format '{{.State.OOMKilled}}'`
+  only catches container-limit kills, not host ones) or a native crash —
+  the image bakes `PYTHONFAULTHANDLER=1`, so segfault/abort stacks land
+  in `docker logs`.
+
+Before reading any log, confirm WHICH build produced it: `docker exec
+<name> cat /opt/moet-checks/SOURCE.txt` prints the vllm fork SHA the
+image's patch was generated from (file absent = pre-observability
+image — rebuild). A relaunch on a stale image looks identical in the
+log until the first moe_w2 line, and has already burned a debug cycle.
 
 VRAM reality on Ada: DS4-Flash planes are ~1.73 GiB/layer × 43 layers ≈
 **74 GiB** — GPU-resident planes need the 96 GB SM120 board. On 24–48 GB
