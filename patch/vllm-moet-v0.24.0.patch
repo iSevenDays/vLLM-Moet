@@ -2060,10 +2060,10 @@ index 000000000..10770e789
 +        "on" if _verify() else "off")
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
-index 000000000..7d64d2697
+index 000000000..f7604e2c6
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
-@@ -0,0 +1,2407 @@
+@@ -0,0 +1,2533 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Routed experts on 2-bit tensor-sym planes (cubit moe_w2) for the
@@ -2099,6 +2099,7 @@ index 000000000..7d64d2697
 +import ctypes
 +import functools
 +import os
++import re
 +
 +import torch
 +
@@ -2142,6 +2143,7 @@ index 000000000..7d64d2697
 +# (loader degrades to mc4 when missing). Opt out: VLLM_MOE_W2_AFRAG=0.
 +_AFRAG = os.getenv("VLLM_MOE_W2_AFRAG", "1") == "1"
 +_afrag_ok = False
++_sm89 = False                   # set by the (8,9) loader branch
 +# PREFILL QUALITY LEVER (default ON): prefill-sized calls consume the FP4
 +# delta tier exactly like decode — pairs whose expert is FP4-resident divert
 +# to moe_w4(q)_mm, the rest stay on the 2-bit planes. Before this, prefill
@@ -2378,6 +2380,34 @@ index 000000000..7d64d2697
 +        raise RuntimeError(f"moe_w2_cubit: CUDA error {r} in {what}")
 +
 +
++def _warn_env_typos() -> None:
++    """VLLM_MOE_W2* env names nothing reads are SILENT no-ops: the moe_w2
++    stack reads os.getenv directly and envs.py does not register these
++    knobs (so vllm's own "Unknown vLLM environment variable" warning fires
++    even for the CORRECT names — benign, ignore it). The failure mode of a
++    typo is "my knob did nothing", which costs a deploy cycle to notice
++    (measured: ..PLANE_CACHE typo for ..PLANES_CACHE). Harvest the
++    canonical names from the moe_w2_* sources and warn with a suggestion.
++    """
++    import difflib
++    import glob
++    here = os.path.dirname(os.path.abspath(__file__))
++    known = {"VLLM_MOE_W2_DENSE_FP8"}    # read from fp8.py, not utils/
++    for f in glob.glob(os.path.join(here, "moe_w2_*.py")):
++        try:
++            with open(f) as fh:
++                known |= set(re.findall(r"VLLM_MOE_W2\w*", fh.read()))
++        except OSError:
++            pass
++    for k in sorted(os.environ):
++        if k.startswith("VLLM_MOE_W2") and k not in known:
++            hint = difflib.get_close_matches(k, sorted(known), n=1)
++            logger.warning(
++                "moe_w2: env %s is not read by any moe_w2 module and does "
++                "NOTHING%s", k,
++                f" — did you mean {hint[0]}?" if hint else "")
++
++
 +def _ensure_ready() -> bool:
 +    global _state
 +    if _state == "ready":
@@ -2385,6 +2415,7 @@ index 000000000..7d64d2697
 +    if _state == "unavailable":
 +        return False
 +    try:
++        _warn_env_typos()
 +        torch.cuda.init()
 +        torch.zeros(1, device="cuda")
 +        # Hand-written SASS = sm_120 ONLY, and the cubins carry no PTX to
@@ -2416,9 +2447,29 @@ index 000000000..7d64d2697
 +            ks = tuple(int(x) for x in os.getenv(
 +                "VLLM_MOE_W2_KS", "7168,6144,4096,2048,1024,512").split(","))
 +            _fns.update(moe_w2_sm89.make_launchers(ks))
++            global _sm89
++            _sm89 = True
++            # STARTUP SELF-TEST (observability: deploy cycles are more
++            # expensive than one JIT compile at init). A tiny op-level
++            # GEMM runs against a torch reference on the actual silicon:
++            # a Triton codegen/driver regression fails HERE, attributed,
++            # instead of as silent output corruption. Opt out:
++            # VLLM_MOE_W2_SM89_SELFTEST=0.
++            if os.getenv("VLLM_MOE_W2_SM89_SELFTEST", "1") == "1":
++                import triton as _triton
++                worst = moe_w2_sm89.self_test()
++                logger.info(
++                    "moe_w2_cubit: sm_89 Triton emulation ready on %s "
++                    "(triton %s): self-test worst_rel=%.3e (gate 2.5e-2); "
++                    "w2/w2mc4 registered for K=%s",
++                    torch.cuda.get_device_name(), _triton.__version__,
++                    worst, sorted(ks))
++            else:
++                logger.info(
++                    "moe_w2_cubit: sm_89 Triton emulation ready "
++                    "(self-test SKIPPED via env); w2/w2mc4 for K=%s",
++                    sorted(ks))
 +            _state = "ready"
-+            logger.info("moe_w2_cubit: sm_89 Triton emulation ready "
-+                        "(w2/w2mc4, K=%s)", sorted(ks))
 +            return True
 +        if cap != (12, 0):
 +            raise RuntimeError(
@@ -2504,6 +2555,15 @@ index 000000000..7d64d2697
 +        w4tier = "w4q" if moe_w2_delta.split_enabled() else "w4"
 +        need += [(w4tier, K13), (w4tier, K2)]
 +    missing = [f"{t}_k{k}" for t, k in need if (t, k) not in _fns]
++    if _sm89:
++        # Ada: there is no cubin dir to fix — either the FP4 delta tier
++        # is enabled (not ported to sm_89) or K13/K2 fell outside
++        # VLLM_MOE_W2_KS. Name the actual remedy.
++        assert not missing, (
++            f"moe_w2 sm_89: no kernels for {missing} (K13={K13}, K2={K2})."
++            f" The w4/w4q FP4 delta tiers are NOT ported to Ada — set "
++            f"VLLM_MOE_W2_DELTA=0 (or VLLM_MOE_W2_DELTA_GB=0) — and make "
++            f"sure K13/K2 are in VLLM_MOE_W2_KS. See docs/ada-sm89-port.md")
 +    assert not missing, (
 +        f"moe_w2_cubit: missing cubins for K13={K13}/K2={K2}: {missing} "
 +        f"(dir {_DIR}; set VLLM_MOE_W2_CUBIT_DIR)")
@@ -2835,6 +2895,62 @@ index 000000000..7d64d2697
 +    return True
 +
 +
++_budget_logged = False
++
++
++def _log_plane_budget(E: int, N13: int, K13: int, N2: int, K2: int) -> None:
++    """One-time projection of the FULL model's plane footprint at the
++    FIRST plane build — observability bought before the failure, not
++    after: resident mode on a card that cannot possibly hold the planes
++    used to walk ~40 layers of torch.empty into a bare CUDA OOM whose
++    traceback names nothing moe_w2. Now the impossible config fails here
++    with the remedy, the merely-tight one warns, and every boot logs one
++    budget line (also the "moe_w2 is ACTIVE" beacon — the stock backend
++    banner, e.g. "Using 'MARLIN' Mxfp4 MoE backend", still prints and
++    routinely misleads readers of the log)."""
++    global _budget_logged
++    if _budget_logged:
++        return
++    _budget_logged = True
++    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
++    per_layer = E * (N13 * K13 + N2 * K2) * (1 / 4 + 1 / 32)  # codes+scales
++    n_layers = _layer_cutoff()
++    try:
++        from vllm.config import get_current_vllm_config
++        pp = get_current_vllm_config().parallel_config.pipeline_parallel_size
++        n_layers = -(-n_layers // max(pp, 1))
++    except Exception:  # noqa: BLE001 — PP unknown: project full depth
++        pass
++    total_gib = per_layer * n_layers / 2**30
++    if moe_w2_delta.base_enabled():
++        logger.info(
++            "moe_w2 planes: %.2f GiB/layer x %d layers = %.1f GiB -> "
++            "PINNED HOST RAM (base cache; the GPU holds the "
++            "VLLM_MOE_W2_BASE_CACHE_GB slot pool)",
++            per_layer / 2**30, n_layers, total_gib)
++        return
++    free_b, total_b = torch.cuda.mem_get_info()
++    logger.info(
++        "moe_w2 planes: %.2f GiB/layer x %d layers = %.1f GiB "
++        "GPU-RESIDENT (device now: %.1f GiB free / %.1f GiB total)",
++        per_layer / 2**30, n_layers, total_gib,
++        free_b / 2**30, total_b / 2**30)
++    if per_layer * n_layers > total_b:
++        raise RuntimeError(
++            f"moe_w2: GPU-resident planes need ~{total_gib:.1f} GiB but "
++            f"this device has {total_b / 2**30:.1f} GiB TOTAL — this "
++            "cannot fit at any utilization. Use the base cache "
++            "(VLLM_MOE_W2_BASE_CACHE_GB=<pool GiB> keeps planes in pinned "
++            "host RAM and streams a GPU slot pool), shard with TP, or "
++            "serve a smaller model. See docs/ada-sm89-port.md")
++    if per_layer * n_layers > free_b * 0.9:
++        logger.warning(
++            "moe_w2: projected resident planes (%.1f GiB) exceed 90%% of "
++            "currently free VRAM (%.1f GiB) — weight load will likely "
++            "OOM; consider VLLM_MOE_W2_BASE_CACHE_GB", total_gib,
++            free_b / 2**30)
++
++
 +def build_layer_planes(layer, layer_key: int) -> None:
 +    """Quantize one FusedMoE layer's experts to 2-bit planes (GPU, chunked).
 +
@@ -2842,7 +2958,9 @@ index 000000000..7d64d2697
 +    builds fragment-major code planes + scale planes on the GPU, then
 +    replaces the originals with empty stubs.
 +    """
-+    assert _ensure_ready(), "moe_w2 cubins missing"
++    assert _ensure_ready(), (
++        "moe_w2 kernels unavailable — the root cause was logged at "
++        "engine init as 'moe_w2_cubit unavailable: ...'")
 +    dev = torch.device("cuda")
 +    w13 = layer.w13_weight.data          # [E, 2I, H/2] u8 (cpu)
 +    s13 = layer.w13_weight_scale.data    # [E, 2I, H/32] u8
@@ -2853,6 +2971,7 @@ index 000000000..7d64d2697
 +    K13, K2 = N2, N13 // 2               # H, I (4096/2048 on DS4-Flash TP1)
 +    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
 +    _require_kernels(K13, K2, need_w4=moe_w2_delta.enabled())
++    _log_plane_budget(E, N13, K13, N2, K2)
 +    if _try_skip_requant(layer, layer_key, E, N13, K13, N2, K2,
 +                         ("w13_weight", "w13_weight_scale", "w2_weight",
 +                          "w2_weight_scale")):
@@ -2926,7 +3045,9 @@ index 000000000..7d64d2697
 +    from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (
 +        fp8_block_to_codes_scales, pack_fp4_fragment_major)
 +
-+    assert _ensure_ready(), "moe_w2 cubins missing"
++    assert _ensure_ready(), (
++        "moe_w2 kernels unavailable — the root cause was logged at "
++        "engine init as 'moe_w2_cubit unavailable: ...'")
 +    dev = torch.device("cuda")
 +    w13 = layer.w13_weight.data                       # [E, 2I, H] e4m3 (cpu)
 +    s13 = getattr(layer, f"w13_{scale_suffix}").data  # [E, 2I/128, H/128] f32
@@ -2936,6 +3057,7 @@ index 000000000..7d64d2697
 +    E, N13, K13 = w13.shape
 +    _, N2, K2 = w2.shape
 +    _require_kernels(K13, K2, need_w4=moe_w2_delta.enabled())
++    _log_plane_budget(E, N13, K13, N2, K2)
 +    if _try_skip_requant(layer, layer_key, E, N13, K13, N2, K2,
 +                         ("w13_weight", f"w13_{scale_suffix}", "w2_weight",
 +                          f"w2_{scale_suffix}")):
@@ -3039,7 +3161,9 @@ index 000000000..7d64d2697
 +    from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (
 +        nvfp4_to_codes_scales, pack_fp4_fragment_major)
 +
-+    assert _ensure_ready(), "moe_w2 cubins missing"
++    assert _ensure_ready(), (
++        "moe_w2 kernels unavailable — the root cause was logged at "
++        "engine init as 'moe_w2_cubit unavailable: ...'")
 +    dev = torch.device("cuda")
 +    if getattr(layer, "_moe_w2_pack_skip", False):
 +        # loader-level skip: the params are 0-byte stubs (plan_pack_skip),
@@ -3048,6 +3172,7 @@ index 000000000..7d64d2697
 +        # back to.
 +        E, N13, K13, N2, K2 = layer._moe_w2_shapes
 +        _require_kernels(K13, K2, need_w4=moe_w2_delta.enabled())
++        _log_plane_budget(E, N13, K13, N2, K2)
 +        if moe_w2_delta.base_enabled():
 +            assert _try_skip_requant(
 +                layer, layer_key, E, N13, K13, N2, K2,
@@ -3081,6 +3206,7 @@ index 000000000..7d64d2697
 +    K2 = K2h * 2
 +    group = K13 // s13.shape[2]                 # 16 for NVFP4
 +    _require_kernels(K13, K2, need_w4=moe_w2_delta.enabled())
++    _log_plane_budget(E, N13, K13, N2, K2)
 +    if _try_skip_requant(layer, layer_key, E, N13, K13, N2, K2,
 +                         ("w13_weight", "w13_weight_scale", "w2_weight",
 +                          "w2_weight_scale")):
@@ -7774,10 +7900,10 @@ index 000000000..684cd1283
 +        _mark_broken(f"store failed: {e}")
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_sm89.py b/vllm/model_executor/layers/quantization/utils/moe_w2_sm89.py
 new file mode 100644
-index 000000000..c6fe63771
+index 000000000..f6d714ecc
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_sm89.py
-@@ -0,0 +1,172 @@
+@@ -0,0 +1,229 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Ada (sm_89) Triton port of the cubit ``moe_w2_mm`` 2-bit MoE GEMM.
@@ -7916,6 +8042,9 @@ index 000000000..c6fe63771
 +        # ---- B scale: UE8M0 byte -> 2^(sb-127), exact via exponent bitcast
 +        sb = tl.load(bs_ptr + (pid_n * (K // 32) + g) * 16 + r).to(tl.int32)
 +        w_s = (sb << 23).to(tl.float32, bitcast=True)      # 2^(sb-127), sb>=1
++        # sb=0 -> 2^-127 is an f32 SUBNORMAL: correct per UE8M0, but an
++        # FTZ multiply would flush it to 0. Real packs never carry sb=0
++        # (an all-zero 32-group is degenerate); noted for completeness.
 +        w_s = tl.where(sb == 0, 5.877471754111438e-39, w_s)  # sb=0 subnormal
 +        # ---- unscaled bf16 dot (exact products), fp32 accumulate,
 +        #      then fold both per-32 scales as one [M, N] outer product
@@ -7950,6 +8079,60 @@ index 000000000..c6fe63771
 +        fns[("w2", k)] = fn
 +        fns[("w2mc4", k)] = fn
 +    return fns
++
++
++def self_test(k: int = 512, n_rows: int = 32, m_rows: int = 4) -> float:
++    """Tiny op-level GEMM vs a torch reference on the CURRENT device.
++
++    Startup observability for the emulation path: one JIT compile plus
++    <1 ms of GPU time at engine init buys a loud, attributable verdict
++    line — a Triton codegen/driver regression fails HERE with a clear
++    message instead of surfacing as silent output corruption a deploy
++    cycle later. Reference math and the 2.5e-2 gate are verbatim
++    kernels/gen/moe_w2_check.py; per-K compiles still happen lazily at
++    first forward (a per-K compile failure raises loudly there).
++    Returns worst_rel; raises RuntimeError on failure."""
++    dev = torch.device("cuda")
++    g = torch.Generator().manual_seed(7)
++    codes = torch.randint(0, 4, (n_rows, k), dtype=torch.uint8, generator=g)
++    sexp = torch.randint(120, 132, (n_rows, k // 32), dtype=torch.uint8,
++                         generator=g)
++    a = torch.randn(m_rows, k, generator=g) * 0.5
++    ab = a.view(m_rows, k // 32, 32)
++    a_s = ab.abs().amax(-1).clamp_min(1e-10) / 448.0
++    a8 = (ab / a_s[..., None]).clamp(-448, 448).to(
++        torch.float8_e4m3fn).view(m_rows, k)
++    levels = torch.tensor([-4.0, -1.0, 1.0, 4.0])
++    w = levels[codes.long()] * torch.exp2(
++        sexp.float() - 127.0).repeat_interleave(32, 1)
++    ref = (a8.float() * a_s.repeat_interleave(32, 1)) @ w.T
++    # host packers, layout verbatim moe_w2_planes/moe_w2_check.py
++    c = codes.view(n_rows // 16, 2, 8, k // 64, 2, 2, 4, 4)
++    c = c.permute(0, 3, 2, 6, 1, 4, 5, 7).contiguous().view(-1, 4).to(
++        torch.int32)
++    plane = (c[:, 0] | (c[:, 1] << 2) | (c[:, 2] << 4)
++             | (c[:, 3] << 6)).to(torch.uint8)
++    sb = sexp.view(n_rows // 16, 16, k // 32).transpose(
++        1, 2).contiguous().flatten()
++    d_a, d_as = a8.to(dev), a_s.float().contiguous().to(dev)
++    d_b, d_bs = plane.to(dev), sb.to(dev)
++    d_c = torch.zeros(m_rows, n_rows, dtype=torch.bfloat16, device=dev)
++    desc = torch.tensor([[d_a.data_ptr(), d_as.data_ptr(), d_b.data_ptr(),
++                          d_bs.data_ptr(), d_c.data_ptr(), m_rows]],
++                        dtype=torch.int64, device=dev)
++    make_launcher(k)(desc, n_rows, 1)
++    torch.cuda.synchronize()
++    got = d_c.float().cpu()
++    finite = bool(torch.isfinite(got).all())
++    worst = (got - ref).abs().max().item() / ref.abs().max().item()
++    if not finite or worst >= 2.5e-2:
++        raise RuntimeError(
++            f"moe_w2_sm89 self-test FAILED: worst_rel={worst:.3e} "
++            f"(gate 2.5e-2), finite={finite} — the Triton emulation is "
++            "miscompiling on this device/driver; run "
++            "kernels/gen/moe_w2_check_sm89.py for the full op gate and "
++            "report triton/torch/driver versions")
++    return worst
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_store.py b/vllm/model_executor/layers/quantization/utils/moe_w2_store.py
 new file mode 100644
 index 000000000..6b7908f84

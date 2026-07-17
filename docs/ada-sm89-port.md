@@ -59,6 +59,66 @@ delta tiers are not ported: **serve with `VLLM_MOE_W2_DELTA=0`**
 - Triton JIT-compiles per K on first use; vLLM's warmup covers this
   before cudagraph capture.
 
+## Observability — read this before your second deploy cycle
+
+Deployment cycles cost more than log lines, so the Ada path now reports
+its own health at startup. What a HEALTHY boot logs (EngineCore
+process):
+
+1. `moe_w2_cubit: sm_89 Triton emulation ready on <device> (triton X.Y):
+   self-test worst_rel=…e-03 (gate 2.5e-2)` — a 1-pair op-level GEMM ran
+   against a torch reference **on your silicon** at engine init. If
+   Triton miscompiles on this device/driver, the boot fails here with an
+   attributed message instead of serving garbage.
+   (`VLLM_MOE_W2_SM89_SELFTEST=0` to skip.)
+2. `moe_w2 planes: X.XX GiB/layer x N layers = Y GiB …` — the plane
+   budget, projected at the FIRST plane build. GPU-resident mode on a
+   card that cannot possibly hold the planes fails **here** with the
+   remedy, instead of ~40 layers later as a bare CUDA OOM. This line is
+   also your "moe_w2 is ACTIVE" beacon — the stock backend banner
+   (e.g. `Using 'MARLIN' Mxfp4 MoE backend`) still prints and does NOT
+   mean the moe_w2 path is off.
+3. `moe_w2: env VLLM_MOE_W2_… is not read by any moe_w2 module and does
+   NOTHING — did you mean …?` — typo guard over every `VLLM_MOE_W2*`
+   env. The moe_w2 knobs are read with `os.getenv`, NOT registered in
+   `vllm/envs.py` — so vllm's own `Unknown vLLM environment variable`
+   warning fires even for **correct** names. Ignore that one; trust this
+   one.
+
+Triage recipe when the engine dies at startup:
+
+```bash
+docker logs <name> 2>&1 | grep -B2 -A30 -E "EngineCore.*(Error|Traceback|CRITICAL)|moe_w2"
+docker inspect <name> --format '{{.State.ExitCode}} {{.State.OOMKilled}}'   # host OOM kill?
+```
+
+The APIServer traceback ending in `wait_for_engine_startup` only says
+"the engine died" — the real error is in the `(EngineCore pid=…)` lines
+above it (or absent entirely if the host OOM-killer struck).
+
+VRAM reality on Ada: DS4-Flash planes are ~1.73 GiB/layer × 43 layers ≈
+**74 GiB** — GPU-resident planes need the 96 GB SM120 board. On 24–48 GB
+Ada cards you MUST run the base cache: `VLLM_MOE_W2_BASE_CACHE_GB=<pool
+GiB>` keeps planes in pinned host RAM and streams a GPU slot pool
+(start around 4–8 GiB on a 4090 and watch the miss/replay counters), or
+shard with TP, or serve a smaller model.
+
+Env cheat sheet (spellings that have already burned a deploy cycle):
+`VLLM_MOE_W2_PLANES_CACHE` (plural — persists built planes across
+boots), `VLLM_MOE_W2_DELTA_GB=0` (valid way to disable the delta tier;
+`VLLM_MOE_W2_DELTA=0` also works), `VLLM_MOE_W2_BASE_CACHE_GB` (the base
+cache), `VLLM_MOE_W2_STORE_DIR` (expert pack store). First boot without
+a planes cache re-quantizes the whole checkpoint — expect a long load;
+mount `VLLM_MOE_W2_PLANES_CACHE` at a persistent path to pay it once.
+
+In-container op gate on the real card (bake ships at /opt/moet-checks):
+
+```bash
+docker run --rm --gpus all --entrypoint bash vllm-moet-sm89:v024 -c \
+  'for K in 512 1024 2048 4096 6144 7168; do \
+     K=$K python3 /opt/moet-checks/moe_w2_check_sm89.py || exit 1; done'
+```
+
 ## Validation state (be honest with yourself)
 
 CPU golden **PASS** on this repo for all K ∈ {512, 1024, 2048, 4096,

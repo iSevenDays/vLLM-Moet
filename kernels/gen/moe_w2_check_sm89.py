@@ -16,15 +16,22 @@ import sys
 
 import torch
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "..", "triton"))
-from moe_w2_sm89 import make_launcher  # noqa: E402
+try:
+    # in-container / patched-tree runs: the installed vllm copy is the one
+    # the server actually launches — prefer validating THAT
+    from vllm.model_executor.layers.quantization.utils.moe_w2_sm89 import (
+        make_launcher)
+except ImportError:
+    sys.path.insert(0, os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "triton"))
+    from moe_w2_sm89 import make_launcher  # noqa: E402
 
 N = int(os.environ.get("N", "4096"))
 K = int(os.environ.get("K", "4096"))
 E = int(os.environ.get("E", "5"))
 M = int(os.environ.get("M", "4"))
 RUNS = int(os.environ.get("RUNS", "4"))
+assert 1 <= M <= 16, f"M={M}: the desc ABI carries at most 16 rows/pair"
 torch.manual_seed(int(os.environ.get("SEED", "7")))
 
 LEVELS = torch.tensor([-4.0, -1.0, 1.0, 4.0])

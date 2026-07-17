@@ -70,3 +70,15 @@ RUN cd "$(python3 -c 'import vllm, os; print(os.path.dirname(os.path.dirname(vll
     && python3 -c "from vllm.model_executor.layers.quantization.utils import moe_w2_cubit; print('moe_w2 hook OK')" \
     && python3 -c "from vllm.model_executor.layers.quantization.utils import moe_w2_sm89; print('sm_89 triton kernels OK')" \
     && rm /tmp/vllm-moet.patch
+
+# 3. op-level check scripts baked in for IN-CONTAINER preflight on the real
+#    silicon (they validate the installed vllm copy of the kernel). Run the
+#    full op gate BEFORE first serving a new box/driver — cheaper than a
+#    deploy cycle:
+#      docker run --rm --gpus all --entrypoint bash vllm-moet-sm89:v024 -c \
+#        'for K in 512 1024 2048 4096 6144 7168; do \
+#           K=$K python3 /opt/moet-checks/moe_w2_check_sm89.py || exit 1; done'
+#    (the engine also runs a 1-pair self-test at every startup — see the
+#    "moe_w2_cubit: sm_89 Triton emulation ready ... self-test" log line;
+#    opt out with VLLM_MOE_W2_SM89_SELFTEST=0)
+COPY kernels/gen/moe_w2_check_sm89.py kernels/gen/moe_w2_sm89_cpu_check.py /opt/moet-checks/

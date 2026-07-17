@@ -205,4 +205,7 @@ mismatches over all rows/k), worst_rel 2.5–3.2e‑3 vs the f32 reference
 `moe_w2_check.py`: worst_rel < 2.5e‑2 AND 4 runs byte‑identical) and the
 e2e suites (`tools/test_moe_w2_forward.py` rel<0.06/cos>0.999) **pending
 sm_89 hardware** — this dev box has none; run them on the first Ada card
-before serving.
+before serving. Every engine boot additionally runs a 1‑pair startup
+self‑test on the serving silicon (`moe_w2_sm89.self_test`, gate 2.5e‑2,
+logged with device + triton version; `VLLM_MOE_W2_SM89_SELFTEST=0`
+skips) — see docs/ada‑sm89‑port.md § Observability.

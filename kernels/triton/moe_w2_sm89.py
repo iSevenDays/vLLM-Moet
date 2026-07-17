@@ -136,6 +136,9 @@ def moe_w2_mm_sm89(
         # ---- B scale: UE8M0 byte -> 2^(sb-127), exact via exponent bitcast
         sb = tl.load(bs_ptr + (pid_n * (K // 32) + g) * 16 + r).to(tl.int32)
         w_s = (sb << 23).to(tl.float32, bitcast=True)      # 2^(sb-127), sb>=1
+        # sb=0 -> 2^-127 is an f32 SUBNORMAL: correct per UE8M0, but an
+        # FTZ multiply would flush it to 0. Real packs never carry sb=0
+        # (an all-zero 32-group is degenerate); noted for completeness.
         w_s = tl.where(sb == 0, 5.877471754111438e-39, w_s)  # sb=0 subnormal
         # ---- unscaled bf16 dot (exact products), fp32 accumulate,
         #      then fold both per-32 scales as one [M, N] outer product
@@ -170,3 +173,57 @@ def make_launchers(ks) -> dict:
         fns[("w2", k)] = fn
         fns[("w2mc4", k)] = fn
     return fns
+
+
+def self_test(k: int = 512, n_rows: int = 32, m_rows: int = 4) -> float:
+    """Tiny op-level GEMM vs a torch reference on the CURRENT device.
+
+    Startup observability for the emulation path: one JIT compile plus
+    <1 ms of GPU time at engine init buys a loud, attributable verdict
+    line — a Triton codegen/driver regression fails HERE with a clear
+    message instead of surfacing as silent output corruption a deploy
+    cycle later. Reference math and the 2.5e-2 gate are verbatim
+    kernels/gen/moe_w2_check.py; per-K compiles still happen lazily at
+    first forward (a per-K compile failure raises loudly there).
+    Returns worst_rel; raises RuntimeError on failure."""
+    dev = torch.device("cuda")
+    g = torch.Generator().manual_seed(7)
+    codes = torch.randint(0, 4, (n_rows, k), dtype=torch.uint8, generator=g)
+    sexp = torch.randint(120, 132, (n_rows, k // 32), dtype=torch.uint8,
+                         generator=g)
+    a = torch.randn(m_rows, k, generator=g) * 0.5
+    ab = a.view(m_rows, k // 32, 32)
+    a_s = ab.abs().amax(-1).clamp_min(1e-10) / 448.0
+    a8 = (ab / a_s[..., None]).clamp(-448, 448).to(
+        torch.float8_e4m3fn).view(m_rows, k)
+    levels = torch.tensor([-4.0, -1.0, 1.0, 4.0])
+    w = levels[codes.long()] * torch.exp2(
+        sexp.float() - 127.0).repeat_interleave(32, 1)
+    ref = (a8.float() * a_s.repeat_interleave(32, 1)) @ w.T
+    # host packers, layout verbatim moe_w2_planes/moe_w2_check.py
+    c = codes.view(n_rows // 16, 2, 8, k // 64, 2, 2, 4, 4)
+    c = c.permute(0, 3, 2, 6, 1, 4, 5, 7).contiguous().view(-1, 4).to(
+        torch.int32)
+    plane = (c[:, 0] | (c[:, 1] << 2) | (c[:, 2] << 4)
+             | (c[:, 3] << 6)).to(torch.uint8)
+    sb = sexp.view(n_rows // 16, 16, k // 32).transpose(
+        1, 2).contiguous().flatten()
+    d_a, d_as = a8.to(dev), a_s.float().contiguous().to(dev)
+    d_b, d_bs = plane.to(dev), sb.to(dev)
+    d_c = torch.zeros(m_rows, n_rows, dtype=torch.bfloat16, device=dev)
+    desc = torch.tensor([[d_a.data_ptr(), d_as.data_ptr(), d_b.data_ptr(),
+                          d_bs.data_ptr(), d_c.data_ptr(), m_rows]],
+                        dtype=torch.int64, device=dev)
+    make_launcher(k)(desc, n_rows, 1)
+    torch.cuda.synchronize()
+    got = d_c.float().cpu()
+    finite = bool(torch.isfinite(got).all())
+    worst = (got - ref).abs().max().item() / ref.abs().max().item()
+    if not finite or worst >= 2.5e-2:
+        raise RuntimeError(
+            f"moe_w2_sm89 self-test FAILED: worst_rel={worst:.3e} "
+            f"(gate 2.5e-2), finite={finite} — the Triton emulation is "
+            "miscompiling on this device/driver; run "
+            "kernels/gen/moe_w2_check_sm89.py for the full op gate and "
+            "report triton/torch/driver versions")
+    return worst
