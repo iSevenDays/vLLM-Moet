@@ -32,6 +32,10 @@
 set -euo pipefail
 MODEL=${MODEL:-/root/models/DeepSeek-V4-Flash}
 CACHE=${CACHE:-/root/models/moet-cache}
+# network=none is a deliberate air-gap: the first boot re-quantizes the
+# whole checkpoint and should not be reachable half-warm. It also means
+# port 8000 is UNREACHABLE until you relaunch with NETWORK=host (or a
+# bridge + -p mapping) once the boot markers look healthy.
 NETWORK=${NETWORK:-none}
 MAXLEN=${MAXLEN:-16384}
 UTIL=${UTIL:-0.90}
@@ -66,7 +70,7 @@ echo "healthy-boot markers:  docker logs -f $NAME 2>&1 | grep -E 'moe_w2'"
 echo "  1) 'moe_w2: env ... does NOTHING — did you mean ...' (only if you typoed a knob)"
 echo "  2) 'sm_89 Triton emulation ready on <GPU> ... self-test worst_rel=...'"
 echo "  3) 'moe_w2 planes: ... -> PINNED HOST RAM (base cache ...)'"
-echo "on failure:            docker logs $NAME 2>&1 | grep -B2 -A30 -E 'EngineCore.*(Error|Traceback)|moe_w2'"
+echo "on failure:            docker logs $NAME 2>&1 | grep -B2 -A30 -E 'EngineCore.*(Error|Traceback|CRITICAL)|moe_w2'"
 echo "                       docker inspect $NAME --format '{{.State.ExitCode}} {{.State.OOMKilled}}'"
 echo "  'Failed core proc(s): {}' (empty set) = EngineCore died with NO Python exception:"
 echo "    host OOM-killer  -> sudo dmesg -T | grep -iE 'oom|killed process' | tail -5   (and: free -g)"

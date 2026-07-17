@@ -2060,10 +2060,10 @@ index 000000000..10770e789
 +        "on" if _verify() else "off")
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
-index 000000000..fd0565127
+index 000000000..271460dbf
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
-@@ -0,0 +1,2554 @@
+@@ -0,0 +1,2555 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Routed experts on 2-bit tensor-sym planes (cubit moe_w2) for the
@@ -2455,7 +2455,8 @@ index 000000000..fd0565127
 +            # a Triton codegen/driver regression fails HERE, attributed,
 +            # instead of as silent output corruption. Opt out:
 +            # VLLM_MOE_W2_SM89_SELFTEST=0.
-+            if os.getenv("VLLM_MOE_W2_SM89_SELFTEST", "1") == "1":
++            if os.getenv("VLLM_MOE_W2_SM89_SELFTEST", "1").lower() \
++                    not in ("0", "false", "no", "off"):
 +                import triton as _triton
 +                worst = moe_w2_sm89.self_test()
 +                logger.info(
@@ -2947,8 +2948,8 @@ index 000000000..fd0565127
 +                    "arena with VLLM_MOE_W2_BASE_RAM_GB and give the "
 +                    "spill an NVMe home via VLLM_MOE_W2_STORE_DIR",
 +                    total_gib, avail_gib)
-+        except OSError:
-+            pass
++        except Exception:  # noqa: BLE001 — a preflight must never be
++            pass           # the failure it exists to diagnose
 +        return
 +    free_b, total_b = torch.cuda.mem_get_info()
 +    logger.info(
