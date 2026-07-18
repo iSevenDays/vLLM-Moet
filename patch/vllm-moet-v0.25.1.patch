@@ -9297,10 +9297,10 @@ index 18e3b1056..d53669202 100644
  
  
 diff --git a/vllm/utils/deep_gemm.py b/vllm/utils/deep_gemm.py
-index 0a1644bcc..164b2641a 100644
+index 0a1644bcc..d83df13cd 100644
 --- a/vllm/utils/deep_gemm.py
 +++ b/vllm/utils/deep_gemm.py
-@@ -453,7 +453,137 @@ def fp8_gemm_nt(*args, **kwargs):
+@@ -453,7 +453,148 @@ def fp8_gemm_nt(*args, **kwargs):
      return _fp8_gemm_nt_impl(*args, disable_ue8m0_cast=not use_ue8m0, **kwargs)
  
  
@@ -9332,14 +9332,25 @@ index 0a1644bcc..164b2641a 100644
 +            "Correct but slow; a native kernel port is the fix.", name)
 +
 +
-+def _expand_block_scales(vals: torch.Tensor, scales: torch.Tensor):
-+    """values.float() * block-scales broadcast to the value shape (raw f32
-+    scale layouts only — the packed int32 layouts are SM100-era and never
-+    produced on the fallback arches)."""
++def _scales_to_fp32(scales: torch.Tensor) -> torch.Tensor:
++    """Scale tensor -> f32. UE8M0 (exponent-only, e.g. the weight
++    scale_inv of scale_fmt=ue8m0 checkpoints - field-hit on the very
++    first o_proj) decodes by exponent-field bitcast, exact for every
++    byte; raw f32 passes through. The packed-int32 SM100 layouts are
++    never produced on the fallback arches and stay rejected."""
++    if scales.dtype == getattr(torch, "float8_e8m0fnu", None):
++        return (scales.view(torch.uint8).to(torch.int32) << 23).view(
++            torch.float32)
 +    assert scales.dtype == torch.float32, (
-+        f"torch fallback expects raw f32 block scales, got {scales.dtype}")
++        f"torch fallback expects f32 or e8m0 block scales, "
++        f"got {scales.dtype}")
++    return scales
++
++
++def _expand_block_scales(vals: torch.Tensor, scales: torch.Tensor):
++    """values.float() * block-scales broadcast to the value shape."""
 +    x = vals.float()
-+    sc = scales.float()
++    sc = _scales_to_fp32(scales)
 +    assert sc.ndim == x.ndim, (sc.shape, x.shape)
 +    for d in range(x.ndim):
 +        if sc.shape[d] != x.shape[d]:
@@ -9373,7 +9384,7 @@ index 0a1644bcc..164b2641a 100644
 +            "is not None -> FP4 Q); serve pre-SM90 with the FP8 indexer "
 +            "cache")
 +    k, k_scale = kv
-+    kf = k.float() * k_scale.float().view(-1, 1)          # [N, D]
++    kf = k.float() * _scales_to_fp32(k_scale).view(-1, 1)  # [N, D]
 +    qf = qv.float()                                       # [M, H, D]
 +    M, H, _ = qf.shape
 +    n = kf.shape[0]
@@ -9438,7 +9449,7 @@ index 0a1644bcc..164b2641a 100644
      _lazy_init()
      if _fp8_einsum_impl is None:
          return _missing(*args, **kwargs)
-@@ -528,6 +658,9 @@ def fp8_fp4_mqa_logits(
+@@ -528,6 +669,9 @@ def fp8_fp4_mqa_logits(
      Returns:
          Logits tensor of shape [M, N], dtype `torch.float32`.
      """
@@ -9448,7 +9459,7 @@ index 0a1644bcc..164b2641a 100644
      _lazy_init()
      if _fp8_fp4_mqa_logits_impl is None:
          return _missing()
-@@ -556,6 +689,11 @@ def get_paged_mqa_logits_metadata(
+@@ -556,6 +700,11 @@ def get_paged_mqa_logits_metadata(
          Backend-specific tensor consumed by `fp8_fp4_paged_mqa_logits` to
          schedule work across SMs.
      """
@@ -9460,7 +9471,7 @@ index 0a1644bcc..164b2641a 100644
      _lazy_init()
      if _get_paged_mqa_logits_metadata_impl is None:
          return _missing()
-@@ -600,6 +738,11 @@ def fp8_fp4_paged_mqa_logits(
+@@ -600,6 +749,11 @@ def fp8_fp4_paged_mqa_logits(
          Logits tensor of shape [B * next_n, max_model_len], dtype
          `torch.float32`.
      """
