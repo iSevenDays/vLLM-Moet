@@ -10703,6 +10703,44 @@ index 0a1644bcc..ed4050910 100644
      _lazy_init()
      if _fp8_fp4_paged_mqa_logits_impl is None:
          return _missing()
+diff --git a/vllm/utils/flashinfer.py b/vllm/utils/flashinfer.py
+index c8e6a8419..5409b28d1 100644
+--- a/vllm/utils/flashinfer.py
++++ b/vllm/utils/flashinfer.py
+@@ -214,7 +214,15 @@ def has_flashinfer_moe() -> bool:
+ 
+ @functools.cache
+ def has_flashinfer_sparse_mla_sm120() -> bool:
+-    """Return ``True`` if FlashInfer sparse MLA decode support is available."""
++    """Return ``True`` if FlashInfer sparse MLA decode support is available.
++
++    Checks the SIGNATURE, not just the import: vllm's DSV4 sparse call
++    sites pass the SWA kwargs (``swa_topk_lens`` et al) that FlashInfer
++    grew in 0.6.14, while the requirements pin lagged at 0.6.13 - an old
++    package imports fine and then dies mid-warmup with an
++    unexpected-keyword TypeError (field-hit on Ada). Probing here turns
++    that into an init-time backend refusal that names the remedy.
++    """
+     if not has_flashinfer():
+         return False
+     try:
+@@ -225,6 +233,16 @@ def has_flashinfer_sparse_mla_sm120() -> bool:
+         )
+     except ImportError:
+         return False
++    import inspect
++    if "swa_topk_lens" not in inspect.signature(
++            trtllm_batch_decode_sparse_mla_dsv4).parameters:
++        logger.warning_once(
++            "FlashInfer's trtllm_batch_decode_sparse_mla_dsv4 lacks the "
++            "swa_topk_lens API (needs flashinfer-python>=0.6.14; the "
++            "vllm requirements pin 0.6.13 predates the DSV4 SWA kwargs) "
++            "- sparse MLA decode disabled. Install flashinfer-python"
++            "==0.6.14 (+ the matching jit-cache wheel).")
++        return False
+     return (
+         callable(trtllm_batch_decode_sparse_mla_dsv4)
+         and callable(trtllm_batch_decode_with_kv_cache_mla)
 diff --git a/vllm/v1/attention/backends/flashinfer.py b/vllm/v1/attention/backends/flashinfer.py
 index 80319003d..40193a3a6 100755
 --- a/vllm/v1/attention/backends/flashinfer.py
