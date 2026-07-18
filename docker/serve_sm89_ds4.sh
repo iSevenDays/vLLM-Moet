@@ -34,25 +34,49 @@ MODEL=${MODEL:-/root/models/DeepSeek-V4-Flash}
 CACHE=${CACHE:-/root/models/moet-cache}
 # network=none is a deliberate air-gap: the first boot re-quantizes the
 # whole checkpoint and should not be reachable half-warm. It also means
-# port 8000 is UNREACHABLE until you relaunch with NETWORK=host (or a
-# bridge + -p mapping) once the boot markers look healthy.
+# the API port ($PORT) is UNREACHABLE until you relaunch with NETWORK=host
+# (or a bridge + -p mapping) once the boot markers look healthy.
 NETWORK=${NETWORK:-none}
 MAXLEN=${MAXLEN:-16384}
 UTIL=${UTIL:-0.90}
-BASE_GB=${BASE_GB:-6}
+PORT=${PORT:-8001}
+# Both 48 GB cards via tensor parallelism (TP2); GPU1 was idle on TP1. BASE_GB is
+# the GPU-resident expert pool PER RANK (per card) — 20 GiB fits a 48 GB card with
+# room for the TP-sharded dense weights + KV. Fall back to one card with:
+#   TP=1 GPUS='"device=0"' ./docker/serve_sm89_ds4.sh   (then bump ARENA_GB to ~20)
+GPUS=${GPUS:-'"device=0,1"'}
+TP=${TP:-2}
+BASE_GB=${BASE_GB:-20}
 NAME=${NAME:-moet}
 IMG=${IMG:-vllm-moet-sm89:v024}
+# --- small-host RAM tier (REQUIRED on this box: ~38 GiB host RAM << the ~80 GiB the
+#     all-pinned 2-bit base needs). STORE_DIR moves the base out of pinned RAM into
+#     on-disk per-rank packs: read-mostly files (mmap/page-cache), NOT swap — so ZFS
+#     is safe for them (swap-on-ZFS deadlocks; a pack file does not). The packs
+#     double as a persistent quant cache (later boots skip dequant->requant).
+#     BASE_RAM_GB pins a small MRU arena over each pack. NOTE: the arena is PER RANK,
+#     so under TP2 the host holds 2 x ARENA_GB — kept small here (2 x 10 = 20 GiB) to
+#     fit this 38 GiB box. STORE needs a REAL fs (bind mount, NOT overlayfs), ~80 GB
+#     free for both per-rank packs combined.
+STORE=${STORE:-$CACHE/packs}
+ARENA_GB=${ARENA_GB:-10}
 
-mkdir -p "$CACHE/planes" "$CACHE/jit"
+mkdir -p "$CACHE/planes" "$CACHE/jit" "$STORE"
 docker rm -f "$NAME" 2>/dev/null || true
-docker run -d --name "$NAME" --gpus '"device=0"' --network "$NETWORK" --ipc host --shm-size 64g \
+# TP>1 needs --disable-custom-all-reduce on this stack (README § TP).
+TPARGS=""
+if [ "$TP" -gt 1 ]; then TPARGS="--tensor-parallel-size $TP --disable-custom-all-reduce"; fi
+docker run -d --name "$NAME" --gpus "$GPUS" --network "$NETWORK" --ipc host --shm-size 64g \
   -v "$MODEL":/model:ro \
   -v "$CACHE/planes":/plane-cache \
   -v "$CACHE/jit":/root/.cache \
+  -v "$STORE":/packs \
   -e VLLM_MOE_W2=1 \
   -e VLLM_MOE_W2_DELTA_GB=0 \
   -e VLLM_MOE_W2_BASE_CACHE_GB="$BASE_GB" \
   -e VLLM_MOE_W2_PLANES_CACHE=/plane-cache \
+  -e VLLM_MOE_W2_STORE_DIR=/packs \
+  -e VLLM_MOE_W2_BASE_RAM_GB="$ARENA_GB" \
   -e TRITON_CACHE_DIR=/root/.cache/triton \
   -e TORCHINDUCTOR_CACHE_DIR=/root/.cache/torchinductor \
   "$IMG" \
@@ -60,11 +84,12 @@ docker run -d --name "$NAME" --gpus '"device=0"' --network "$NETWORK" --ipc host
   --kv-cache-dtype fp8 --block-size 256 --max-model-len "$MAXLEN" \
   --gpu-memory-utilization "$UTIL" --max-num-batched-tokens 2048 --max-num-seqs 4 \
   --tokenizer-mode deepseek_v4 --no-scheduler-reserve-full-isl \
+  $TPARGS \
   --speculative-config '{"method": "deepseek_mtp", "num_speculative_tokens": 2}' \
   --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"],"cudagraph_capture_sizes":[1,2,4,8,12,16,24]}' \
-  --port 8000
+  --port "$PORT"
 BUILD=$(docker exec "$NAME" cat /opt/moet-checks/SOURCE.txt 2>/dev/null | grep -v '^#' | head -1 || true)
-echo "started $NAME (sm_89, base-cache ${BASE_GB} GiB, network=$NETWORK, max-model-len=$MAXLEN, util=$UTIL)"
+echo "started $NAME (sm_89, gpus=${GPUS} tp=${TP}, base-cache ${BASE_GB} GiB/rank, arena ${ARENA_GB} GiB/rank, store ${STORE}->/packs, port ${PORT}, network=$NETWORK, max-model-len=$MAXLEN, util=$UTIL)"
 echo "image build (vllm fork SHA): ${BUILD:-UNKNOWN - pre-observability image, REBUILD from current main}"
 echo "healthy-boot markers:  docker logs -f $NAME 2>&1 | grep -E 'moe_w2'"
 echo "  1) 'moe_w2: env ... does NOTHING — did you mean ...' (only if you typoed a knob)"
