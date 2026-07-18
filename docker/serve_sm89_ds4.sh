@@ -40,33 +40,46 @@ NETWORK=${NETWORK:-none}
 MAXLEN=${MAXLEN:-16384}
 UTIL=${UTIL:-0.90}
 PORT=${PORT:-8001}
-# Both 48 GB cards via tensor parallelism (TP2); GPU1 was idle on TP1. BASE_GB is
-# the GPU-resident expert pool PER RANK (per card) — 20 GiB fits a 48 GB card with
-# room for the TP-sharded dense weights + KV. Fall back to one card with:
-#   TP=1 GPUS='"device=0"' ./docker/serve_sm89_ds4.sh   (then bump ARENA_GB to ~20)
-GPUS=${GPUS:-'"device=0,1"'}
-TP=${TP:-2}
+# GPU / parallelism. DEFAULT = SINGLE CARD (TP1). TP2 needs TWO pinned host arenas
+# plus ~26 GiB of inter-worker /dev/shm and does NOT fit this 38 GiB host: a TP2 first
+# run swap-stormed the box into a hard hang (even host sshd stopped answering). Use TP2
+# only after adding host RAM — TP=2 GPUS='"device=0,1"'. The --memory cap below still
+# contains it, so an oversized run is OOM-killed instead of taking the whole host down.
+GPUS=${GPUS:-'"device=0"'}
+TP=${TP:-1}
 BASE_GB=${BASE_GB:-20}
 NAME=${NAME:-moet}
 IMG=${IMG:-vllm-moet-sm89:v024}
-# --- small-host RAM tier (REQUIRED on this box: ~38 GiB host RAM << the ~80 GiB the
-#     all-pinned 2-bit base needs). STORE_DIR moves the base out of pinned RAM into
-#     on-disk per-rank packs: read-mostly files (mmap/page-cache), NOT swap — so ZFS
-#     is safe for them (swap-on-ZFS deadlocks; a pack file does not). The packs
-#     double as a persistent quant cache (later boots skip dequant->requant).
-#     BASE_RAM_GB pins a small MRU arena over each pack. NOTE: the arena is PER RANK,
-#     so under TP2 the host holds 2 x ARENA_GB — kept small here (2 x 10 = 20 GiB) to
-#     fit this 38 GiB box. STORE needs a REAL fs (bind mount, NOT overlayfs), ~80 GB
-#     free for both per-rank packs combined.
+# --- small-host RAM tier (REQUIRED here: 38 GiB host RAM << the ~80 GiB the all-pinned
+#     2-bit base needs). STORE_DIR moves the base out of pinned RAM into an on-disk pack:
+#     a read-mostly file (mmap/page-cache), NOT swap — so ZFS is safe for it (swap-on-ZFS
+#     deadlocks; a pack file does not). The pack doubles as a persistent quant cache
+#     (later boots skip dequant->requant). BASE_RAM_GB pins a small MRU arena over the
+#     pack (per rank). STORE needs a REAL fs (bind mount, NOT overlayfs), ~80 GB free.
 STORE=${STORE:-$CACHE/packs}
-ARENA_GB=${ARENA_GB:-10}
+ARENA_GB=${ARENA_GB:-14}
+# Host-safety belt: a HARD cgroup memory cap on the container. If the load ever
+# overshoots, the cgroup OOM-killer takes the CONTAINER (fast, contained) instead of
+# letting the host swap-storm the slow USB sticks into a full hang. Sized to fit TP1
+# (RSS ~20-26 GiB) with margin and leave the 38 GiB host a reserve; only +2 GiB swap
+# so it cannot lean on USB swap. Belt-and-suspenders: ALSO cap the LXC itself before
+# launch — pct set 100 -memory 32000 -swap 4000 (see post-reboot prep in the handover).
+MEM_GB=${MEM_GB:-30}
 
 mkdir -p "$CACHE/planes" "$CACHE/jit" "$STORE"
 docker rm -f "$NAME" 2>/dev/null || true
-# TP>1 needs --disable-custom-all-reduce on this stack (README § TP).
-TPARGS=""
-if [ "$TP" -gt 1 ]; then TPARGS="--tensor-parallel-size $TP --disable-custom-all-reduce"; fi
-docker run -d --name "$NAME" --gpus "$GPUS" --network "$NETWORK" --ipc host --shm-size 64g \
+# TP>1 needs --disable-custom-all-reduce + host IPC and a large /dev/shm for inter-worker
+# tensor passing. TP1 needs neither, so keep shm small and contained — the ~26 GiB shm was
+# a big part of what sank the TP2 first run on this host.
+if [ "$TP" -gt 1 ]; then
+  TPARGS="--tensor-parallel-size $TP --disable-custom-all-reduce"
+  IPCARGS="--ipc host --shm-size 64g"
+else
+  TPARGS=""
+  IPCARGS="--shm-size 8g"
+fi
+docker run -d --name "$NAME" --gpus "$GPUS" --network "$NETWORK" $IPCARGS \
+  --memory "${MEM_GB}g" --memory-swap "$((MEM_GB + 2))g" \
   -v "$MODEL":/model:ro \
   -v "$CACHE/planes":/plane-cache \
   -v "$CACHE/jit":/root/.cache \
@@ -89,7 +102,7 @@ docker run -d --name "$NAME" --gpus "$GPUS" --network "$NETWORK" --ipc host --sh
   --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"],"cudagraph_capture_sizes":[1,2,4,8,12,16,24]}' \
   --port "$PORT"
 BUILD=$(docker exec "$NAME" cat /opt/moet-checks/SOURCE.txt 2>/dev/null | grep -v '^#' | head -1 || true)
-echo "started $NAME (sm_89, gpus=${GPUS} tp=${TP}, base-cache ${BASE_GB} GiB/rank, arena ${ARENA_GB} GiB/rank, store ${STORE}->/packs, port ${PORT}, network=$NETWORK, max-model-len=$MAXLEN, util=$UTIL)"
+echo "started $NAME (sm_89, gpus=${GPUS} tp=${TP}, memcap=${MEM_GB}g, base-cache ${BASE_GB} GiB/rank, arena ${ARENA_GB} GiB/rank, store ${STORE}->/packs, port ${PORT}, network=$NETWORK, max-model-len=$MAXLEN, util=$UTIL)"
 echo "image build (vllm fork SHA): ${BUILD:-UNKNOWN - pre-observability image, REBUILD from current main}"
 echo "healthy-boot markers:  docker logs -f $NAME 2>&1 | grep -E 'moe_w2'"
 echo "  1) 'moe_w2: env ... does NOTHING — did you mean ...' (only if you typoed a knob)"
