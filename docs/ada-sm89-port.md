@@ -125,6 +125,14 @@ above it. Decode its last line:
   upstream e8m0→fp32 decode before the launch was gated ROCm/XPU-only;
   the gate is dropped — the exact exponent-bitcast decode now runs on
   every platform, both operands.
+  Do NOT reach for the v0.25.1 image to dodge this (measured, not
+  assumed): v0.25.1's `fp8_utils.py` carries the SAME ROCm/XPU-only
+  gate, and it pins the same torch 2.11.0 (same bundled Triton) — the
+  identical KeyError reproduces there. The v0.24.0 patch also does not
+  apply to its tree: ~22 files fail hunks and the six DSpark
+  speculator files collide (upstream absorbed DSpark in 0.25). A 0.25
+  port is a full new patch lineage — do it for its own reasons
+  someday, not for this bug.
 
 Before reading any log, confirm WHICH build produced it: `docker exec
 <name> cat /opt/moet-checks/SOURCE.txt` prints the vllm fork SHA the
