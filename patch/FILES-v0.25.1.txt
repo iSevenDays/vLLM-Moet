@@ -31,6 +31,8 @@ vllm/model_executor/layers/sparse_attn_indexer.py
 vllm/model_executor/models/deepseek_mtp.py
 vllm/model_executor/models/qwen3_dspark.py
 vllm/models/deepseek_v4/common/ops/fused_inv_rope_fp8_quant.py
+vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py
+vllm/models/deepseek_v4/nvidia/model.py
 vllm/models/deepseek_v4/nvidia/mtp.py
 vllm/models/deepseek_v4/nvidia/ops/o_proj.py
 vllm/utils/deep_gemm.py
