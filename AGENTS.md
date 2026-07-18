@@ -7,13 +7,16 @@ every rule below traces back to a real incident.
 
 ## The iron rule
 
-`patch/vllm-moet-v0.24.0.patch` is a **generated artifact**: byte-for-byte
-`git diff v0.24.0 moet-v0.24.0` from the vllm fork clone. It is **never
-edited by hand**, never patched incrementally, never regenerated from
-anything but the fork branch. The only sanctioned way to change it:
+Every `patch/vllm-moet-<tag>.patch` is a **generated artifact**:
+byte-for-byte `git diff <tag> moet-<tag>` from the vllm fork clone. Two
+lineages ship — `v0.24.0` (branch `moet-v0.24.0`, fingerprints
+`FILES.txt`/`SOURCE.txt`) and `v0.25.1` (branch `moet-v0.25.1`,
+fingerprints `FILES-v0.25.1.txt`/`SOURCE-v0.25.1.txt`). A patch is
+**never edited by hand**, never patched incrementally, never regenerated
+from anything but its fork branch. The only sanctioned way to change one:
 
 ```bash
-python3 tools/check_patch_files.py --update
+python3 tools/check_patch_files.py --update [tag ...]   # default: all
 ```
 
 If your change touches vLLM code, it goes to the **fork branch first**; the

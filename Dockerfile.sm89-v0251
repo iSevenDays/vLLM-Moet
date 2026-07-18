@@ -1,0 +1,52 @@
+# vLLM-Moet on official vLLM v0.25.1 — Ada / sm_89 (RTX 4090, RTX 2000-6000 Ada)
+#
+# The v0.25.1 LINEAGE of the Ada build: official vllm/vllm-openai:v0.25.1
+# with patch/vllm-moet-v0.25.1.patch applied (generated from fork branch
+# moet-v0.25.1 = the full Moet feature set merged onto v0.25.1; see the
+# merge commit for the hunk-by-hunk conflict policy). The 2-bit MoE
+# experts run through the same Triton emulation as the v0.24.0 Ada image
+# (moe_w2_sm89.py, inside the patch); the e8m0 Triton-MM decode fix is
+# carried (v0.25.1 upstream still has the ROCm/XPU-only gate).
+#
+# STATUS: CPU-validated only (patch .py compile, packing golden, stream
+# mechanics harness). The v0.24.0 image (Dockerfile.sm89-v024) is the
+# field-tested line — its startup self-test passed on RTX 4090 D. Run
+# the /opt/moet-checks op gate on silicon before trusting this one, and
+# note DCP configs on this lineage follow upstream semantics (the moet
+# DCP backports were superseded by upstream's evolution; revalidate
+# before enabling DCP).
+#
+# Differences vs Dockerfile.sm89-v024:
+#   - base image v0.25.1 (newer stock flashinfer ships in-image: the
+#     0.6.14 pin was a v0.24.0-image artifact and is NOT repeated here)
+#   - patch/vllm-moet-v0.25.1.patch (57 files; 10 of the v0.24.0
+#     lineage's files were absorbed upstream, DSpark among them)
+#
+# Build (from the repo root):
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm89-v0251 -t vllm-moet-sm89:v0251 .
+# Serve: same launcher, IMG override:
+#   IMG=vllm-moet-sm89:v0251 docker/serve_sm89_ds4.sh
+
+FROM vllm/vllm-openai:v0.25.1
+
+# Native-crash observability (see Dockerfile.sm89-v024 for the rationale:
+# "Failed core proc(s): {}" = no Python exception; faulthandler puts
+# segfault/abort stacks into docker logs; OOM-kills still need host dmesg).
+ENV PYTHONFAULTHANDLER=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
+# the v0.25.1-lineage patch, applied to the installed package (pure-Python
+# delta; brings the moe_w2 path INCLUDING the sm_89 Triton kernels)
+COPY patch/vllm-moet-v0.25.1.patch /tmp/vllm-moet.patch
+RUN cd "$(python3 -c 'import vllm, os; print(os.path.dirname(os.path.dirname(vllm.__file__)))')" \
+    && git apply --verbose /tmp/vllm-moet.patch \
+    && python3 -c "from vllm.model_executor.layers.quantization.utils import moe_w2_cubit; print('moe_w2 hook OK')" \
+    && python3 -c "from vllm.model_executor.layers.quantization.utils import moe_w2_sm89; print('sm_89 triton kernels OK')" \
+    && rm /tmp/vllm-moet.patch
+
+# op-level check scripts + image identity (same contract as the v024 image:
+# run the full gate on new silicon BEFORE serving; SOURCE names the fork SHA)
+COPY kernels/gen/moe_w2_check_sm89.py kernels/gen/moe_w2_sm89_cpu_check.py /opt/moet-checks/
+COPY patch/SOURCE-v0.25.1.txt /opt/moet-checks/SOURCE.txt
