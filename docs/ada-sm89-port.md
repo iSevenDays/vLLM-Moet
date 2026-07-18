@@ -116,6 +116,15 @@ above it. Decode its last line:
   fallback to full staging logs a loud `moe_w2: stream-build NOT
   armed` warning projecting the footprint against `MemAvailable`.
   Watch for `moe_w2 STREAM-BUILD armed` in a healthy boot.
+- `KeyError: 'float8_e8m0fnu'` in `triton/_utils.py` →
+  `terminate called without an active exception` → abort, at first
+  forward/capture AFTER weights loaded: the DS4 attention fp8
+  block-scaled linear fell back to the Triton MM (no family-120
+  DeepGEMM on Ada) holding UE8M0 scale tensors, and Triton cannot bind
+  the `float8_e8m0fnu` dtype at all. Fixed (fork `8a464a2b4`): the
+  upstream e8m0→fp32 decode before the launch was gated ROCm/XPU-only;
+  the gate is dropped — the exact exponent-bitcast decode now runs on
+  every platform, both operands.
 
 Before reading any log, confirm WHICH build produced it: `docker exec
 <name> cat /opt/moet-checks/SOURCE.txt` prints the vllm fork SHA the

@@ -208,4 +208,8 @@ sm_89 hardware** — this dev box has none; run them on the first Ada card
 before serving. Every engine boot additionally runs a 1‑pair startup
 self‑test on the serving silicon (`moe_w2_sm89.self_test`, gate 2.5e‑2,
 logged with device + triton version; `VLLM_MOE_W2_SM89_SELFTEST=0`
-skips) — see docs/ada‑sm89‑port.md § Observability.
+skips) — see docs/ada‑sm89‑port.md § Observability. **First silicon
+signal (field report, RTX 4090 D / triton 3.6.0): startup self‑test
+PASS, worst_rel 2.6e‑3** — squarely in the CPU‑golden band. That is the
+1‑pair smoke, not the full gate: the per‑K op sweep and the e2e suites
+above remain the acceptance bar.

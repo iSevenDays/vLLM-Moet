@@ -1662,10 +1662,41 @@ index 1b2a8a74b..7941c6454 100644
          assert self.moe_kernel is not None
          return self.moe_kernel.apply(
 diff --git a/vllm/model_executor/layers/quantization/utils/fp8_utils.py b/vllm/model_executor/layers/quantization/utils/fp8_utils.py
-index 32a2d8689..3e83d5a87 100644
+index 32a2d8689..831eb654c 100644
 --- a/vllm/model_executor/layers/quantization/utils/fp8_utils.py
 +++ b/vllm/model_executor/layers/quantization/utils/fp8_utils.py
-@@ -1122,6 +1122,11 @@ def deepgemm_post_process_fp8_weight_block(
+@@ -915,14 +915,22 @@ def w8a8_triton_block_scaled_mm(
+     assert len(block_size) == 2
+     block_n, block_k = block_size[0], block_size[1]
+ 
+-    # Triton cannot currently bind E8M0 scale tensors directly. On ROCm,
+-    # DeepSeek-V4 checkpoints store block scales in exponent-only E8M0 format,
+-    # so decode them to fp32 before launching the kernel.
+-    if current_platform.is_rocm() or current_platform.is_xpu():
+-        if As.dtype == torch.float8_e8m0fnu:
+-            As = _upcast_e8m0_to_fp32(As).contiguous()
+-        if Bs.dtype == torch.float8_e8m0fnu:
+-            Bs = _upcast_e8m0_to_fp32(Bs).contiguous()
++    # Triton cannot bind E8M0 scale tensors on ANY platform: its dtype
++    # canonicalisation table has no float8_e8m0fnu entry, so the JIT
++    # binder raises KeyError and the C++ runtime terminates the process
++    # (no Python traceback - the engine just aborts). This guard used to
++    # be ROCm/XPU-only on the assumption that CUDA always consumes UE8M0
++    # scales through DeepGEMM before this fallback is reached - FALSE on
++    # Ada (sm_89): there is no family-120 DeepGEMM path, the DS4
++    # attention fp8 block-scaled linear lands HERE, and the e8m0 Bs of a
++    # scale_fmt=ue8m0 checkpoint aborted the engine at first forward.
++    # Decode unconditionally: E8M0 is exponent-only, the fp32 upcast is
++    # exact (2^(byte-127) via exponent-field bitcast), and the cost is a
++    # few thousand elements per call next to the GEMM itself.
++    if As.dtype == torch.float8_e8m0fnu:
++        As = _upcast_e8m0_to_fp32(As).contiguous()
++    if Bs.dtype == torch.float8_e8m0fnu:
++        Bs = _upcast_e8m0_to_fp32(Bs).contiguous()
+ 
+     assert A.shape[-1] == B.shape[-1]
+     assert A.shape[:-1] == As.shape[:-1] and A.is_contiguous()
+@@ -1122,6 +1130,11 @@ def deepgemm_post_process_fp8_weight_block(
          r = wq.size(0) // g
          wq = wq.view(g, r, d)
          ws = ws.view(g, r // quant_block_shape[0], d // quant_block_shape[1])
