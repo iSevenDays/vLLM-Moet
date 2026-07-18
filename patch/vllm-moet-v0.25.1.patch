@@ -9297,10 +9297,10 @@ index 18e3b1056..d53669202 100644
  
  
 diff --git a/vllm/utils/deep_gemm.py b/vllm/utils/deep_gemm.py
-index 0a1644bcc..d83df13cd 100644
+index 0a1644bcc..ed4050910 100644
 --- a/vllm/utils/deep_gemm.py
 +++ b/vllm/utils/deep_gemm.py
-@@ -453,7 +453,148 @@ def fp8_gemm_nt(*args, **kwargs):
+@@ -453,7 +453,204 @@ def fp8_gemm_nt(*args, **kwargs):
      return _fp8_gemm_nt_impl(*args, disable_ue8m0_cast=not use_ue8m0, **kwargs)
  
  
@@ -9362,11 +9362,56 @@ index 0a1644bcc..d83df13cd 100644
 +    return x * sc
 +
 +
++_fallback_shapes_logged: set[str] = set()
++
++
++def _log_fallback_shapes(name: str, detail: str) -> None:
++    """One INFO line with the ACTUAL tensor geometry the first time each
++    fallback runs — a shape mismatch then diagnoses from the log instead
++    of costing a deploy cycle (the o_proj 2-D-weight einsum did exactly
++    that before this line existed)."""
++    if name not in _fallback_shapes_logged:
++        _fallback_shapes_logged.add(name)
++        logger.info("deep_gemm fallback %s: %s", name, detail)
++
++
++def _einsum_operand(sub: str, tensor: torch.Tensor, dims: dict) -> torch.Tensor:
++    """Reshape a dequantized operand to its subscript arity. DeepGEMM's
++    einsum accepts operands whose LOGICAL rank exceeds their storage rank
++    (o_proj passes wo_a's plain 2-D [h*d, r] linear weight for subscript
++    'hdr'); torch.einsum does not. Split the storage using dims already
++    pinned by the output/other operands; at most one letter may remain
++    unknown (reshape -1 infers it)."""
++    if tensor.ndim == len(sub):
++        for ch, n in zip(sub, tensor.shape):
++            dims.setdefault(ch, n)
++        return tensor
++    shape = [dims.get(ch, -1) for ch in sub]
++    assert shape.count(-1) <= 1, (
++        f"fallback einsum cannot infer '{sub}' from storage "
++        f"{tuple(tensor.shape)} with known dims {dims}")
++    view = tensor.reshape(shape)
++    for ch, n in zip(sub, view.shape):
++        dims.setdefault(ch, n)
++    return view
++
++
 +def _torch_fp8_einsum(subscripts, a, b, out, **_kwargs) -> torch.Tensor:
 +    _warn_fallback("fp8_einsum")
 +    av = _expand_block_scales(*a) if isinstance(a, tuple) else a.float()
 +    bv = _expand_block_scales(*b) if isinstance(b, tuple) else b.float()
-+    out.copy_(torch.einsum(subscripts, av, bv).to(out.dtype))
++    lhs, out_sub = subscripts.replace(" ", "").split("->")
++    sub_a, sub_b = lhs.split(",")
++    dims: dict = {ch: n for ch, n in zip(out_sub, out.shape)}
++    av = _einsum_operand(sub_a, av, dims)
++    bv = _einsum_operand(sub_b, bv, dims)
++    _log_fallback_shapes(
++        "fp8_einsum",
++        f"'{subscripts}' a{tuple(a[0].shape) if isinstance(a, tuple) else tuple(a.shape)}"
++        f"->{tuple(av.shape)} b{tuple(b[0].shape) if isinstance(b, tuple) else tuple(b.shape)}"
++        f"->{tuple(bv.shape)} out{tuple(out.shape)} {out.dtype}")
++    out.copy_(
++        torch.einsum(f"{sub_a},{sub_b}->{out_sub}", av, bv).to(out.dtype))
 +    return out
 +
 +
@@ -9384,6 +9429,11 @@ index 0a1644bcc..d83df13cd 100644
 +            "is not None -> FP4 Q); serve pre-SM90 with the FP8 indexer "
 +            "cache")
 +    k, k_scale = kv
++    _log_fallback_shapes(
++        "fp8_fp4_mqa_logits",
++        f"q{tuple(qv.shape)} {qv.dtype} k{tuple(k.shape)} {k.dtype} "
++        f"k_scale{tuple(k_scale.shape)} {k_scale.dtype} "
++        f"weights{tuple(weights.shape)} ks/ke{tuple(cu_seqlen_ks.shape)}")
 +    kf = k.float() * _scales_to_fp32(k_scale).view(-1, 1)  # [N, D]
 +    qf = qv.float()                                       # [M, H, D]
 +    M, H, _ = qf.shape
@@ -9414,6 +9464,12 @@ index 0a1644bcc..d83df13cd 100644
 +            "not wired); serve pre-SM90 with the FP8 indexer cache")
 +    bsz, next_n, _h, d = qv.shape
 +    block_size = kv_cache.shape[1]
++    _log_fallback_shapes(
++        "fp8_fp4_paged_mqa_logits",
++        f"q{tuple(qv.shape)} {qv.dtype} kv_cache{tuple(kv_cache.shape)} "
++        f"{kv_cache.dtype} weights{tuple(weights.shape)} "
++        f"context_lens{tuple(context_lens.shape)} "
++        f"block_tables{tuple(block_tables.shape)} mml={max_model_len}")
 +    dev = qv.device
 +    if context_lens.ndim == 2:
 +        lens2d = context_lens.to(dev)
@@ -9449,7 +9505,7 @@ index 0a1644bcc..d83df13cd 100644
      _lazy_init()
      if _fp8_einsum_impl is None:
          return _missing(*args, **kwargs)
-@@ -528,6 +669,9 @@ def fp8_fp4_mqa_logits(
+@@ -528,6 +725,9 @@ def fp8_fp4_mqa_logits(
      Returns:
          Logits tensor of shape [M, N], dtype `torch.float32`.
      """
@@ -9459,7 +9515,7 @@ index 0a1644bcc..d83df13cd 100644
      _lazy_init()
      if _fp8_fp4_mqa_logits_impl is None:
          return _missing()
-@@ -556,6 +700,11 @@ def get_paged_mqa_logits_metadata(
+@@ -556,6 +756,11 @@ def get_paged_mqa_logits_metadata(
          Backend-specific tensor consumed by `fp8_fp4_paged_mqa_logits` to
          schedule work across SMs.
      """
@@ -9471,7 +9527,7 @@ index 0a1644bcc..d83df13cd 100644
      _lazy_init()
      if _get_paged_mqa_logits_metadata_impl is None:
          return _missing()
-@@ -600,6 +749,11 @@ def fp8_fp4_paged_mqa_logits(
+@@ -600,6 +805,11 @@ def fp8_fp4_paged_mqa_logits(
          Logits tensor of shape [B * next_n, max_model_len], dtype
          `torch.float32`.
      """
