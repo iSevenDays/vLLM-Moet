@@ -41,6 +41,7 @@ vllm/models/deepseek_v4/nvidia/mtp.py
 vllm/models/deepseek_v4/nvidia/ops/o_proj.py
 vllm/transformers_utils/configs/speculators/algos.py
 vllm/utils/deep_gemm.py
+vllm/utils/flashinfer.py
 vllm/v1/attention/backends/flashinfer.py
 vllm/v1/attention/backends/mla/cubit_sparse_mla.py
 vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py

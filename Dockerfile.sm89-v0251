@@ -17,10 +17,17 @@
 # before enabling DCP).
 #
 # Differences vs Dockerfile.sm89-v024:
-#   - base image v0.25.1 (newer stock flashinfer ships in-image: the
-#     0.6.14 pin was a v0.24.0-image artifact and is NOT repeated here)
-#   - patch/vllm-moet-v0.25.1.patch (57 files; 10 of the v0.24.0
-#     lineage's files were absorbed upstream, DSpark among them)
+#   - base image v0.25.1
+#   - patch/vllm-moet-v0.25.1.patch (10 of the v0.24.0 lineage's files
+#     were absorbed upstream, DSpark among them)
+#   - flashinfer 0.6.14 pin RESTORED (field-proven necessary): vllm
+#     0.25.1 pins flashinfer 0.6.13 in-image, but its own DSV4 sparse
+#     call sites pass the SWA kwargs (swa_topk_lens) that FlashInfer
+#     grew in 0.6.14 - decode warmup dies with an unexpected-keyword
+#     TypeError on the sparse-MLA-API mode (the mode Ada and SM12x use;
+#     SM100's trtllm-gen mode dodges it, which is how upstream's lag
+#     survives their CI). The engine also probes the signature at init
+#     now and refuses loudly on an old FlashInfer.
 #
 # Build (from the repo root):
 #   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm89-v0251 -t vllm-moet-sm89:v0251 .
@@ -36,6 +43,15 @@ ENV PYTHONFAULTHANDLER=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/*
+
+# flashinfer 0.6.14 (+ cu130 jit-cache): the image's 0.6.13 predates the
+# DSV4 SWA kwargs (see header). The 0.6.13 cubin pkg must go - there is
+# no 0.6.14 build of it and the version check would trip.
+RUN pip uninstall -y --break-system-packages flashinfer-cubin || true
+RUN pip install --no-cache-dir --break-system-packages flashinfer-python==0.6.14 \
+    && pip install --no-cache-dir --break-system-packages \
+        --index-url https://flashinfer.ai/whl/cu130 \
+        "flashinfer-jit-cache==0.6.14+cu130"
 
 # the v0.25.1-lineage patch, applied to the installed package (pure-Python
 # delta; brings the moe_w2 path INCLUDING the sm_89 Triton kernels)
