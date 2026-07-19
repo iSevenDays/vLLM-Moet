@@ -148,10 +148,10 @@ index 0000000..df62c57
 +}
 diff --git a/tests/v1/attention/test_triton_sparse_mla_dsv4.py b/tests/v1/attention/test_triton_sparse_mla_dsv4.py
 new file mode 100644
-index 0000000..038fc85
+index 0000000..1e65a8a
 --- /dev/null
 +++ b/tests/v1/attention/test_triton_sparse_mla_dsv4.py
-@@ -0,0 +1,254 @@
+@@ -0,0 +1,265 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Numerics for the Triton DSv4 sparse-MLA port (Ada / pre-SM100 route).
@@ -223,8 +223,10 @@ index 0000000..038fc85
 +        lens[0] = k_main
 +    sinks = None
 +    if with_sinks:
-+        sinks = torch.full((h,), -float("inf"), device=device)
-+        sinks[: h // 2] = torch.randn(h // 2, device=device)
++        sinks = torch.full((h,), -float("inf"), device=device,
++                           dtype=torch.float32)
++        sinks[: h // 2] = torch.randn(h // 2, device=device,
++                                      dtype=torch.float32)
 +
 +    kwargs = dict(
 +        sparse_indices=idx,
@@ -356,16 +358,25 @@ index 0000000..038fc85
 +@pytest.mark.skipif(not _INTERPRET,
 +                    reason="set TRITON_INTERPRET=1 for the CPU tier")
 +def test_boot_self_test_case_runs_on_cpu():
-+    """Execute the EXACT boot-time self-test path on CPU.
++    """Execute the EXACT boot-time self-test path on CPU, under the
++    loader's ambient conditions.
 +
-+    Regression guard for the 2026-07-19 field hit: the self-test called
-+    the kernel positionally, `idx` landed in `workspace_buffer` (third
-+    parameter after the signature grew to mirror flashinfer), and the
-+    first CUDA boot died at layer init - the only call path the CPU
-+    tiers did not cover. Now they do.
++    Regression guard for two 2026-07-19 field hits, both in code only a
++    CUDA boot used to reach:
++    1. positional kernel call - `idx` landed in `workspace_buffer` after
++       the signature grew to mirror flashinfer;
++    2. default-dtype sensitivity - at boot this runs inside the model
++       loader's set_default_dtype(bf16) context, so the sinks tensor
++       (allocated without an explicit dtype) came out bf16 and was
++       refused. Hence the bf16 ambient below.
 +    """
 +    from vllm.v1.attention.ops.triton_sparse_mla_dsv4 import _self_test_case
-+    assert _self_test_case(torch.device("cpu")) < 5e-2
++    old = torch.get_default_dtype()
++    torch.set_default_dtype(torch.bfloat16)  # the loader's ambient at boot
++    try:
++        assert _self_test_case(torch.device("cpu")) < 5e-2
++    finally:
++        torch.set_default_dtype(old)
 +
 +
 +@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -12177,10 +12188,10 @@ index 6aec1db..4359cb3 100644
          q,
 diff --git a/vllm/v1/attention/ops/triton_sparse_mla_dsv4.py b/vllm/v1/attention/ops/triton_sparse_mla_dsv4.py
 new file mode 100644
-index 0000000..287eb7e
+index 0000000..f6aa663
 --- /dev/null
 +++ b/vllm/v1/attention/ops/triton_sparse_mla_dsv4.py
-@@ -0,0 +1,782 @@
+@@ -0,0 +1,789 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Triton port of FlashInfer's SM120 sparse-MLA paged attention (DSv4).
@@ -12860,9 +12871,15 @@ index 0000000..287eb7e
 +    and the test suite runs this function on CPU so the boot path can
 +    never again be the one untested path.
 +    """
++    # Every float tensor here carries an EXPLICIT dtype: this function
++    # executes inside the model loader's set_default_dtype(bf16) context
++    # at boot, so default-dtype allocations silently come out bf16 there
++    # (second field hit on the 4090: the sinks tensor). The CPU tier
++    # reruns this function under a bf16 ambient default to keep it true.
 +    torch.manual_seed(0)
 +    pages, pbs, t, h = 6, 64, 4, 16
-+    kv_f32 = torch.randn(pages * pbs, _D, device=device) * 2.0
++    kv_f32 = torch.randn(pages * pbs, _D, device=device,
++                         dtype=torch.float32) * 2.0
 +    packed = pack_dsv4_reference_cache(kv_f32, pbs)
 +    plain = torch.randn(pages, pbs, _D, device=device,
 +                        dtype=torch.bfloat16)
@@ -12878,8 +12895,9 @@ index 0000000..287eb7e
 +    elens = torch.tensor([256, 0, 17, 256],
 +                         device=device,
 +                         dtype=torch.int32)
-+    sinks = torch.full((h,), -float("inf"), device=device)
-+    sinks[:8] = torch.randn(8, device=device)
++    sinks = torch.full((h,), -float("inf"), device=device,
++                       dtype=torch.float32)
++    sinks[:8] = torch.randn(8, device=device, dtype=torch.float32)
 +    kwargs = dict(
 +        query=q,
 +        swa_kv_cache=plain.unsqueeze(-2),
