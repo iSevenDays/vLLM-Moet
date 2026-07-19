@@ -24,15 +24,57 @@ If your change touches vLLM code, it goes to the **fork branch first**; the
 patch is derived afterwards. A change that exists only inside the patch file
 WILL be erased by somebody's next regeneration.
 
-## The two repos on this box
+### When the fork clone is not reachable (the patch-direct fallback)
+
+The fork clone lives on the **dev box** only (path `/workspace/vllm-v0.24.0`,
+or wherever `VLLM_MOET_FORK` points). Other environments — CI, contributor
+Macs, and any deploy/build host that just pulls this repo to drive a
+Docker build — do **not** have it. A `vllm/` subdirectory, if present at
+all on a non-dev box, is a locally-added IDE reference (gitignored; not
+part of this repo). It is never the fork, and you cannot regen from it.
+
+**The patch is the actual distribution mechanism.** The Dockerfile
+applies `patch/vllm-moet-<tag>.patch` to the upstream image at build
+time. When you are on a box without the fork clone and a vLLM code
+change is needed, editing the patch directly is the **documented
+fallback**, not a violation. The discipline below keeps it safe —
+matching the regen-from-fork output byte-for-byte so the next dev-box
+regen does not erase it.
+
+Procedure:
+
+1. Edit the source in a staging tree (e.g. `staging/<topic>/…`) by
+   extracting the current file body out of the patch, modifying it, and
+   validating syntax (`python3 -c "import ast; ast.parse(open(…).read())"`).
+   Keep the pristine extraction as `<file>.orig` for diff review.
+2. Locate the file's hunk in `patch/vllm-moet-<tag>.patch`. New files
+   use the `new file mode 100644 / index 0000000..<sha> / --- /dev/null /
+   +++ b/<file> / @@ -0,0 +1,N @@` form. Modified files use the standard
+   unified diff form — update hunks in place, preserving context lines.
+3. Replace the body with the modified file content (every line `+`
+   prefixed). Update the `@@ -0,0 +1,N @@` count and the `index` blob
+   SHA (abbreviated git blob hash: `hashlib.sha1(b"blob " +
+   str(len(content_bytes)).encode() + b"\0" + content_bytes).hexdigest()[:7]`).
+4. **Roundtrip-verify**: re-extract the body from the rewritten patch
+   and confirm its git blob SHA equals the modified file's git blob SHA.
+   No SHA match, no commit.
+5. Note in the commit body that this is a patch-direct edit pending
+   fork-branch sync, and name the file(s) touched. The next dev-box
+   session must `git apply -3` the commit's patch hunk onto
+   `moet-v0.25.1` so a regen produces a byte-equal patch.
+
+The iron rule still applies wherever the fork clone IS reachable:
+prefer regen over hand-edit there. The fallback exists so work does not
+stall on boxes that cannot reach the fork.
+
+## The two repos
 
 | repo | path | branch | role |
 |---|---|---|---|
-| **vLLM-Moet** (this one, public) | `/workspace/vllm-moet` | `main` | publication: generated patch, kernels + cubins, bench system, docs |
-| **vllm fork clone** | `/workspace/vllm-v0.24.0` (path is historical) | `moet-v0.25.1` | **source of truth for ALL vLLM code**; remotes: `fork` = `kacper-daftcode/vllm`, `origin` = `vllm-project/vllm` |
+| **vLLM-Moet** (this one, public) | wherever the checkout lives on the current box | `main` | publication: generated patch, kernels + cubins, bench system, docs |
+| **vllm fork clone** (dev box only) | `/workspace/vllm-v0.24.0` (path is historical) | `moet-v0.25.1` | source of truth for ALL vLLM code *where reachable*; remotes: `fork` = `kacper-daftcode/vllm`, `origin` = `vllm-project/vllm`. Not present on CI, contributor Macs, or deploy/build hosts — see the patch-direct fallback above. |
 
-`/root/workspace` is a symlink to `/workspace`. Upstream-PR branches and
-experiments live in worktrees off the same clone
+Upstream-PR branches and experiments live in worktrees off the fork clone
 (`git -C /workspace/vllm-v0.24.0 worktree list`).
 
 `moet-v0.25.1` is the ship lineage: everything committed there is meant to
@@ -98,11 +140,14 @@ smoke results (`bench/results/smoke/`).
 - Stage **explicit paths only**: `git add <file> <file> …`.
 - `main` and `moet-v0.25.1` are shared trunks: no amending commits you did
   not just create, no rebase, no force-push, no history rewrite.
-- The `patch/` trio (patch, `FILES.txt`, `SOURCE.txt`) changes **only** via
-  `--update`. If your commit would touch any of them for another reason,
-  you are doing something wrong.
-- A pre-commit hook in this checkout runs the patch guard whenever `patch/`
-  is staged. Do not bypass it with `--no-verify`.
+- The `patch/` trio (patch, `FILES-v0.25.1.txt`, `SOURCE-v0.25.1.txt`)
+  changes **only** via `--update` on boxes where the fork clone is
+  reachable. On boxes without the fork clone, the patch-direct fallback
+  above applies — but `FILES`/`SOURCE` fingerprints must still be
+  reconciled (see the fallback procedure; do not bump `SOURCE.txt`
+  without a fork SHA to name).
+- A pre-commit hook in dev-box checkouts runs the patch guard whenever
+  `patch/` is staged. Do not bypass it with `--no-verify`.
 - Commit identity: no global git identity is configured on this box —
   pass the session identity per command, matching the existing history:
 
