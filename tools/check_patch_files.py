@@ -92,7 +92,7 @@ class Lineage:
             "by hand.\n")
 
 
-LINEAGES = [Lineage("v0.24.0", legacy_names=True), Lineage("v0.25.1")]
+LINEAGES = [Lineage("v0.25.1")]
 
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 # `index <old>..<new>[ <mode>]` lines carry abbreviated blob hashes whose

@@ -8,10 +8,11 @@ every rule below traces back to a real incident.
 ## The iron rule
 
 Every `patch/vllm-moet-<tag>.patch` is a **generated artifact**:
-byte-for-byte `git diff <tag> moet-<tag>` from the vllm fork clone. Two
-lineages ship — `v0.24.0` (branch `moet-v0.24.0`, fingerprints
-`FILES.txt`/`SOURCE.txt`) and `v0.25.1` (branch `moet-v0.25.1`,
-fingerprints `FILES-v0.25.1.txt`/`SOURCE-v0.25.1.txt`). A patch is
+byte-for-byte `git diff <tag> moet-<tag>` from the vllm fork clone. One
+lineage ships — `v0.25.1` (branch `moet-v0.25.1`, fingerprints
+`FILES-v0.25.1.txt`/`SOURCE-v0.25.1.txt`); the retired `v0.24.0`
+lineage was removed 2026-07-19 (only the v0.25.1 image is deployed;
+its history stays in git). A patch is
 **never edited by hand**, never patched incrementally, never regenerated
 from anything but its fork branch. The only sanctioned way to change one:
 
@@ -28,21 +29,21 @@ WILL be erased by somebody's next regeneration.
 | repo | path | branch | role |
 |---|---|---|---|
 | **vLLM-Moet** (this one, public) | `/workspace/vllm-moet` | `main` | publication: generated patch, kernels + cubins, bench system, docs |
-| **vllm fork clone** | `/workspace/vllm-v0.24.0` | `moet-v0.24.0` | **source of truth for ALL vLLM code**; remotes: `fork` = `kacper-daftcode/vllm`, `origin` = `vllm-project/vllm` |
+| **vllm fork clone** | `/workspace/vllm-v0.24.0` (path is historical) | `moet-v0.25.1` | **source of truth for ALL vLLM code**; remotes: `fork` = `kacper-daftcode/vllm`, `origin` = `vllm-project/vllm` |
 
 `/root/workspace` is a symlink to `/workspace`. Upstream-PR branches and
 experiments live in worktrees off the same clone
 (`git -C /workspace/vllm-v0.24.0 worktree list`).
 
-`moet-v0.24.0` is the ship lineage: everything committed there is meant to
+`moet-v0.25.1` is the ship lineage: everything committed there is meant to
 ship in the next patch regen. Park half-done work on a side branch or
-worktree, not on `moet-v0.24.0`.
+worktree, not on `moet-v0.25.1`.
 
 ## Where a change goes
 
 | change | commit where | must also update |
 |---|---|---|
-| vLLM runtime code (`moe_w2_*`, loaders, runner, attention, …) | fork branch `moet-v0.24.0` | regen the patch here — procedure below |
+| vLLM runtime code (`moe_w2_*`, loaders, runner, attention, …) | fork branch `moet-v0.25.1` | regen the patch here — procedure below |
 | SASS kernels / cubins | `kernels/` | a `kernels/MANIFEST.md` row (generator + validation status) |
 | serve configs | `bench/recipes/` | `bench/models.yaml`, `bench/matrix.yaml`; run `bench/runner/lint.py` |
 | bench results | `bench/results/<release>/` | `bench/runner/render.py` — the README table and per-release report are **generated**; never hand-edit the marked README block |
@@ -55,7 +56,7 @@ smoke results (`bench/results/smoke/`).
 ## Shipping a vLLM code change — the procedure
 
 1. **Commit on the fork branch** (`/workspace/vllm-v0.24.0`,
-   `moet-v0.24.0`). If the remote may have moved, fetch and merge first —
+   `moet-v0.25.1`). If the remote may have moved, fetch and merge first —
    the regen tool refuses to run when the local branch is missing pushed
    commits.
 2. **Regenerate** from this repo:
@@ -84,7 +85,7 @@ smoke results (`bench/results/smoke/`).
 
    > `Three-tier starvation fix ships: step-scoped seen windows (vllm 9736e4d34)`
 
-6. **Push both together** (`fork moet-v0.24.0` + `origin main`) once the
+6. **Push both together** (`fork moet-v0.25.1` + `origin main`) once the
    pre-push checklist passes — or leave both unpushed. Avoid a lasting
    state where only one side is pushed.
 
@@ -95,7 +96,7 @@ smoke results (`bench/results/smoke/`).
   `git commit -a`, no `git stash`, no `git checkout --` / `git reset` over
   someone else's files, ever.
 - Stage **explicit paths only**: `git add <file> <file> …`.
-- `main` and `moet-v0.24.0` are shared trunks: no amending commits you did
+- `main` and `moet-v0.25.1` are shared trunks: no amending commits you did
   not just create, no rebase, no force-push, no history rewrite.
 - The `patch/` trio (patch, `FILES.txt`, `SOURCE.txt`) changes **only** via
   `--update`. If your commit would touch any of them for another reason,
