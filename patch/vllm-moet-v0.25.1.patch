@@ -148,10 +148,10 @@ index 0000000..df62c57
 +}
 diff --git a/tests/v1/attention/test_triton_sparse_mla_dsv4.py b/tests/v1/attention/test_triton_sparse_mla_dsv4.py
 new file mode 100644
-index 0000000..63f0982
+index 0000000..038fc85
 --- /dev/null
 +++ b/tests/v1/attention/test_triton_sparse_mla_dsv4.py
-@@ -0,0 +1,239 @@
+@@ -0,0 +1,254 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Numerics for the Triton DSv4 sparse-MLA port (Ada / pre-SM100 route).
@@ -351,6 +351,21 @@ index 0000000..63f0982
 +@pytest.mark.parametrize("case_kw", _CASE_GRID)
 +def test_kernel_matches_ref_interpreter(case_kw):
 +    _kernel_vs_ref(torch.device("cpu"), **case_kw)
++
++
++@pytest.mark.skipif(not _INTERPRET,
++                    reason="set TRITON_INTERPRET=1 for the CPU tier")
++def test_boot_self_test_case_runs_on_cpu():
++    """Execute the EXACT boot-time self-test path on CPU.
++
++    Regression guard for the 2026-07-19 field hit: the self-test called
++    the kernel positionally, `idx` landed in `workspace_buffer` (third
++    parameter after the signature grew to mirror flashinfer), and the
++    first CUDA boot died at layer init - the only call path the CPU
++    tiers did not cover. Now they do.
++    """
++    from vllm.v1.attention.ops.triton_sparse_mla_dsv4 import _self_test_case
++    assert _self_test_case(torch.device("cpu")) < 5e-2
 +
 +
 +@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -12162,10 +12177,10 @@ index 6aec1db..4359cb3 100644
          q,
 diff --git a/vllm/v1/attention/ops/triton_sparse_mla_dsv4.py b/vllm/v1/attention/ops/triton_sparse_mla_dsv4.py
 new file mode 100644
-index 0000000..8dfe264
+index 0000000..287eb7e
 --- /dev/null
 +++ b/vllm/v1/attention/ops/triton_sparse_mla_dsv4.py
-@@ -0,0 +1,762 @@
+@@ -0,0 +1,782 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Triton port of FlashInfer's SM120 sparse-MLA paged attention (DSv4).
@@ -12831,24 +12846,20 @@ index 0000000..8dfe264
 +    return result
 +
 +
-+@functools.cache
-+def dsv4_sparse_mla_self_test() -> None:
-+    """One-shot on-device self-test: Triton port vs. the torch reference.
++def _self_test_case(device: torch.device) -> float:
++    """Build and run the canonical self-test case; return worst_rel.
 +
-+    Runs at attention-layer init on architectures that take the port (so a
-+    codegen/driver regression fails the BOOT, attributed, instead of
-+    corrupting outputs). Covers: packed + plain caches, both segments,
-+    sinks, len-0 tokens and -1 index padding.
++    Device-agnostic on purpose: CI executes this EXACT boot-time code
++    path under ``TRITON_INTERPRET=1`` on CPU. The original self-test
++    called the kernel with positional arguments and was only reachable
++    with CUDA present - after the public signature grew
++    ``workspace_buffer`` in third position (to mirror flashinfer), the
++    indices landed in ``workspace_buffer`` and the first REAL boot died
++    at layer init with 'sparse_indices is required' (field-hit on the
++    4090, 2026-07-19). Everything here is keyword-only for that reason,
++    and the test suite runs this function on CPU so the boot path can
++    never again be the one untested path.
 +    """
-+    if os.getenv("VLLM_DSV4_SPARSE_MLA_SELFTEST", "1") in ("0", "false",
-+                                                           "no", "off"):
-+        logger.warning_once(
-+            "DSv4 sparse-MLA Triton port self-test SKIPPED "
-+            "(VLLM_DSV4_SPARSE_MLA_SELFTEST=0)")
-+        return
-+    if not (HAS_TRITON and torch.cuda.is_available()):
-+        return
-+    device = torch.device("cuda", torch.cuda.current_device())
 +    torch.manual_seed(0)
 +    pages, pbs, t, h = 6, 64, 4, 16
 +    kv_f32 = torch.randn(pages * pbs, _D, device=device) * 2.0
@@ -12870,6 +12881,9 @@ index 0000000..8dfe264
 +    sinks = torch.full((h,), -float("inf"), device=device)
 +    sinks[:8] = torch.randn(8, device=device)
 +    kwargs = dict(
++        query=q,
++        swa_kv_cache=plain.unsqueeze(-2),
++        sparse_indices=idx,
 +        compressed_kv_cache=packed.view(pages, pbs, 1, _BPT_PACKED),
 +        swa_topk_lens=lens,
 +        extra_sparse_indices=eidx,
@@ -12878,11 +12892,32 @@ index 0000000..8dfe264
 +        sinks=sinks,
 +        kv_layout="NHD",
 +    )
-+    got = triton_sparse_mla_dsv4(q, plain.unsqueeze(-2), idx, **kwargs)
-+    want = sparse_mla_dsv4_torch_ref(q, plain.unsqueeze(-2), idx, **kwargs)
++    got = triton_sparse_mla_dsv4(**kwargs)
++    want = sparse_mla_dsv4_torch_ref(**kwargs)
 +    denom = want.to(torch.float32).abs().clamp_min(1e-2)
-+    worst_rel = ((got.to(torch.float32) - want.to(torch.float32)).abs() /
-+                 denom).max().item()
++    return ((got.to(torch.float32) - want.to(torch.float32)).abs() /
++            denom).max().item()
++
++
++@functools.cache
++def dsv4_sparse_mla_self_test() -> None:
++    """One-shot on-device self-test: Triton port vs. the torch reference.
++
++    Runs at attention-layer init on architectures that take the port (so a
++    codegen/driver regression fails the BOOT, attributed, instead of
++    corrupting outputs). Covers: packed + plain caches, both segments,
++    sinks, len-0 tokens and -1 index padding.
++    """
++    if os.getenv("VLLM_DSV4_SPARSE_MLA_SELFTEST", "1") in ("0", "false",
++                                                           "no", "off"):
++        logger.warning_once(
++            "DSv4 sparse-MLA Triton port self-test SKIPPED "
++            "(VLLM_DSV4_SPARSE_MLA_SELFTEST=0)")
++        return
++    if not (HAS_TRITON and torch.cuda.is_available()):
++        return
++    device = torch.device("cuda", torch.cuda.current_device())
++    worst_rel = _self_test_case(device)
 +    cap = torch.cuda.get_device_capability(device)
 +    logger.info(
 +        "DSv4 sparse-MLA Triton port self-test on sm_%d%d (%s): "
