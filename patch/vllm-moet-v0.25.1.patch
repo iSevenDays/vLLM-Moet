@@ -148,10 +148,10 @@ index 0000000..df62c57
 +}
 diff --git a/tests/v1/attention/test_triton_sparse_mla_dsv4.py b/tests/v1/attention/test_triton_sparse_mla_dsv4.py
 new file mode 100644
-index 0000000..c4a144a
+index 0000000..31d7385
 --- /dev/null
 +++ b/tests/v1/attention/test_triton_sparse_mla_dsv4.py
-@@ -0,0 +1,268 @@
+@@ -0,0 +1,352 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Numerics for the Triton DSv4 sparse-MLA port (Ada / pre-SM100 route).
@@ -198,6 +198,7 @@ index 0000000..c4a144a
 +    packed_extra: bool = True,
 +    with_sinks: bool = True,
 +    with_lens: bool = True,
++    padded_layout: bool = False,
 +    seed: int = 0,
 +):
 +    torch.manual_seed(seed)
@@ -209,7 +210,8 @@ index 0000000..c4a144a
 +            cache = pack_dsv4_reference_cache(rows, pbs)
 +        else:
 +            cache = rows.to(torch.bfloat16).view(pages, pbs, _D)
-+        return cache.unsqueeze(-2)  # NHD: [pages, pbs, 1, w]
++        cache = cache.unsqueeze(-2)  # NHD: [pages, pbs, 1, w]
++        return _pad_to_alignment(cache) if padded_layout else cache
 +
 +    q = torch.randn(t, h, _D, device=device, dtype=torch.bfloat16)
 +    idx = torch.randint(0, n_slots, (t, k_main), device=device,
@@ -243,6 +245,38 @@ index 0000000..c4a144a
 +                              dtype=torch.int32)
 +        kwargs["extra_sparse_topk_lens"] = elens
 +    return q, mk_cache(packed_main), kwargs
++
++
++def _pad_to_alignment(cache: torch.Tensor,
++                      alignment_bytes: int = 576) -> torch.Tensor:
++    """Mimic upstream's ``page_size_padded`` allocation when
++    ``alignment=576`` (DSv4 SWA + MLA specs): lay each page's data
++    contiguously into a wider flat buffer, then re-expose the original
++    ``[pages, pbs, 1, W]`` shape with the padded page stride via
++    ``as_strided``. The padding tail stays zero and is never read because
++    ``pbs`` bounds the token index inside a page.
++
++    Reproduces the 2026-07-19 Ada boot failure: a cache built this way is
++    non-contiguous by design, so the old strict ``is_contiguous()`` guard
++    in ``_normalize_kv_cache`` rejected it.
++    """
++    pages, pbs, _, w = cache.shape
++    item_bytes = cache.element_size()
++    real_page_bytes = pbs * w * item_bytes
++    padded = (math.ceil(real_page_bytes / alignment_bytes)
++              * alignment_bytes)
++    if padded == real_page_bytes:
++        return cache
++    padded_page_elems = padded // item_bytes
++    flat_per_page = pbs * w
++    buf = torch.zeros(pages * padded_page_elems, dtype=cache.dtype,
++                      device=cache.device)
++    src = cache.reshape(pages, flat_per_page)
++    for p in range(pages):
++        buf[p * padded_page_elems:(p * padded_page_elems) + flat_per_page] = \
++            src[p]
++    return buf.as_strided(cache.shape,
++                          (padded_page_elems, w, w, 1))
 +
 +
 +def _rel_err(got: torch.Tensor, want: torch.Tensor) -> float:
@@ -348,6 +382,13 @@ index 0000000..c4a144a
 +    dict(with_lens=False, with_sinks=False, k_extra=None),
 +    dict(h=32, k_main=192, seed=7),
 +    dict(t=1, h=16, k_main=64, k_extra=64, seed=11),
++    # Alignment-padded layouts (Ada boot bug, 2026-07-19): upstream's
++    # ``page_size_padded`` allocation makes the cache non-contiguous by
++    # design. The kernel must read ``page_stride`` from
++    # ``kv_cache.stride()[0]``; the packed and plain paths are covered
++    # separately because their gather arithmetic differs.
++    dict(packed_main=True, packed_extra=True, padded_layout=True, seed=21),
++    dict(packed_main=False, packed_extra=False, padded_layout=True, seed=22),
 +]
 +
 +
@@ -406,6 +447,49 @@ index 0000000..c4a144a
 +                      dtype=torch.bfloat16)
 +    kwargs["out"] = out
 +    # warmup on a side stream, then capture
++    s = torch.cuda.Stream()
++    s.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(s):
++        triton_sparse_mla_dsv4(q, cache, **kwargs)
++    torch.cuda.current_stream().wait_stream(s)
++    g = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(g):
++        triton_sparse_mla_dsv4(q, cache, **kwargs)
++    g.replay()
++    torch.cuda.synchronize()
++    want = sparse_mla_dsv4_torch_ref(q, cache,
++                                     **{k: v for k, v in kwargs.items()
++                                        if k != "out"})
++    assert _rel_err(out, want) < 5e-2
++
++
++@pytest.mark.skipif(not _INTERPRET,
++                    reason="set TRITON_INTERPRET=1 for the CPU tier")
++def test_padded_layout_matches_ref_interpreter():
++    """Regression for the 2026-07-19 Ada boot bug: a non-contiguous,
++    alignment-padded cache used to trip ``_normalize_kv_cache``'s strict
++    guard before the kernel ran. With ``page_stride`` threaded through
++    the gather, the kernel must read the same data the torch ref reads.
++    """
++    device = torch.device("cpu")
++    q, cache, kwargs = _mk_case(device, padded_layout=True, seed=21)
++    assert not cache.is_contiguous(), "padded_layout case is contiguous"
++    got = triton_sparse_mla_dsv4(q, cache, **kwargs)
++    want = sparse_mla_dsv4_torch_ref(q, cache, **kwargs)
++    err = _rel_err(got, want)
++    assert err < 5e-2, f"padded layout kernel vs ref worst_rel={err}"
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
++def test_padded_layout_cuda_graph_capturable():
++    """The Ada boot died inside CUDA graph capture because the cache was
++    non-contiguous. The ``page_stride`` path must remain capturable."""
++    device = torch.device("cuda")
++    q, cache, kwargs = _mk_case(device, padded_layout=True, seed=21)
++    assert not cache.is_contiguous(), "padded_layout case is contiguous"
++    out = torch.empty(q.shape[0], q.shape[1], _D, device=device,
++                      dtype=torch.bfloat16)
++    kwargs["out"] = out
 +    s = torch.cuda.Stream()
 +    s.wait_stream(torch.cuda.current_stream())
 +    with torch.cuda.stream(s):
@@ -12191,10 +12275,10 @@ index 6aec1db..4359cb3 100644
          q,
 diff --git a/vllm/v1/attention/ops/triton_sparse_mla_dsv4.py b/vllm/v1/attention/ops/triton_sparse_mla_dsv4.py
 new file mode 100644
-index 0000000..9de723a
+index 0000000..4528105
 --- /dev/null
 +++ b/vllm/v1/attention/ops/triton_sparse_mla_dsv4.py
-@@ -0,0 +1,826 @@
+@@ -0,0 +1,862 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Triton port of FlashInfer's SM120 sparse-MLA paged attention (DSv4).
@@ -12303,6 +12387,10 @@ index 0000000..9de723a
 +    idx,  # [BLOCK_N] int64 global slots (invalid lanes pre-zeroed)
 +    valid,  # [BLOCK_N] bool
 +    pbs,  # page block size (tokens per page)
++    page_stride,  # elements between page starts (uint8 bytes for packed,
++                  # query-dtype elements for plain). >= pbs * width.
++                  # Read from kv_cache.stride()[0] so padded (alignment-padded)
++                  # and contiguous layouts are accepted equally.
 +    d_offs,  # [D] arange
 +    IS_PACKED: tl.constexpr,
 +    D: tl.constexpr,
@@ -12313,7 +12401,7 @@ index 0000000..9de723a
 +    if IS_PACKED:
 +        page = idx // pbs
 +        tok = idx - page * pbs
-+        page_base = page * (pbs * 584)
++        page_base = page * page_stride
 +        data_base = page_base + tok * 576  # [BLOCK_N]
 +        is_nope = d_offs < D_NOPE  # [D]
 +
@@ -12350,7 +12438,10 @@ index 0000000..9de723a
 +
 +        return tl.where(is_nope[None, :], nope_f32 * scale, rope_f32)
 +    else:
-+        addr = idx[:, None] * D + d_offs[None, :]
++        page = idx // pbs
++        tok = idx - page * pbs
++        addr = (page[:, None] * page_stride + tok[:, None] * D +
++                d_offs[None, :])
 +        k = tl.load(kv_ptr + addr, mask=valid[:, None], other=0.0)
 +        return k.to(tl.float32)
 +
@@ -12369,6 +12460,8 @@ index 0000000..9de723a
 +    sm_scale,
 +    pbs,
 +    extra_pbs,
++    page_stride,
++    extra_page_stride,
 +    K_main,
 +    K_extra,
 +    H,
@@ -12424,8 +12517,8 @@ index 0000000..9de723a
 +        idx = tl.load(idx_ptr + t * stride_it + offs, mask=in_len, other=-1)
 +        valid = in_len & (idx >= 0)
 +        idx0 = tl.where(valid, idx, 0).to(tl.int64)
-+        k = _dsv4_gather_k(kv_ptr, idx0, valid, pbs, d_offs, IS_PACKED, D,
-+                           D_NOPE, QUANT_TILE)
++        k = _dsv4_gather_k(kv_ptr, idx0, valid, pbs, page_stride, d_offs,
++                           IS_PACKED, D, D_NOPE, QUANT_TILE)
 +        if DOT_BF16:
 +            k = k.to(tl.bfloat16)
 +            s = tl.dot(q, tl.trans(k)) * qk_scale
@@ -12456,7 +12549,8 @@ index 0000000..9de723a
 +                          other=-1)
 +            valid = in_len & (idx >= 0)
 +            idx0 = tl.where(valid, idx, 0).to(tl.int64)
-+            k = _dsv4_gather_k(extra_kv_ptr, idx0, valid, extra_pbs, d_offs,
++            k = _dsv4_gather_k(extra_kv_ptr, idx0, valid, extra_pbs,
++                               extra_page_stride, d_offs,
 +                               EXTRA_IS_PACKED, D, D_NOPE, QUANT_TILE)
 +            if DOT_BF16:
 +                k = k.to(tl.bfloat16)
@@ -12500,13 +12594,22 @@ index 0000000..9de723a
 +    kv_layout: str,
 +    query_dtype: torch.dtype,
 +    name: str,
-+) -> tuple[torch.Tensor, int, bool]:
-+    """Return ``(cache, page_block_size, is_packed)``.
++) -> tuple[torch.Tensor, int, bool, int]:
++    """Return ``(cache, page_block_size, is_packed, page_stride)``.
 +
 +    Mirrors flashinfer's ``_check_sm120_dsv4_kv_cache_layout`` +
 +    ``_packed_kv_page_block_size``: 3-D ``[pages, pbs, w]`` or 4-D with a
 +    singleton KV-head axis (NHD: dim 2, HND: dim 1); ``w`` is 584 packed
 +    uint8 or 512 in the query dtype.
++
++    ``page_stride`` is the distance between page starts in elements of
++    ``kv_cache.dtype`` (uint8 bytes for the packed path, query-dtype
++    elements for the plain path). The upstream allocator may pad pages to
++    alignment (e.g. 576-byte alignment for ``fp8_ds_mla``), producing a
++    non-contiguous ``as_strided`` view where ``stride(0) > pbs * width``.
++    The kernel reads ``page_stride`` from this tensor's own strides and
++    uses it for the gather, so both padded and contiguous layouts are
++    accepted with no copy.
 +    """
 +    if kv_cache.ndim == 4:
 +        if kv_layout == "NHD":
@@ -12529,22 +12632,32 @@ index 0000000..9de723a
 +    else:
 +        raise ValueError(
 +            f"{name} must have ndim 3 or 4, got {kv_cache.ndim}")
-+    if not kv_cache.is_contiguous():
-+        raise ValueError(f"{name} must be contiguous")
-+
++    # Accept either contiguous or alignment-padded layouts. The page stride
++    # (distance between page starts in elements of kv_cache.dtype) is read
++    # from the tensor's own strides; the kernel uses it instead of assuming
++    # pbs * width. The minimum valid stride covers one page of data; reject
++    # anything smaller as a malformed cache.
++    page_stride = int(kv_cache.stride()[0])
 +    width = int(kv_cache.shape[-1])
++    min_stride = pbs * width
++    if page_stride < min_stride:
++        raise ValueError(
++            f"{name}: page stride {page_stride} < minimum {min_stride} "
++            f"(pbs={pbs}, width={width}, dtype={kv_cache.dtype}); cache "
++            "layout inconsistent with the spec")
++
 +    if kv_cache.dtype == torch.uint8:
 +        if width != _BPT_PACKED:
 +            raise ValueError(
 +                f"Expected packed DSV4 {name} head dim {_BPT_PACKED}, got "
 +                f"{width}")
-+        return kv_cache, pbs, True
++        return kv_cache, pbs, True, page_stride
 +    if kv_cache.dtype != query_dtype:
 +        raise ValueError(f"{name} dtype must match query dtype, got "
 +                         f"{kv_cache.dtype} and {query_dtype}")
 +    if width != _D:
 +        raise ValueError(f"Expected {name} head dim {_D}, got {width}")
-+    return kv_cache, pbs, False
++    return kv_cache, pbs, False, page_stride
 +
 +
 +def _normalize_indices(
@@ -12663,7 +12776,7 @@ index 0000000..9de723a
 +        query_flat = query_flat.contiguous()
 +    num_tokens = query_flat.shape[0]
 +
-+    kv_main, pbs_main, packed_main = _normalize_kv_cache(
++    kv_main, pbs_main, packed_main, page_stride_main = _normalize_kv_cache(
 +        swa_kv_cache, kv_layout, query.dtype, "swa_kv_cache")
 +    idx_main, lens_main = _normalize_indices(sparse_indices, swa_topk_lens,
 +                                             num_tokens, "sparse_indices")
@@ -12677,15 +12790,17 @@ index 0000000..9de723a
 +        if compressed_kv_cache is None:
 +            raise ValueError("compressed_kv_cache is required when "
 +                             "extra_sparse_indices is provided")
-+        kv_extra, pbs_extra, packed_extra = _normalize_kv_cache(
-+            compressed_kv_cache, kv_layout, query.dtype,
-+            "compressed_kv_cache")
++        kv_extra, pbs_extra, packed_extra, page_stride_extra = (
++            _normalize_kv_cache(
++                compressed_kv_cache, kv_layout, query.dtype,
++                "compressed_kv_cache"))
 +        idx_extra, lens_extra = _normalize_indices(extra_sparse_indices,
 +                                                   extra_sparse_topk_lens,
 +                                                   num_tokens,
 +                                                   "extra_sparse_indices")
 +    else:
-+        kv_extra, pbs_extra, packed_extra = kv_main, pbs_main, packed_main
++        kv_extra, pbs_extra, packed_extra, page_stride_extra = (
++            kv_main, pbs_main, packed_main, page_stride_main)
 +        idx_extra, lens_extra = idx_main, lens_main
 +
 +    expected_out_shape = ((b, qlen, num_heads, _D) if orig_ndim == 4 else
@@ -12714,16 +12829,19 @@ index 0000000..9de723a
 +
 +    logger.info_once(
 +        "DSv4 sparse-MLA Triton port geometry: q%s %s, swa cache %s %s "
-+        "(pbs=%d, packed=%s), K_main=%d, extra=%s, K_extra=%s, sinks=%s",
++        "(pbs=%d, packed=%s, page_stride=%d), K_main=%d, extra=%s, "
++        "K_extra=%s, extra_page_stride=%d, sinks=%s",
 +        tuple(query_flat.shape),
 +        query.dtype,
 +        tuple(swa_kv_cache.shape),
 +        swa_kv_cache.dtype,
 +        pbs_main,
 +        packed_main,
++        page_stride_main,
 +        idx_main.shape[-1],
 +        has_extra,
 +        idx_extra.shape[-1] if has_extra else 0,
++        page_stride_extra,
 +        sinks is not None,
 +    )
 +
@@ -12743,6 +12861,8 @@ index 0000000..9de723a
 +            float(bmm1_scale),
 +            pbs_main,
 +            pbs_extra,
++            page_stride_main,
++            page_stride_extra,
 +            idx_main.shape[-1],
 +            idx_extra.shape[-1] if has_extra else 0,
 +            num_heads,
@@ -12822,9 +12942,9 @@ index 0000000..9de723a
 +    num_tokens, num_heads, _ = query_flat.shape
 +
 +    def rows(cache: torch.Tensor) -> torch.Tensor:
-+        cache3, pbs, packed = _normalize_kv_cache(cache, kv_layout,
-+                                                  query.dtype, "cache")
-+        cache3 = cache3.reshape(cache3.shape[0], -1)
++        cache3, pbs, packed, _ = _normalize_kv_cache(cache, kv_layout,
++                                                     query.dtype, "cache")
++        cache3 = cache3.contiguous().reshape(cache3.shape[0], -1)
 +        if packed:
 +            return dequant_dsv4_packed_cache(cache3, pbs)
 +        return cache3.reshape(-1, _D).to(torch.float32)
