@@ -12188,10 +12188,10 @@ index 6aec1db..4359cb3 100644
          q,
 diff --git a/vllm/v1/attention/ops/triton_sparse_mla_dsv4.py b/vllm/v1/attention/ops/triton_sparse_mla_dsv4.py
 new file mode 100644
-index 0000000..f6aa663
+index 0000000..0b03bd5
 --- /dev/null
 +++ b/vllm/v1/attention/ops/triton_sparse_mla_dsv4.py
-@@ -0,0 +1,789 @@
+@@ -0,0 +1,807 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Triton port of FlashInfer's SM120 sparse-MLA paged attention (DSv4).
@@ -12276,6 +12276,22 @@ index 0000000..f6aa663
 +# Set once at import: TRITON_INTERPRET is read by Triton itself at import
 +# time, so a consistent snapshot here is correct by construction.
 +_IS_INTERPRET = os.getenv("TRITON_INTERPRET", "0") == "1"
++
++
++@functools.cache
++def _module_build_id() -> str:
++    """Short content hash of THIS file, logged at boot.
++
++    'Which build produced this log' burned a deploy cycle on 2026-07-19:
++    a stale image re-raised an already-fixed self-test error and the log
++    alone could not prove which code was running (only the traceback
++    line numbers gave it away). The self-test line now carries this id;
++    compare it to sha256 of the file in the repo when in doubt.
++    """
++    import hashlib
++
++    with open(__file__, "rb") as f:
++        return hashlib.sha256(f.read()).hexdigest()[:12]
 +
 +
 +@triton.jit
@@ -12939,15 +12955,17 @@ index 0000000..f6aa663
 +    cap = torch.cuda.get_device_capability(device)
 +    logger.info(
 +        "DSv4 sparse-MLA Triton port self-test on sm_%d%d (%s): "
-+        "worst_rel=%.3e vs torch reference (torch %s, triton %s)",
++        "worst_rel=%.3e vs torch reference (module build %s, torch %s, "
++        "triton %s)",
 +        cap[0], cap[1], torch.cuda.get_device_name(device), worst_rel,
-+        torch.__version__, triton.__version__)
++        _module_build_id(), torch.__version__, triton.__version__)
 +    if worst_rel > 5e-2:
 +        raise RuntimeError(
 +            f"DSv4 sparse-MLA Triton port self-test FAILED on this device: "
-+            f"worst_rel={worst_rel:.3e} vs torch reference. This is a "
-+            f"codegen/driver regression, not a model problem. Set "
-+            f"VLLM_DSV4_SPARSE_MLA_SELFTEST=0 only to triage.")
++            f"worst_rel={worst_rel:.3e} vs torch reference (module build "
++            f"{_module_build_id()}). This is a codegen/driver regression, "
++            f"not a model problem. Set VLLM_DSV4_SPARSE_MLA_SELFTEST=0 "
++            f"only to triage.")
 +
 +
 +def pack_dsv4_reference_cache(kv_rows: torch.Tensor,
