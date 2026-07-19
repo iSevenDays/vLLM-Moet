@@ -24,10 +24,20 @@
 #     0.25.1 pins flashinfer 0.6.13 in-image, but its own DSV4 sparse
 #     call sites pass the SWA kwargs (swa_topk_lens) that FlashInfer
 #     grew in 0.6.14 - decode warmup dies with an unexpected-keyword
-#     TypeError on the sparse-MLA-API mode (the mode Ada and SM12x use;
-#     SM100's trtllm-gen mode dodges it, which is how upstream's lag
-#     survives their CI). The engine also probes the signature at init
-#     now and refuses loudly on an old FlashInfer.
+#     TypeError on the sparse-MLA-API mode (the SM12x mode; SM100's
+#     trtllm-gen mode dodges it, which is how upstream's lag survives
+#     their CI). The engine also probes the signature at init now and
+#     refuses loudly on an old FlashInfer.
+#   - DSv4 sparse-MLA attention on Ada does NOT run FlashInfer at all:
+#     FlashInfer's deepest gate (_resolve_dsv4_sparse_mla_backend)
+#     refuses everything below SM100 (field-hit at decode capture).
+#     Decode AND prefill route to vLLM's Triton port
+#     (vllm/v1/attention/ops/triton_sparse_mla_dsv4.py, in the patch),
+#     verified against a torch reference by an init-time on-device
+#     self-test. VLLM_DSV4_SPARSE_MLA_FORCE_TRITON=1 forces that port
+#     on any arch; VLLM_DSV4_SPARSE_MLA_SELFTEST=0 skips the self-test
+#     (triage only). The pin above still matters for everything else
+#     FlashInfer serves in this image.
 #
 # Build (from the repo root):
 #   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm89-v0251 -t vllm-moet-sm89:v0251 .

@@ -4,6 +4,7 @@
 # patch but not in the vllm fork branch the patch is generated from —
 # merge it into the branch first; do not ship the regeneration.
 csrc/nvfp4_ds_mla/concat_and_cache_nvfp4_ds_mla.cu
+tests/v1/attention/test_triton_sparse_mla_dsv4.py
 tools/nvfp4_flashinfer_sm120/README.md
 tools/nvfp4_flashinfer_sm120/nvfp4_expand.cuh
 tools/nvfp4_flashinfer_sm120/patch_flashinfer.py
@@ -49,6 +50,7 @@ vllm/v1/attention/backends/mla/sparse_utils.py
 vllm/v1/attention/ops/dcp_sparse_topk.py
 vllm/v1/attention/ops/merge_attn_states.py
 vllm/v1/attention/ops/triton_decode_attention.py
+vllm/v1/attention/ops/triton_sparse_mla_dsv4.py
 vllm/v1/core/sched/scheduler.py
 vllm/v1/engine/core.py
 vllm/v1/kv_cache_interface.py

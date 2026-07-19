@@ -1,6 +1,6 @@
 diff --git a/csrc/nvfp4_ds_mla/concat_and_cache_nvfp4_ds_mla.cu b/csrc/nvfp4_ds_mla/concat_and_cache_nvfp4_ds_mla.cu
 new file mode 100644
-index 000000000..df62c57cc
+index 0000000..df62c57
 --- /dev/null
 +++ b/csrc/nvfp4_ds_mla/concat_and_cache_nvfp4_ds_mla.cu
 @@ -0,0 +1,142 @@
@@ -146,9 +146,254 @@ index 000000000..df62c57cc
 +  m.def("concat_and_cache_nvfp4_ds_mla", &concat_and_cache_nvfp4_ds_mla,
 +        "Write MLA KV into the packed nvfp4_ds_mla layout (352 B/token)");
 +}
+diff --git a/tests/v1/attention/test_triton_sparse_mla_dsv4.py b/tests/v1/attention/test_triton_sparse_mla_dsv4.py
+new file mode 100644
+index 0000000..63f0982
+--- /dev/null
++++ b/tests/v1/attention/test_triton_sparse_mla_dsv4.py
+@@ -0,0 +1,239 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Numerics for the Triton DSv4 sparse-MLA port (Ada / pre-SM100 route).
++
++Three tiers, mirroring how the port was validated off-GPU first:
++
++1. torch-reference invariants, CPU-only: the packed fp8_ds_mla
++   encode/decode round-trips, masking/lengths/sinks behave per the
++   FlashInfer SM120 contract.
++2. Triton kernel vs. torch reference under ``TRITON_INTERPRET=1``
++   (CPU, no GPU needed - run in CI).
++3. Triton kernel vs. torch reference on CUDA (any arch; this is what the
++   init-time self-test also runs on the serving box).
++"""
++
++import math
++import os
++
++import pytest
++import torch
++
++from vllm.v1.attention.ops.triton_sparse_mla_dsv4 import (
++    _BPT_PACKED,
++    _D,
++    dequant_dsv4_packed_cache,
++    pack_dsv4_reference_cache,
++    sparse_mla_dsv4_torch_ref,
++    triton_sparse_mla_dsv4,
++)
++
++SCALE = _D**-0.5
++
++
++def _mk_case(
++    device: torch.device,
++    *,
++    t: int = 4,
++    h: int = 16,
++    pages: int = 6,
++    pbs: int = 64,
++    k_main: int = 128,
++    k_extra: int | None = 256,
++    packed_main: bool = True,
++    packed_extra: bool = True,
++    with_sinks: bool = True,
++    with_lens: bool = True,
++    seed: int = 0,
++):
++    torch.manual_seed(seed)
++    n_slots = pages * pbs
++
++    def mk_cache(packed: bool):
++        rows = torch.randn(n_slots, _D, device=device) * 2.0
++        if packed:
++            cache = pack_dsv4_reference_cache(rows, pbs)
++        else:
++            cache = rows.to(torch.bfloat16).view(pages, pbs, _D)
++        return cache.unsqueeze(-2)  # NHD: [pages, pbs, 1, w]
++
++    q = torch.randn(t, h, _D, device=device, dtype=torch.bfloat16)
++    idx = torch.randint(0, n_slots, (t, k_main), device=device,
++                        dtype=torch.int32)
++    idx[0, k_main // 2] = -1  # -1 padding inside the active window
++    lens = None
++    if with_lens:
++        lens = torch.randint(0, k_main + 1, (t,), device=device,
++                             dtype=torch.int32)
++        lens[min(1, t - 1)] = 0  # all-masked token
++        lens[0] = k_main
++    sinks = None
++    if with_sinks:
++        sinks = torch.full((h,), -float("inf"), device=device)
++        sinks[: h // 2] = torch.randn(h // 2, device=device)
++
++    kwargs = dict(
++        sparse_indices=idx,
++        swa_topk_lens=lens,
++        bmm1_scale=SCALE,
++        sinks=sinks,
++        kv_layout="NHD",
++    )
++    if k_extra is not None:
++        kwargs["compressed_kv_cache"] = mk_cache(packed_extra)
++        kwargs["extra_sparse_indices"] = torch.randint(
++            0, n_slots, (t, 1, k_extra), device=device, dtype=torch.int32)
++        elens = torch.randint(0, k_extra + 1, (t,), device=device,
++                              dtype=torch.int32)
++        kwargs["extra_sparse_topk_lens"] = elens
++    return q, mk_cache(packed_main), kwargs
++
++
++def _rel_err(got: torch.Tensor, want: torch.Tensor) -> float:
++    got = got.to(torch.float32)
++    want = want.to(torch.float32)
++    return ((got - want).abs() / want.abs().clamp_min(1e-2)).max().item()
++
++
++# --------------------------------------------------------------------------
++# Tier 1: torch reference invariants (CPU)
++# --------------------------------------------------------------------------
++
++
++def test_packed_cache_roundtrip_cpu():
++    torch.manual_seed(0)
++    pbs = 64
++    rows = torch.randn(4 * pbs, _D) * 3.0
++    packed = pack_dsv4_reference_cache(rows, pbs)
++    assert packed.shape == (4, pbs, _BPT_PACKED)
++    decoded = dequant_dsv4_packed_cache(packed.reshape(4, -1), pbs)
++    # rope is stored bf16 (exact-ish); nope is fp8 with power-of-two
++    # per-64 tile scales -> e4m3 relative quantization error.
++    rope_rel = ((decoded[:, 448:] - rows[:, 448:]).abs() /
++                rows[:, 448:].abs().clamp_min(1e-3)).max()
++    assert rope_rel <= 2.0**-8, f"rope bf16 roundtrip rel err {rope_rel}"
++    nope = rows[:, :448].reshape(-1, 7, 64)
++    dec_nope = decoded[:, :448].reshape(-1, 7, 64)
++    tile_amax = nope.abs().amax(dim=-1, keepdim=True)
++    rel = ((dec_nope - nope).abs() / tile_amax.clamp_min(1e-6)).max()
++    assert rel <= 0.13, f"fp8 tile-relative roundtrip err {rel}"
++
++
++def test_ref_all_masked_token_is_zero_cpu():
++    q, cache, kwargs = _mk_case(torch.device("cpu"), k_extra=None,
++                                with_sinks=False)
++    kwargs["swa_topk_lens"] = torch.zeros(q.shape[0], dtype=torch.int32)
++    out = sparse_mla_dsv4_torch_ref(q, cache, **kwargs)
++    assert (out == 0).all()
++
++
++def test_ref_sink_only_token_is_zero_cpu():
++    q, cache, kwargs = _mk_case(torch.device("cpu"), k_extra=None,
++                                with_sinks=True)
++    kwargs["swa_topk_lens"] = torch.zeros(q.shape[0], dtype=torch.int32)
++    out = sparse_mla_dsv4_torch_ref(q, cache, **kwargs)
++    assert (out == 0).all()
++
++
++def test_ref_sink_shrinks_output_cpu():
++    """The sink adds denominator mass only -> outputs scale down."""
++    q, cache, kwargs = _mk_case(torch.device("cpu"), k_extra=None,
++                                with_sinks=False, with_lens=False)
++    base = sparse_mla_dsv4_torch_ref(q, cache, **kwargs).to(torch.float32)
++    h = q.shape[1]
++    kwargs["sinks"] = torch.full((h,), 20.0)  # dominant sink
++    sunk = sparse_mla_dsv4_torch_ref(q, cache, **kwargs).to(torch.float32)
++    assert sunk.abs().sum() < 0.05 * base.abs().sum()
++
++
++def test_ref_matches_dense_softmax_cpu():
++    """Cross-check against a from-scratch dense computation."""
++    torch.manual_seed(3)
++    pbs, pages, t, h, k = 64, 2, 2, 16, 32
++    rows = torch.randn(pages * pbs, _D)
++    cache = rows.to(torch.bfloat16).view(pages, pbs, 1, _D)
++    q = torch.randn(t, h, _D, dtype=torch.bfloat16)
++    idx = torch.randint(0, pages * pbs, (t, k), dtype=torch.int32)
++    out = sparse_mla_dsv4_torch_ref(q, cache, idx, bmm1_scale=SCALE,
++                                    kv_layout="NHD")
++    kf = rows.to(torch.bfloat16).to(torch.float32)
++    for ti in range(t):
++        gathered = kf[idx[ti].long()]  # [k, D]
++        s = (q[ti].to(torch.float32) @ gathered.T) * SCALE
++        p = torch.softmax(s, dim=-1)
++        want = p @ gathered
++        got = out[ti].to(torch.float32)
++        assert _rel_err(got, want.to(torch.bfloat16)) < 1e-2
++
++
++# --------------------------------------------------------------------------
++# Tiers 2 + 3: Triton kernel vs. torch reference
++# --------------------------------------------------------------------------
++
++_INTERPRET = os.getenv("TRITON_INTERPRET", "0") == "1"
++
++
++def _kernel_vs_ref(device: torch.device, **case_kw) -> None:
++    q, cache, kwargs = _mk_case(device, **case_kw)
++    got = triton_sparse_mla_dsv4(q, cache, **kwargs)
++    want = sparse_mla_dsv4_torch_ref(q, cache, **kwargs)
++    err = _rel_err(got, want)
++    assert err < 5e-2, f"kernel vs ref worst_rel={err}"
++
++
++_CASE_GRID = [
++    dict(),  # packed main + packed extra, sinks, lens
++    dict(packed_main=False, packed_extra=False),
++    dict(k_extra=None),
++    dict(with_sinks=False),
++    dict(with_lens=False, with_sinks=False, k_extra=None),
++    dict(h=32, k_main=192, seed=7),
++    dict(t=1, h=16, k_main=64, k_extra=64, seed=11),
++]
++
++
++@pytest.mark.skipif(not _INTERPRET,
++                    reason="set TRITON_INTERPRET=1 for the CPU tier")
++@pytest.mark.parametrize("case_kw", _CASE_GRID)
++def test_kernel_matches_ref_interpreter(case_kw):
++    _kernel_vs_ref(torch.device("cpu"), **case_kw)
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
++@pytest.mark.parametrize("case_kw", _CASE_GRID)
++def test_kernel_matches_ref_cuda(case_kw):
++    _kernel_vs_ref(torch.device("cuda"), **case_kw)
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
++def test_self_test_passes_on_this_device():
++    from vllm.v1.attention.ops.triton_sparse_mla_dsv4 import (
++        dsv4_sparse_mla_self_test)
++    dsv4_sparse_mla_self_test.cache_clear()
++    dsv4_sparse_mla_self_test()
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
++def test_cuda_graph_capturable():
++    """The decode path is captured into CUDA graphs on the serving box -
++    the port must not sync with the host or allocate per step."""
++    device = torch.device("cuda")
++    q, cache, kwargs = _mk_case(device)
++    out = torch.empty(q.shape[0], q.shape[1], _D, device=device,
++                      dtype=torch.bfloat16)
++    kwargs["out"] = out
++    # warmup on a side stream, then capture
++    s = torch.cuda.Stream()
++    s.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(s):
++        triton_sparse_mla_dsv4(q, cache, **kwargs)
++    torch.cuda.current_stream().wait_stream(s)
++    g = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(g):
++        triton_sparse_mla_dsv4(q, cache, **kwargs)
++    g.replay()
++    torch.cuda.synchronize()
++    want = sparse_mla_dsv4_torch_ref(q, cache,
++                                     **{k: v for k, v in kwargs.items()
++                                        if k != "out"})
++    assert _rel_err(out, want) < 5e-2
 diff --git a/tools/nvfp4_flashinfer_sm120/README.md b/tools/nvfp4_flashinfer_sm120/README.md
 new file mode 100644
-index 000000000..a147137db
+index 0000000..a147137
 --- /dev/null
 +++ b/tools/nvfp4_flashinfer_sm120/README.md
 @@ -0,0 +1,49 @@
@@ -203,7 +448,7 @@ index 000000000..a147137db
 +- Microbench (isolated KV gather, RTX 5090): 1.86× tokens/s vs 656 B.
 diff --git a/tools/nvfp4_flashinfer_sm120/nvfp4_expand.cuh b/tools/nvfp4_flashinfer_sm120/nvfp4_expand.cuh
 new file mode 100644
-index 000000000..e27203c56
+index 0000000..e27203c
 --- /dev/null
 +++ b/tools/nvfp4_flashinfer_sm120/nvfp4_expand.cuh
 @@ -0,0 +1,211 @@
@@ -420,7 +665,7 @@ index 000000000..e27203c56
 +}
 diff --git a/tools/nvfp4_flashinfer_sm120/patch_flashinfer.py b/tools/nvfp4_flashinfer_sm120/patch_flashinfer.py
 new file mode 100644
-index 000000000..cfa92d323
+index 0000000..cfa92d3
 --- /dev/null
 +++ b/tools/nvfp4_flashinfer_sm120/patch_flashinfer.py
 @@ -0,0 +1,412 @@
@@ -837,7 +1082,7 @@ index 000000000..cfa92d323
 +print("SYNTAX-OK python")
 +print("PATCH-FLASHINFER-DONE")
 diff --git a/vllm/compilation/breakable_cudagraph.py b/vllm/compilation/breakable_cudagraph.py
-index 6da3ec717..c84958ac0 100644
+index 6da3ec7..c84958a 100644
 --- a/vllm/compilation/breakable_cudagraph.py
 +++ b/vllm/compilation/breakable_cudagraph.py
 @@ -175,10 +175,13 @@ class BreakableCUDAGraphCapture:
@@ -857,7 +1102,7 @@ index 6da3ec717..c84958ac0 100644
          self._capturing = True
  
 diff --git a/vllm/compilation/cuda_graph.py b/vllm/compilation/cuda_graph.py
-index b63d86199..3cad1f058 100644
+index b63d861..3cad1f0 100644
 --- a/vllm/compilation/cuda_graph.py
 +++ b/vllm/compilation/cuda_graph.py
 @@ -314,6 +314,10 @@ class CUDAGraphWrapper:
@@ -872,7 +1117,7 @@ index b63d86199..3cad1f058 100644
                      # `output` is managed by pytorch's cudagraph pool
                      output = self.runnable(*args, **kwargs)
 diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
-index 2e0126368..bf708cf8f 100644
+index 2e01263..bf708cf 100644
 --- a/vllm/config/speculative.py
 +++ b/vllm/config/speculative.py
 @@ -230,6 +230,43 @@ class SpeculativeConfig:
@@ -970,7 +1215,7 @@ index 2e0126368..bf708cf8f 100644
  
      def _validate_suffix_decoding(self):
 diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
-index e8796a3db..855da92ff 100644
+index e8796a3..855da92 100644
 --- a/vllm/config/vllm.py
 +++ b/vllm/config/vllm.py
 @@ -777,6 +777,14 @@ class VllmConfig:
@@ -1022,7 +1267,7 @@ index e8796a3db..855da92ff 100644
                  "nvfp4 KV cache is not supported with MLA (Multi-head Latent "
                  "Attention) backends. Please use a different --kv-cache-dtype "
 diff --git a/vllm/envs.py b/vllm/envs.py
-index 13a19b86c..f29a12760 100755
+index 13a19b8..f29a127 100755
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
 @@ -182,6 +182,9 @@ if TYPE_CHECKING:
@@ -1053,7 +1298,7 @@ index 13a19b86c..f29a12760 100755
      # JIT all the required kernels before model execution so there is no
      # JIT'ing in the hot-path. However, this warmup increases the engine
 diff --git a/vllm/model_executor/layers/attention/mla_attention.py b/vllm/model_executor/layers/attention/mla_attention.py
-index 027f19a90..67ea49483 100644
+index 027f19a..67ea494 100644
 --- a/vllm/model_executor/layers/attention/mla_attention.py
 +++ b/vllm/model_executor/layers/attention/mla_attention.py
 @@ -188,6 +188,7 @@ return curr_o @ W_O
@@ -1148,7 +1393,7 @@ index 027f19a90..67ea49483 100644
  
          # Enforce that we enough for at least 1 page per request
 diff --git a/vllm/model_executor/layers/quantization/fp8.py b/vllm/model_executor/layers/quantization/fp8.py
-index 626fc83cd..40f50a7b1 100644
+index 626fc83..40f50a7 100644
 --- a/vllm/model_executor/layers/quantization/fp8.py
 +++ b/vllm/model_executor/layers/quantization/fp8.py
 @@ -671,6 +671,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
@@ -1212,7 +1457,7 @@ index 626fc83cd..40f50a7b1 100644
          assert self.moe_kernel is not None
          return self.moe_kernel.apply(
 diff --git a/vllm/model_executor/layers/quantization/modelopt.py b/vllm/model_executor/layers/quantization/modelopt.py
-index 76afd9344..de8fd60db 100644
+index 76afd93..de8fd60 100644
 --- a/vllm/model_executor/layers/quantization/modelopt.py
 +++ b/vllm/model_executor/layers/quantization/modelopt.py
 @@ -1,6 +1,7 @@
@@ -1428,7 +1673,7 @@ index 76afd9344..de8fd60db 100644
                  return UnquantizedLinearMethod()
              return None
 diff --git a/vllm/model_executor/layers/quantization/mxfp4.py b/vllm/model_executor/layers/quantization/mxfp4.py
-index 5ef5fd40d..02834b680 100644
+index 5ef5fd4..02834b6 100644
 --- a/vllm/model_executor/layers/quantization/mxfp4.py
 +++ b/vllm/model_executor/layers/quantization/mxfp4.py
 @@ -620,6 +620,28 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
@@ -1499,7 +1744,7 @@ index 5ef5fd40d..02834b680 100644
          assert self.moe_kernel is not None
          return self.moe_kernel.apply(
 diff --git a/vllm/model_executor/layers/quantization/utils/fp8_utils.py b/vllm/model_executor/layers/quantization/utils/fp8_utils.py
-index 32a2d8689..831eb654c 100644
+index 32a2d86..831eb65 100644
 --- a/vllm/model_executor/layers/quantization/utils/fp8_utils.py
 +++ b/vllm/model_executor/layers/quantization/utils/fp8_utils.py
 @@ -915,14 +915,22 @@ def w8a8_triton_block_scaled_mm(
@@ -1547,7 +1792,7 @@ index 32a2d8689..831eb654c 100644
              mn=r,
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_bf12.py b/vllm/model_executor/layers/quantization/utils/moe_w2_bf12.py
 new file mode 100644
-index 000000000..10770e789
+index 0000000..10770e7
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_bf12.py
 @@ -0,0 +1,386 @@
@@ -1939,7 +2184,7 @@ index 000000000..10770e789
 +        "on" if _verify() else "off")
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
-index 000000000..c147703ab
+index 0000000..c147703
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 @@ -0,0 +1,2615 @@
@@ -4560,7 +4805,7 @@ index 000000000..c147703ab
 +    return enabled() and _ensure_ready()
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
 new file mode 100644
-index 000000000..efbe5068f
+index 0000000..efbe506
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
 @@ -0,0 +1,2106 @@
@@ -6672,7 +6917,7 @@ index 000000000..efbe5068f
 +    return _TIER
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_gate.py b/vllm/model_executor/layers/quantization/utils/moe_w2_gate.py
 new file mode 100644
-index 000000000..c990ac33f
+index 0000000..c990ac3
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_gate.py
 @@ -0,0 +1,309 @@
@@ -6987,7 +7232,7 @@ index 000000000..c990ac33f
 +                fire_rate=(_n_fired / _n_steps if _n_steps else 0.0))
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_looka.py b/vllm/model_executor/layers/quantization/utils/moe_w2_looka.py
 new file mode 100644
-index 000000000..f5de680cf
+index 0000000..f5de680
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_looka.py
 @@ -0,0 +1,256 @@
@@ -7249,7 +7494,7 @@ index 000000000..f5de680cf
 +            f"(top-{_PILOT_K}, n={tot[1]})")
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_planes.py b/vllm/model_executor/layers/quantization/utils/moe_w2_planes.py
 new file mode 100644
-index 000000000..b061273a2
+index 0000000..b061273
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_planes.py
 @@ -0,0 +1,369 @@
@@ -7624,7 +7869,7 @@ index 000000000..b061273a2
 +    return vals * s
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_planes_cache.py b/vllm/model_executor/layers/quantization/utils/moe_w2_planes_cache.py
 new file mode 100644
-index 000000000..684cd1283
+index 0000000..684cd12
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_planes_cache.py
 @@ -0,0 +1,231 @@
@@ -7861,7 +8106,7 @@ index 000000000..684cd1283
 +        _mark_broken(f"store failed: {e}")
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_sm89.py b/vllm/model_executor/layers/quantization/utils/moe_w2_sm89.py
 new file mode 100644
-index 000000000..f6d714ecc
+index 0000000..f6d714e
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_sm89.py
 @@ -0,0 +1,229 @@
@@ -8096,7 +8341,7 @@ index 000000000..f6d714ecc
 +    return worst
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_store.py b/vllm/model_executor/layers/quantization/utils/moe_w2_store.py
 new file mode 100644
-index 000000000..6b7908f84
+index 0000000..6b7908f
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_store.py
 @@ -0,0 +1,685 @@
@@ -8787,7 +9032,7 @@ index 000000000..6b7908f84
 +    return store
 diff --git a/vllm/model_executor/layers/quantization/utils/prefill_timers.py b/vllm/model_executor/layers/quantization/utils/prefill_timers.py
 new file mode 100644
-index 000000000..fd83f500b
+index 0000000..fd83f50
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/prefill_timers.py
 @@ -0,0 +1,53 @@
@@ -8845,7 +9090,7 @@ index 000000000..fd83f500b
 +    logger.info("[prefill-timer] %-14s total %8.1f ms over %5d spans",
 +                name, _total_ms[name], _count[name])
 diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
-index ceb52e5d3..34d38a100 100644
+index ceb52e5..34d38a1 100644
 --- a/vllm/model_executor/layers/sparse_attn_indexer.py
 +++ b/vllm/model_executor/layers/sparse_attn_indexer.py
 @@ -2,6 +2,8 @@
@@ -9107,7 +9352,7 @@ index ceb52e5d3..34d38a100 100644
              "AMD sparse_attn_indexer expects a single FP8 q_quant tensor"
          )
 diff --git a/vllm/model_executor/models/deepseek_mtp.py b/vllm/model_executor/models/deepseek_mtp.py
-index ff63f9c36..f73e70d4b 100644
+index ff63f9c..f73e70d 100644
 --- a/vllm/model_executor/models/deepseek_mtp.py
 +++ b/vllm/model_executor/models/deepseek_mtp.py
 @@ -35,6 +35,7 @@ from .deepseek_v2 import (
@@ -9135,7 +9380,7 @@ index ff63f9c36..f73e70d4b 100644
          super().__init__()
          self.config = vllm_config.model_config.hf_config
 diff --git a/vllm/model_executor/models/qwen3_dspark.py b/vllm/model_executor/models/qwen3_dspark.py
-index 219819759..b387bae3d 100644
+index 2198197..b387bae 100644
 --- a/vllm/model_executor/models/qwen3_dspark.py
 +++ b/vllm/model_executor/models/qwen3_dspark.py
 @@ -10,6 +10,9 @@ The parallel backbone is a standard Qwen3 decoder stack reused from the
@@ -9222,7 +9467,7 @@ index 219819759..b387bae3d 100644
              skip_substrs.append("embed_tokens")
          if not includes_lm_head:
 diff --git a/vllm/models/deepseek_v4/common/ops/fused_inv_rope_fp8_quant.py b/vllm/models/deepseek_v4/common/ops/fused_inv_rope_fp8_quant.py
-index b667b8767..97824f4a2 100644
+index b667b87..97824f4 100644
 --- a/vllm/models/deepseek_v4/common/ops/fused_inv_rope_fp8_quant.py
 +++ b/vllm/models/deepseek_v4/common/ops/fused_inv_rope_fp8_quant.py
 @@ -257,7 +257,11 @@ def _fused_inv_rope_fp8_quant_kernel_impl(
@@ -9248,23 +9493,28 @@ index b667b8767..97824f4a2 100644
      )
      return fp8_buf, scale_buf
 diff --git a/vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py b/vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py
-index 1848c1930..c72ed8a64 100644
+index 1848c19..11e64ee 100644
 --- a/vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py
 +++ b/vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py
-@@ -98,7 +98,11 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4FlashMLABackend):
+@@ -98,7 +98,16 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4FlashMLABackend):
  
      @classmethod
      def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
 -        return capability.major in [10, 12]
-+        # SM12x and Ada (8.9) share the FlashInfer sparse-MLA decode API
-+        # mode (JIT-compiled per arch); SM10x uses trtllm-gen. FlashMLA's
-+        # sparse kernels are SM90-only, so Ada has no other DSv4 route.
++        # SM10x: FlashInfer trtllm-gen. SM12x: FlashInfer's sparse-MLA
++        # decode API. Ada (8.9): FlashInfer's resolver has NO kernel
++        # (its deepest gate, _resolve_dsv4_sparse_mla_backend, refuses
++        # pre-SM100 - field-hit at decode capture); Ada runs vLLM's
++        # Triton port of the same call surface
++        # (vllm/v1/attention/ops/triton_sparse_mla_dsv4.py), routed in
++        # vllm/utils/flashinfer.py. FlashMLA's sparse kernels are
++        # SM90-only, so Ada has no other DSv4 route.
 +        return capability.major in [10, 12] or (
 +            capability.major == 8 and capability.minor == 9)
  
      @classmethod
      def supports_combination(
-@@ -122,18 +126,21 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4FlashMLABackend):
+@@ -122,18 +131,34 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4FlashMLABackend):
              if kv_cache_dtype not in (None, "auto", "bfloat16", "fp8", "fp8_e4m3"):
                  return "kv_cache_dtype not supported"
              return None
@@ -9272,25 +9522,43 @@ index 1848c1930..c72ed8a64 100644
 +        if device_capability.major == 12 or (
 +                device_capability.major == 8
 +                and device_capability.minor == 9):
-+            # SM12x and Ada: FlashInfer sparse-MLA decode API mode
              if kv_cache_dtype not in ("fp8", "fp8_e4m3", "fp8_ds_mla"):
                  return "kv_cache_dtype not supported"
-             from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
- 
-             if not has_flashinfer_sparse_mla_sm120():
-                 return (
+-            from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
+-
+-            if not has_flashinfer_sparse_mla_sm120():
+-                return (
 -                    "FLASHINFER_MLA_SPARSE_DSV4 SM120 requires FlashInfer's "
 -                    "sparse MLA decode API"
-+                    "FLASHINFER_MLA_SPARSE_DSV4 on this arch requires "
-+                    "FlashInfer's sparse MLA decode API"
-                 )
+-                )
++            if device_capability.major == 12:
++                # SM12x: FlashInfer sparse-MLA decode API mode.
++                from vllm.utils.flashinfer import (
++                    has_flashinfer_sparse_mla_sm120)
++
++                if not has_flashinfer_sparse_mla_sm120():
++                    return (
++                        "FLASHINFER_MLA_SPARSE_DSV4 on this arch requires "
++                        "FlashInfer's sparse MLA decode API"
++                    )
++            else:
++                # Ada: FlashInfer's resolver refuses SM89, so decode and
++                # prefill route to vLLM's Triton sparse-MLA port instead
++                # (same cache layout and call surface). Needs Triton only.
++                from vllm.triton_utils import HAS_TRITON
++
++                if not HAS_TRITON:
++                    return (
++                        "FLASHINFER_MLA_SPARSE_DSV4 on sm_89 uses vLLM's "
++                        "Triton sparse-MLA port and requires Triton"
++                    )
              return None
 -        return "FLASHINFER_MLA_SPARSE_DSV4 requires SM10x or SM12x"
 +        return "FLASHINFER_MLA_SPARSE_DSV4 requires SM10x, SM12x or SM8.9"
  
      @staticmethod
      def get_kv_cache_shape(
-@@ -144,7 +151,10 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4FlashMLABackend):
+@@ -144,7 +169,10 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4FlashMLABackend):
          cache_dtype_str: str = "auto",
      ) -> tuple[int, ...]:
          device_capability = current_platform.get_device_capability()
@@ -9302,8 +9570,58 @@ index 1848c1930..c72ed8a64 100644
              return DeepseekV4FlashMLABackend.get_kv_cache_shape(
                  num_blocks,
                  block_size,
+@@ -526,7 +554,14 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
+ 
+ 
+ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
+-    """DeepSeek V4 sparse MLA attention through FlashInfer's SM120 kernels."""
++    """DeepSeek V4 sparse MLA attention, fp8_ds_mla layout.
++
++    On SM12x the decode/prefill calls run FlashInfer's SM120 sparse-MLA
++    kernels. On Ada (sm_89) the identical calls are routed by
++    ``vllm/utils/flashinfer.py`` to vLLM's Triton port of that API
++    (FlashInfer's resolver refuses pre-SM100). The class name records
++    where the call surface was born, not which arch executes it.
++    """
+ 
+     backend_cls = DeepseekV4FlashInferMLASparseBackend
+     use_fp8_ds_mla_layout: ClassVar[bool] = True
+@@ -576,13 +611,27 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
+ 
+     def __init__(self, *args, **kwargs) -> None:
+         super().__init__(*args, **kwargs)
+-        from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
++        device_capability = current_platform.get_device_capability()
++        if device_capability is not None and device_capability.major < 9:
++            # Pre-SM90 (Ada): FlashInfer's resolver has no kernel here;
++            # this layer's decode AND prefill go through vLLM's Triton
++            # sparse-MLA port. Validate the port against the torch
++            # reference on this exact silicon ONCE, at init: a
++            # codegen/driver regression must fail the BOOT (attributed,
++            # before 40+ s of weight loading is wasted per retry), not
++            # corrupt outputs at the first request.
++            from vllm.v1.attention.ops.triton_sparse_mla_dsv4 import (
++                dsv4_sparse_mla_self_test)
++
++            dsv4_sparse_mla_self_test()
++        else:
++            from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
+ 
+-        if not has_flashinfer_sparse_mla_sm120():
+-            raise RuntimeError(
+-                "FLASHINFER_MLA_SPARSE_DSV4 on SM120 requires FlashInfer's "
+-                "sparse MLA decode API."
+-            )
++            if not has_flashinfer_sparse_mla_sm120():
++                raise RuntimeError(
++                    "FLASHINFER_MLA_SPARSE_DSV4 on SM120 requires "
++                    "FlashInfer's sparse MLA decode API."
++                )
+         self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe()
+         # Per-tensor FP8 cache path scales.
+         if self.kv_cache_torch_dtype != torch.float8_e4m3fn:
 diff --git a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
-index 5f4a638c2..980f7a0ae 100644
+index 5f4a638..66b1b00 100644
 --- a/vllm/models/deepseek_v4/nvidia/model.py
 +++ b/vllm/models/deepseek_v4/nvidia/model.py
 @@ -70,6 +70,9 @@ from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
@@ -9316,7 +9634,7 @@ index 5f4a638c2..980f7a0ae 100644
  from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
  from vllm.platforms import current_platform
  from vllm.sequence import IntermediateTensors
-@@ -775,18 +778,41 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
+@@ -775,18 +778,46 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
              "Use FLASHINFER_MLA_SPARSE_DSV4 for DeepSeek V4 FlashInfer "
              "sparse MLA."
          )
@@ -9325,8 +9643,11 @@ index 5f4a638c2..980f7a0ae 100644
 -        if device_capability is not None and device_capability.major == 12:
 +        if device_capability is not None and (
 +                device_capability.major == 12 or pre_sm90):
-+            # the "SM120" class is the FlashInfer sparse-MLA decode API
-+            # mode (fp8_ds_mla layout, per-arch JIT) - Ada rides it too
++            # the "SM120" class is the fp8_ds_mla-layout call surface: on
++            # SM12x it runs FlashInfer's sparse-MLA decode API; on Ada
++            # FlashInfer's resolver has no kernel, so the same calls
++            # route to vLLM's Triton port (vllm/utils/flashinfer.py
++            # dispatch). The class name is its birthplace, not its gate.
              return DeepseekV4FlashInferSM120Attention
          return DeepseekV4FlashInferMLAAttention
      if backend in (
@@ -9353,14 +9674,16 @@ index 5f4a638c2..980f7a0ae 100644
 +        logger.info_once(
 +            "DeepseekV4 attention: FlashMLA sparse decode is SM90+; "
 +            "sm_%d%d routes to DeepseekV4FlashInferSM120Attention "
-+            "(FlashInfer sparse-MLA decode API, fp8_ds_mla layout)",
++            "(fp8_ds_mla layout; decode+prefill via vLLM's Triton "
++            "sparse-MLA port - FlashInfer's resolver has no pre-SM100 "
++            "kernel)",
 +            device_capability.major, device_capability.minor)
 +        return DeepseekV4FlashInferSM120Attention
      return DeepseekV4FlashMLAAttention
  
  
 diff --git a/vllm/models/deepseek_v4/nvidia/mtp.py b/vllm/models/deepseek_v4/nvidia/mtp.py
-index 64715deae..8c456a69a 100644
+index 64715de..8c456a6 100644
 --- a/vllm/models/deepseek_v4/nvidia/mtp.py
 +++ b/vllm/models/deepseek_v4/nvidia/mtp.py
 @@ -40,6 +40,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -9386,7 +9709,7 @@ index 64715deae..8c456a69a 100644
          super().__init__()
          self.config = vllm_config.model_config.hf_config
 diff --git a/vllm/models/deepseek_v4/nvidia/ops/o_proj.py b/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
-index 18e3b1056..d53669202 100644
+index 18e3b10..d536692 100644
 --- a/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
 +++ b/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
 @@ -15,13 +15,16 @@ def compute_fp8_einsum_recipe() -> tuple[tuple[int, int, int], bool]:
@@ -9409,7 +9732,7 @@ index 18e3b1056..d53669202 100644
  
  
 diff --git a/vllm/utils/deep_gemm.py b/vllm/utils/deep_gemm.py
-index 0a1644bcc..ed4050910 100644
+index 0a1644b..ed40509 100644
 --- a/vllm/utils/deep_gemm.py
 +++ b/vllm/utils/deep_gemm.py
 @@ -453,7 +453,204 @@ def fp8_gemm_nt(*args, **kwargs):
@@ -9652,10 +9975,74 @@ index 0a1644bcc..ed4050910 100644
      if _fp8_fp4_paged_mqa_logits_impl is None:
          return _missing()
 diff --git a/vllm/utils/flashinfer.py b/vllm/utils/flashinfer.py
-index 998c3b63d..93c0508eb 100644
+index 998c3b6..00bec0b 100644
 --- a/vllm/utils/flashinfer.py
 +++ b/vllm/utils/flashinfer.py
-@@ -214,7 +214,15 @@ def has_flashinfer_moe() -> bool:
+@@ -153,13 +153,62 @@ flashinfer_trtllm_batch_decode_with_kv_cache_mla = _lazy_import_wrapper(
+     "trtllm_batch_decode_with_kv_cache_mla",
+     fallback_fn=_missing_sparse_mla,
+ )
+-flashinfer_trtllm_batch_decode_sparse_mla_dsv4 = _lazy_import_wrapper(
++_flashinfer_native_trtllm_batch_decode_sparse_mla_dsv4 = _lazy_import_wrapper(
+     "flashinfer.decode",
+     "trtllm_batch_decode_sparse_mla_dsv4",
+     fallback_fn=_missing_sparse_mla,
+ )
+ 
+ 
++@functools.lru_cache(maxsize=None)
++def _dsv4_sparse_mla_route(device: torch.device) -> str:
++    """Pick ``flashinfer`` or ``triton-port`` for DSv4 sparse MLA.
++
++    Mirrors FlashInfer's DEEPEST arch gate
++    (``_resolve_dsv4_sparse_mla_backend``: SM100/103 -> trtllm-gen,
++    SM120/121 -> sparse, everything else -> ValueError). Class names and
++    import/signature probes above that resolver have lied before: Ada
++    passed both and then died at decode graph capture, 41 s into boot.
++    Everything the resolver refuses routes to vLLM's Triton port
++    (``vllm/v1/attention/ops/triton_sparse_mla_dsv4.py``).
++
++    ``VLLM_DSV4_SPARSE_MLA_FORCE_TRITON=1`` forces the port on any arch
++    (A/B numerics and perf against the native kernels).
++    """
++    if os.getenv("VLLM_DSV4_SPARSE_MLA_FORCE_TRITON",
++                 "0").lower() in ("1", "true", "yes", "on"):
++        logger.warning_once(
++            "DSv4 sparse MLA: VLLM_DSV4_SPARSE_MLA_FORCE_TRITON=1 - using "
++            "the Triton port even where FlashInfer has native kernels.")
++        return "triton-port"
++    major, minor = torch.cuda.get_device_capability(device)
++    if major in (10, 12):
++        return "flashinfer"
++    logger.warning_once(
++        "DSv4 sparse MLA: FlashInfer's resolver has no sm_%d%d kernel "
++        "(supports SM100/SM103/SM120/SM121) - decode AND prefill route to "
++        "vLLM's Triton sparse-MLA port. Correct but slower than the native "
++        "kernels; a native port is the long-term fix.", major, minor)
++    return "triton-port"
++
++
++def flashinfer_trtllm_batch_decode_sparse_mla_dsv4(*args: Any,
++                                                   **kwargs: Any) -> Any:
++    """DSv4 sparse-MLA decode/prefill entry, routed by device arch.
++
++    SM100/SM103 and SM120/SM121 call FlashInfer natively; every other
++    arch takes the Triton port with identical call surface + semantics.
++    """
++    query = kwargs["query"] if "query" in kwargs else args[0]
++    if query.is_cuda and _dsv4_sparse_mla_route(query.device) == "triton-port":
++        from vllm.v1.attention.ops.triton_sparse_mla_dsv4 import (
++            triton_sparse_mla_dsv4)
++
++        return triton_sparse_mla_dsv4(*args, **kwargs)
++    return _flashinfer_native_trtllm_batch_decode_sparse_mla_dsv4(
++        *args, **kwargs)
++
++
+ # Special case for autotune since it returns a context manager
+ autotune = _lazy_import_wrapper(
+     "flashinfer.autotuner",
+@@ -214,7 +263,15 @@ def has_flashinfer_moe() -> bool:
  
  @functools.cache
  def has_flashinfer_sparse_mla_sm120() -> bool:
@@ -9672,7 +10059,7 @@ index 998c3b63d..93c0508eb 100644
      if not has_flashinfer():
          return False
      try:
-@@ -225,6 +233,16 @@ def has_flashinfer_sparse_mla_sm120() -> bool:
+@@ -225,6 +282,16 @@ def has_flashinfer_sparse_mla_sm120() -> bool:
          )
      except ImportError:
          return False
@@ -9690,7 +10077,7 @@ index 998c3b63d..93c0508eb 100644
          callable(trtllm_batch_decode_sparse_mla_dsv4)
          and callable(trtllm_batch_decode_with_kv_cache_mla)
 diff --git a/vllm/v1/attention/backends/flashinfer.py b/vllm/v1/attention/backends/flashinfer.py
-index 5e2295c0a..a73bf09b8 100755
+index 5e2295c..a73bf09 100755
 --- a/vllm/v1/attention/backends/flashinfer.py
 +++ b/vllm/v1/attention/backends/flashinfer.py
 @@ -414,7 +414,9 @@ class FlashInferBackend(AttentionBackend):
@@ -9706,7 +10093,7 @@ index 5e2295c0a..a73bf09b8 100755
              return torch.float8_e5m2
 diff --git a/vllm/v1/attention/backends/mla/cubit_sparse_mla.py b/vllm/v1/attention/backends/mla/cubit_sparse_mla.py
 new file mode 100644
-index 000000000..16d22c7cd
+index 0000000..16d22c7
 --- /dev/null
 +++ b/vllm/v1/attention/backends/mla/cubit_sparse_mla.py
 @@ -0,0 +1,1171 @@
@@ -10882,7 +11269,7 @@ index 000000000..16d22c7cd
 +                    tcap, (T + tcap - 1) // tcap, int(capturing), _pfc_launches)
 +    return True
 diff --git a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
-index 97778dfea..37e4ea6d8 100644
+index 97778df..37e4ea6 100644
 --- a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
 +++ b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
 @@ -151,6 +151,7 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
@@ -10913,7 +11300,7 @@ index 97778dfea..37e4ea6d8 100644
              # fp8_ds_mla packed layout: 512 NoPE + 16 scales + 128 RoPE.
              return (num_blocks, block_size, 656)
 diff --git a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
-index d802f5688..37dabd57d 100644
+index d802f56..37dabd5 100644
 --- a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
 +++ b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
 @@ -32,6 +32,13 @@ def _kv_scale_format_for_model(model_type: str | None) -> str:
@@ -11068,7 +11455,7 @@ index d802f5688..37dabd57d 100644
 +            return out, lse
          return out.squeeze(1), None
 diff --git a/vllm/v1/attention/backends/mla/indexer.py b/vllm/v1/attention/backends/mla/indexer.py
-index b38445f9f..dd0f7005d 100644
+index b38445f..dd0f700 100644
 --- a/vllm/v1/attention/backends/mla/indexer.py
 +++ b/vllm/v1/attention/backends/mla/indexer.py
 @@ -28,6 +28,10 @@ from vllm.v1.attention.backends.utils import (
@@ -11255,7 +11642,7 @@ index b38445f9f..dd0f7005d 100644
      num_reqs = end_idx - start_idx
 diff --git a/vllm/v1/attention/backends/mla/nvfp4_ds_mla_cache.py b/vllm/v1/attention/backends/mla/nvfp4_ds_mla_cache.py
 new file mode 100644
-index 000000000..c37d3729e
+index 0000000..c37d372
 --- /dev/null
 +++ b/vllm/v1/attention/backends/mla/nvfp4_ds_mla_cache.py
 @@ -0,0 +1,53 @@
@@ -11314,7 +11701,7 @@ index 000000000..c37d3729e
 +                                         slot_mapping)
 diff --git a/vllm/v1/attention/backends/mla/sparse_mla_env.py b/vllm/v1/attention/backends/mla/sparse_mla_env.py
 new file mode 100644
-index 000000000..931614177
+index 0000000..9316141
 --- /dev/null
 +++ b/vllm/v1/attention/backends/mla/sparse_mla_env.py
 @@ -0,0 +1,216 @@
@@ -11535,7 +11922,7 @@ index 000000000..931614177
 +    except ValueError:
 +        return 8192
 diff --git a/vllm/v1/attention/backends/mla/sparse_swa.py b/vllm/v1/attention/backends/mla/sparse_swa.py
-index 9e54b62a0..a02b59d89 100644
+index 9e54b62..a02b59d 100644
 --- a/vllm/v1/attention/backends/mla/sparse_swa.py
 +++ b/vllm/v1/attention/backends/mla/sparse_swa.py
 @@ -380,8 +380,13 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
@@ -11554,7 +11941,7 @@ index 9e54b62a0..a02b59d89 100644
              else 0
          )
 diff --git a/vllm/v1/attention/backends/mla/sparse_utils.py b/vllm/v1/attention/backends/mla/sparse_utils.py
-index 522b52b0d..c2fe0d84a 100644
+index 522b52b..c2fe0d8 100644
 --- a/vllm/v1/attention/backends/mla/sparse_utils.py
 +++ b/vllm/v1/attention/backends/mla/sparse_utils.py
 @@ -128,6 +128,9 @@ def triton_convert_req_index_to_global_index(
@@ -11581,7 +11968,7 @@ index 522b52b0d..c2fe0d84a 100644
      assert block_table.dtype == torch.int32
 diff --git a/vllm/v1/attention/ops/dcp_sparse_topk.py b/vllm/v1/attention/ops/dcp_sparse_topk.py
 new file mode 100644
-index 000000000..8a93910d6
+index 0000000..8a93910
 --- /dev/null
 +++ b/vllm/v1/attention/ops/dcp_sparse_topk.py
 @@ -0,0 +1,146 @@
@@ -11732,7 +12119,7 @@ index 000000000..8a93910d6
 +    merged.masked_fill_(top_scores == float("-inf"), -1)
 +    return merged
 diff --git a/vllm/v1/attention/ops/merge_attn_states.py b/vllm/v1/attention/ops/merge_attn_states.py
-index cf4338fb1..f0577501e 100644
+index cf4338f..f057750 100644
 --- a/vllm/v1/attention/ops/merge_attn_states.py
 +++ b/vllm/v1/attention/ops/merge_attn_states.py
 @@ -46,6 +46,19 @@ def merge_attn_states(
@@ -11756,7 +12143,7 @@ index cf4338fb1..f0577501e 100644
      # does not support FP8 dtype for inputs, fallback to use Triton kernel.
      # However, when output_scale is provided, the inputs are still BF16/FP16
 diff --git a/vllm/v1/attention/ops/triton_decode_attention.py b/vllm/v1/attention/ops/triton_decode_attention.py
-index 6aec1db2e..4359cb3cc 100644
+index 6aec1db..4359cb3 100644
 --- a/vllm/v1/attention/ops/triton_decode_attention.py
 +++ b/vllm/v1/attention/ops/triton_decode_attention.py
 @@ -530,6 +530,13 @@ def _decode_grouped_att_m_fwd(
@@ -11773,8 +12160,776 @@ index 6aec1db2e..4359cb3cc 100644
  
      _fwd_grouped_kernel_stage1[grid](
          q,
+diff --git a/vllm/v1/attention/ops/triton_sparse_mla_dsv4.py b/vllm/v1/attention/ops/triton_sparse_mla_dsv4.py
+new file mode 100644
+index 0000000..8dfe264
+--- /dev/null
++++ b/vllm/v1/attention/ops/triton_sparse_mla_dsv4.py
+@@ -0,0 +1,762 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Triton port of FlashInfer's SM120 sparse-MLA paged attention (DSv4).
++
++FlashInfer's ``trtllm_batch_decode_sparse_mla_dsv4`` resolves its backend
++from the device architecture and refuses everything it has no kernel for
++(``_resolve_dsv4_sparse_mla_backend``: SM100/103 -> trtllm-gen,
++SM120/121 -> sparse, anything else -> ValueError; field-hit on Ada at
++decode graph capture, AFTER 41 s of weight loading and a clean prefill
++profile). This module is an arch-portable implementation of the
++``sparse`` backend's exact call surface and semantics, so DSv4 sparse
++attention can run on GPUs FlashInfer does not cover. Ada / sm_89 is the
++tested target; the kernel itself only assumes Triton.
++
++Semantics are LIFTED from flashinfer 0.6.14, not re-derived:
++
++* ``flashinfer/mla/_core.py`` (``_trtllm_batch_decode_sparse_mla_dsv4_sm120``
++  + ``_normalize_sparse_mla_*``) for the call surface, and
++* ``include/flashinfer/attention/sparse_mla_sm120/model/kv_cache_traits.cuh``
++  (``KVCacheTraits<ModelType::DSV4>``) for the packed cache layout,
++
++cross-checked against vLLM's cache writer
++(``csrc/libtorch_stable/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu``).
++
++The contract:
++
++* query: BF16 ``[T, H, 512]`` (or ``[B, Q, H, 512]``), H <= 128;
++  512 = 448 nope + 64 rope. K and V are the SAME 512-dim cache row.
++* packed ``fp8_ds_mla`` cache: the uint8 tensor ``[pages, pbs, 584]`` is
++  a byte container, NOT row-major 584-byte rows. Physical page layout:
++
++  - token data at   ``page*pbs*584 + tok*576``:
++    448 B FP8-E4M3 nope + 64 x BF16 rope (128 B)
++  - scale footer at ``page*pbs*584 + pbs*576 + tok*8``:
++    7 UE8M0 bytes (one per 64-wide nope tile) + 1 pad byte
++  - dequant: ``nope_fp8 * 2^(scale_byte - 127)``; rope is stored BF16.
++
++* plain cache: rows ``[pages, pbs, 512]`` in the query dtype (BF16).
++* indices: INT32 global token slots (``page = idx // pbs``); entries at
++  or past the per-token length, and negative entries, are masked out.
++* two segments (SWA + optional compressed) share ONE softmax.
++* sinks: natural-log virtual logit per head; contributes softmax mass
++  to the denominator only (value 0). Padded heads carry -inf. The sink
++  is NOT scaled by ``bmm1_scale``.
++* out: BF16 ``[T, H, 512]``. A token whose segments are entirely masked
++  produces zeros (with or without a sink), matching the SM120 kernel.
++
++Env knobs (read once, at first use):
++
++* ``VLLM_DSV4_SPARSE_MLA_FORCE_TRITON=1`` - route to this port even on
++  architectures FlashInfer supports (A/B numerics + perf on SM120/SM100
++  silicon). Read by ``vllm/utils/flashinfer.py``.
++* ``VLLM_DSV4_SPARSE_MLA_SELFTEST=0``     - skip the init-time on-device
++  self-test (triage escape hatch; the test costs < 100 ms once).
++"""
++
++import functools
++import os
++
++import torch
++
++from vllm.logger import init_logger
++from vllm.triton_utils import HAS_TRITON, tl, triton
++
++logger = init_logger(__name__)
++
++# DSv4 dimensions, mirrored from KVCacheTraits<ModelType::DSV4>.
++_D = 512  # d_qk == d_v
++_D_NOPE = 448
++_D_ROPE = 64
++_QUANT_TILE = 64
++_NUM_SCALES = 7
++_BPT_PACKED = 584  # logical bytes/token of the packed fp8_ds_mla row
++_TOKEN_DATA_BYTES = 576  # physical: 448 fp8 + 64 * bf16
++_SCALE_BYTES = 8  # footer: 7 UE8M0 + 1 pad
++
++# Finite sentinel for "-inf" in the online softmax. Keeps m/l arithmetic
++# NaN-free for all-masked tokens (the SM120 kernel uses the same trick).
++_NEG_INF = -1.0e30
++_LOG2E = 1.4426950408889634
++
++# Set once at import: TRITON_INTERPRET is read by Triton itself at import
++# time, so a consistent snapshot here is correct by construction.
++_IS_INTERPRET = os.getenv("TRITON_INTERPRET", "0") == "1"
++
++
++@triton.jit
++def _dsv4_gather_k(
++    kv_ptr,
++    idx,  # [BLOCK_N] int64 global slots (invalid lanes pre-zeroed)
++    valid,  # [BLOCK_N] bool
++    pbs,  # page block size (tokens per page)
++    d_offs,  # [D] arange
++    IS_PACKED: tl.constexpr,
++    D: tl.constexpr,
++    D_NOPE: tl.constexpr,
++    QUANT_TILE: tl.constexpr,
++):
++    """Gather a [BLOCK_N, D] fp32 K/V tile from a paged DSv4 cache."""
++    if IS_PACKED:
++        page = idx // pbs
++        tok = idx - page * pbs
++        page_base = page * (pbs * 584)
++        data_base = page_base + tok * 576  # [BLOCK_N]
++        is_nope = d_offs < D_NOPE  # [D]
++
++        # FP8-E4M3 nope bytes, decoded with integer math (portable to the
++        # Triton interpreter; the writer saturates so 0x7F/0xFF never occur).
++        nope_addr = data_base[:, None] + d_offs[None, :]
++        nope_mask = valid[:, None] & is_nope[None, :]
++        b = tl.load(kv_ptr + nope_addr, mask=nope_mask, other=0).to(tl.uint32)
++        sign = (b >> 7) & 1
++        expo = ((b >> 3) & 0xF).to(tl.float32)
++        mant = (b & 0x7).to(tl.float32)
++        mag = tl.where(
++            expo == 0.0,
++            mant * 0.001953125,  # subnormal: mant/8 * 2^-6 = mant * 2^-9
++            tl.exp2(expo - 7.0) * (1.0 + mant * 0.125),
++        )
++        nope_f32 = tl.where(sign == 1, -mag, mag)
++
++        # UE8M0 tile scales from the page footer, gathered per column.
++        tile_id = tl.minimum(d_offs // QUANT_TILE, 6)
++        scale_addr = (page_base[:, None] + pbs * 576 + tok[:, None] * 8 +
++                      tile_id[None, :])
++        s = tl.load(kv_ptr + scale_addr, mask=nope_mask, other=127)
++        scale = tl.exp2(s.to(tl.float32) - 127.0)
++
++        # BF16 rope halves -> f32 via bit assembly.
++        rope_col = d_offs - D_NOPE
++        rope_addr = data_base[:, None] + D_NOPE + 2 * rope_col[None, :]
++        rope_mask = valid[:, None] & (d_offs[None, :] >= D_NOPE)
++        lo = tl.load(kv_ptr + rope_addr, mask=rope_mask, other=0).to(tl.uint32)
++        hi = tl.load(kv_ptr + rope_addr + 1, mask=rope_mask,
++                     other=0).to(tl.uint32)
++        rope_f32 = ((hi << 24) | (lo << 16)).to(tl.float32, bitcast=True)
++
++        return tl.where(is_nope[None, :], nope_f32 * scale, rope_f32)
++    else:
++        addr = idx[:, None] * D + d_offs[None, :]
++        k = tl.load(kv_ptr + addr, mask=valid[:, None], other=0.0)
++        return k.to(tl.float32)
++
++
++@triton.jit
++def _sparse_mla_dsv4_kernel(
++    q_ptr,
++    out_ptr,
++    kv_ptr,
++    idx_ptr,
++    len_ptr,
++    extra_kv_ptr,
++    extra_idx_ptr,
++    extra_len_ptr,
++    sink_ptr,
++    sm_scale,
++    pbs,
++    extra_pbs,
++    K_main,
++    K_extra,
++    H,
++    stride_qt,
++    stride_qh,
++    stride_ot,
++    stride_oh,
++    stride_it,
++    extra_stride_it,
++    HAS_EXTRA: tl.constexpr,
++    HAS_SINK: tl.constexpr,
++    HAS_LENS: tl.constexpr,
++    HAS_EXTRA_LENS: tl.constexpr,
++    IS_PACKED: tl.constexpr,
++    EXTRA_IS_PACKED: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    D: tl.constexpr,
++    D_NOPE: tl.constexpr,
++    QUANT_TILE: tl.constexpr,
++    DOT_BF16: tl.constexpr,
++):
++    t = tl.program_id(0)
++    hb = tl.program_id(1)
++    h_offs = hb * BLOCK_H + tl.arange(0, BLOCK_H)
++    h_ok = h_offs < H
++    d_offs = tl.arange(0, D)
++
++    # Keep dot operands bf16 (f32 accumulate): Ada has 99 KiB smem/SM and
++    # f32 operand tiles for a D=512 dot do not fit (AOT-compile measured
++    # 295 KiB with f32 operands; bf16 + BLOCK_N=32 + num_stages=1 fits).
++    # Precision matches the native SM120 kernel, which runs fp8 MMA.
++    q = tl.load(
++        q_ptr + t * stride_qt + h_offs[:, None] * stride_qh + d_offs[None, :],
++        mask=h_ok[:, None],
++        other=0.0,
++    )
++
++    # Online softmax state, log2 domain.
++    m = tl.full([BLOCK_H], -1.0e30, tl.float32)
++    l = tl.zeros([BLOCK_H], tl.float32)
++    acc = tl.zeros([BLOCK_H, D], tl.float32)
++    qk_scale = sm_scale * 1.4426950408889634
++
++    if HAS_LENS:
++        n_main = tl.load(len_ptr + t)
++        n_main = tl.maximum(tl.minimum(n_main, K_main), 0)
++    else:
++        n_main = K_main
++    for start in range(0, n_main, BLOCK_N):
++        offs = start + tl.arange(0, BLOCK_N)
++        in_len = offs < n_main
++        idx = tl.load(idx_ptr + t * stride_it + offs, mask=in_len, other=-1)
++        valid = in_len & (idx >= 0)
++        idx0 = tl.where(valid, idx, 0).to(tl.int64)
++        k = _dsv4_gather_k(kv_ptr, idx0, valid, pbs, d_offs, IS_PACKED, D,
++                           D_NOPE, QUANT_TILE)
++        if DOT_BF16:
++            k = k.to(tl.bfloat16)
++            s = tl.dot(q, tl.trans(k)) * qk_scale
++        else:
++            s = tl.dot(q.to(tl.float32), tl.trans(k)) * qk_scale
++        s = tl.where(valid[None, :], s, -1.0e30)
++        m_new = tl.maximum(m, tl.max(s, axis=1))
++        alpha = tl.exp2(m - m_new)
++        p = tl.where(valid[None, :], tl.exp2(s - m_new[:, None]), 0.0)
++        l = l * alpha + tl.sum(p, axis=1)
++        if DOT_BF16:
++            acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), k)
++        else:
++            acc = acc * alpha[:, None] + tl.dot(p, k)
++        m = m_new
++
++    if HAS_EXTRA:
++        if HAS_EXTRA_LENS:
++            n_extra = tl.load(extra_len_ptr + t)
++            n_extra = tl.maximum(tl.minimum(n_extra, K_extra), 0)
++        else:
++            n_extra = K_extra
++        for start in range(0, n_extra, BLOCK_N):
++            offs = start + tl.arange(0, BLOCK_N)
++            in_len = offs < n_extra
++            idx = tl.load(extra_idx_ptr + t * extra_stride_it + offs,
++                          mask=in_len,
++                          other=-1)
++            valid = in_len & (idx >= 0)
++            idx0 = tl.where(valid, idx, 0).to(tl.int64)
++            k = _dsv4_gather_k(extra_kv_ptr, idx0, valid, extra_pbs, d_offs,
++                               EXTRA_IS_PACKED, D, D_NOPE, QUANT_TILE)
++            if DOT_BF16:
++                k = k.to(tl.bfloat16)
++                s = tl.dot(q, tl.trans(k)) * qk_scale
++            else:
++                s = tl.dot(q.to(tl.float32), tl.trans(k)) * qk_scale
++            s = tl.where(valid[None, :], s, -1.0e30)
++            m_new = tl.maximum(m, tl.max(s, axis=1))
++            alpha = tl.exp2(m - m_new)
++            p = tl.where(valid[None, :], tl.exp2(s - m_new[:, None]), 0.0)
++            l = l * alpha + tl.sum(p, axis=1)
++            if DOT_BF16:
++                acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), k)
++            else:
++                acc = acc * alpha[:, None] + tl.dot(p, k)
++            m = m_new
++
++    if HAS_SINK:
++        # The sink is a virtual candidate with value 0: it adds softmax
++        # mass to the denominator only (FlashMLA V4 semantics; padded
++        # heads carry -inf and are a no-op). Natural-log -> log2.
++        snk = tl.load(sink_ptr + h_offs, mask=h_ok, other=-1.0e30)
++        snk = tl.maximum(snk * 1.4426950408889634, -1.0e30)
++        m_new = tl.maximum(m, snk)
++        alpha = tl.exp2(m - m_new)
++        l = l * alpha + tl.exp2(snk - m_new)
++        acc = acc * alpha[:, None]
++
++    # All-masked tokens (l == 0) produce zeros, matching the SM120 kernel.
++    l_safe = tl.where(l > 0.0, l, 1.0)
++    o = acc / l_safe[:, None]
++    tl.store(
++        out_ptr + t * stride_ot + h_offs[:, None] * stride_oh + d_offs[None, :],
++        o.to(out_ptr.dtype.element_ty),
++        mask=h_ok[:, None],
++    )
++
++
++def _normalize_kv_cache(
++    kv_cache: torch.Tensor,
++    kv_layout: str,
++    query_dtype: torch.dtype,
++    name: str,
++) -> tuple[torch.Tensor, int, bool]:
++    """Return ``(cache, page_block_size, is_packed)``.
++
++    Mirrors flashinfer's ``_check_sm120_dsv4_kv_cache_layout`` +
++    ``_packed_kv_page_block_size``: 3-D ``[pages, pbs, w]`` or 4-D with a
++    singleton KV-head axis (NHD: dim 2, HND: dim 1); ``w`` is 584 packed
++    uint8 or 512 in the query dtype.
++    """
++    if kv_cache.ndim == 4:
++        if kv_layout == "NHD":
++            if kv_cache.shape[2] != 1:
++                raise ValueError(
++                    f"{name}: NHD layout needs a singleton KV-head axis in "
++                    f"dim 2, got shape {tuple(kv_cache.shape)}")
++            pbs = int(kv_cache.shape[1])
++        elif kv_layout == "HND":
++            if kv_cache.shape[1] != 1:
++                raise ValueError(
++                    f"{name}: HND layout needs a singleton KV-head axis in "
++                    f"dim 1, got shape {tuple(kv_cache.shape)}")
++            pbs = int(kv_cache.shape[2])
++        else:
++            raise ValueError(f"{name}: kv_layout must be NHD or HND, got "
++                             f"{kv_layout!r}")
++    elif kv_cache.ndim == 3:
++        pbs = int(kv_cache.shape[1])
++    else:
++        raise ValueError(
++            f"{name} must have ndim 3 or 4, got {kv_cache.ndim}")
++    if not kv_cache.is_contiguous():
++        raise ValueError(f"{name} must be contiguous")
++
++    width = int(kv_cache.shape[-1])
++    if kv_cache.dtype == torch.uint8:
++        if width != _BPT_PACKED:
++            raise ValueError(
++                f"Expected packed DSV4 {name} head dim {_BPT_PACKED}, got "
++                f"{width}")
++        return kv_cache, pbs, True
++    if kv_cache.dtype != query_dtype:
++        raise ValueError(f"{name} dtype must match query dtype, got "
++                         f"{kv_cache.dtype} and {query_dtype}")
++    if width != _D:
++        raise ValueError(f"Expected {name} head dim {_D}, got {width}")
++    return kv_cache, pbs, False
++
++
++def _normalize_indices(
++    indices: torch.Tensor,
++    lens: torch.Tensor | None,
++    num_tokens: int,
++    name: str,
++) -> tuple[torch.Tensor, torch.Tensor | None]:
++    """Flatten ``[T, K]`` / ``[T, 1, K]`` index tensors; validate dtypes.
++
++    Mirrors flashinfer's ``_normalize_sparse_mla_indices_and_lens`` for the
++    flat-token case (batch = T, q_len = 1).
++    """
++    if indices.ndim == 3:
++        if indices.shape[0] * indices.shape[1] != num_tokens:
++            raise ValueError(
++                f"{name}: shape {tuple(indices.shape)} does not cover "
++                f"{num_tokens} query tokens")
++        indices = indices.reshape(num_tokens, indices.shape[-1])
++    elif indices.ndim == 2:
++        if indices.shape[0] != num_tokens:
++            raise ValueError(
++                f"{name}: shape {tuple(indices.shape)} does not cover "
++                f"{num_tokens} query tokens")
++    else:
++        raise ValueError(f"{name} must have ndim 2 or 3, got {indices.ndim}")
++    if indices.shape[-1] <= 0:
++        raise ValueError(f"{name} requires top-k > 0")
++    if indices.dtype != torch.int32:
++        raise ValueError(f"{name} must be int32, got {indices.dtype}")
++    if indices.stride(-1) != 1:
++        indices = indices.contiguous()
++
++    if lens is not None:
++        lens = lens.reshape(-1)
++        if lens.numel() != num_tokens:
++            raise ValueError(f"{name}_lens must have {num_tokens} entries, "
++                             f"got {lens.numel()}")
++        if lens.dtype != torch.int32:
++            raise ValueError(f"{name}_lens must be int32, got {lens.dtype}")
++        if not lens.is_contiguous():
++            lens = lens.contiguous()
++    return indices, lens
++
++
++def triton_sparse_mla_dsv4(
++    query: torch.Tensor,
++    swa_kv_cache: torch.Tensor,
++    workspace_buffer: torch.Tensor | None = None,
++    sparse_indices: torch.Tensor | None = None,
++    compressed_kv_cache: torch.Tensor | None = None,
++    sparse_topk_lens: torch.Tensor | None = None,
++    seq_lens: torch.Tensor | None = None,
++    out: torch.Tensor | None = None,
++    bmm1_scale: float = 1.0,
++    bmm2_scale: float = 1.0,
++    sinks: torch.Tensor | None = None,
++    kv_layout: str = "HND",
++    cum_seq_lens_q: torch.Tensor | None = None,
++    max_q_len: int | None = None,
++    enable_pdl: bool | None = None,
++    swa_topk_lens: torch.Tensor | None = None,
++    extra_sparse_indices: torch.Tensor | None = None,
++    extra_sparse_topk_lens: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """Arch-portable DSv4 sparse-MLA attention (FlashInfer ``sparse`` mode).
++
++    The signature mirrors flashinfer 0.6.14's
++    ``trtllm_batch_decode_sparse_mla_dsv4`` so the dispatcher in
++    ``vllm/utils/flashinfer.py`` can pass calls through unchanged.
++    ``workspace_buffer`` and ``enable_pdl`` are accepted and ignored (the
++    kernel needs neither); the trtllm-gen-only calling convention
++    (``sparse_topk_lens``/``seq_lens``/``cum_seq_lens_q``) is refused with
++    the remedy named.
++
++    CUDA-graph safe: no host synchronization, no data-dependent shapes;
++    lengths are consumed on-device.
++    """
++    del workspace_buffer, enable_pdl, max_q_len  # not needed by the port
++    if sparse_indices is None:
++        raise ValueError("sparse_indices is required")
++    if (sparse_topk_lens is not None or seq_lens is not None
++            or cum_seq_lens_q is not None):
++        raise NotImplementedError(
++            "DSv4 sparse MLA (Triton port) implements FlashInfer's "
++            "SM120-mode calling convention (swa_topk_lens / "
++            "extra_sparse_indices); the trtllm-gen convention "
++            "(sparse_topk_lens / seq_lens / cum_seq_lens_q) is SM100-only. "
++            "Route this call through the SM120-mode call sites "
++            "(DeepseekV4FlashInferSM120Attention).")
++    if isinstance(bmm1_scale, torch.Tensor) or isinstance(
++            bmm2_scale, torch.Tensor):
++        raise ValueError(
++            "DSv4 sparse MLA (Triton port) expects float bmm scales")
++    if float(bmm2_scale) != 1.0:
++        raise ValueError("DSv4 sparse MLA does not support bmm2_scale")
++    if query.dtype != torch.bfloat16:
++        raise ValueError(
++            f"DSv4 sparse MLA (Triton port) only supports BF16 query, got "
++            f"{query.dtype}")
++
++    orig_ndim = query.ndim
++    if orig_ndim == 4:
++        b, qlen, num_heads, head_dim = query.shape
++        query_flat = query.reshape(b * qlen, num_heads, head_dim)
++    elif orig_ndim == 3:
++        query_flat = query
++        num_heads, head_dim = query.shape[-2:]
++    else:
++        raise ValueError(f"Expected query.ndim == 3 or 4, got {query.ndim}")
++    if head_dim != _D:
++        raise ValueError(f"Expected DSv4 query head dim {_D}, got {head_dim}")
++    if num_heads > 128:
++        raise ValueError(f"Expected num_heads <= 128, got {num_heads}")
++    if query_flat.stride(-1) != 1:
++        query_flat = query_flat.contiguous()
++    num_tokens = query_flat.shape[0]
++
++    kv_main, pbs_main, packed_main = _normalize_kv_cache(
++        swa_kv_cache, kv_layout, query.dtype, "swa_kv_cache")
++    idx_main, lens_main = _normalize_indices(sparse_indices, swa_topk_lens,
++                                             num_tokens, "sparse_indices")
++
++    has_extra = extra_sparse_indices is not None
++    if has_extra != (extra_sparse_topk_lens is not None):
++        raise ValueError(
++            "extra_sparse_indices and extra_sparse_topk_lens must be "
++            "provided together")
++    if has_extra:
++        if compressed_kv_cache is None:
++            raise ValueError("compressed_kv_cache is required when "
++                             "extra_sparse_indices is provided")
++        kv_extra, pbs_extra, packed_extra = _normalize_kv_cache(
++            compressed_kv_cache, kv_layout, query.dtype,
++            "compressed_kv_cache")
++        idx_extra, lens_extra = _normalize_indices(extra_sparse_indices,
++                                                   extra_sparse_topk_lens,
++                                                   num_tokens,
++                                                   "extra_sparse_indices")
++    else:
++        kv_extra, pbs_extra, packed_extra = kv_main, pbs_main, packed_main
++        idx_extra, lens_extra = idx_main, lens_main
++
++    expected_out_shape = ((b, qlen, num_heads, _D) if orig_ndim == 4 else
++                          (num_tokens, num_heads, _D))
++    if out is None:
++        out = torch.empty(expected_out_shape,
++                          dtype=torch.bfloat16,
++                          device=query.device)
++    else:
++        if tuple(out.shape) != expected_out_shape:
++            raise ValueError(f"out shape {tuple(out.shape)} != expected "
++                             f"{expected_out_shape}")
++        if out.dtype != torch.bfloat16:
++            raise ValueError(f"out must be bf16, got {out.dtype}")
++    out_flat = out.view(num_tokens, num_heads, _D)
++    if out_flat.stride(-1) != 1:
++        raise ValueError("out must have a unit stride head dim")
++
++    if sinks is not None:
++        if sinks.dtype != torch.float32 or sinks.numel() < num_heads:
++            raise ValueError(
++                f"sinks must be fp32 with >= {num_heads} entries, got "
++                f"{sinks.dtype} x {sinks.numel()}")
++        if not sinks.is_contiguous():
++            sinks = sinks.contiguous()
++
++    logger.info_once(
++        "DSv4 sparse-MLA Triton port geometry: q%s %s, swa cache %s %s "
++        "(pbs=%d, packed=%s), K_main=%d, extra=%s, K_extra=%s, sinks=%s",
++        tuple(query_flat.shape),
++        query.dtype,
++        tuple(swa_kv_cache.shape),
++        swa_kv_cache.dtype,
++        pbs_main,
++        packed_main,
++        idx_main.shape[-1],
++        has_extra,
++        idx_extra.shape[-1] if has_extra else 0,
++        sinks is not None,
++    )
++
++    block_h = 16
++    grid = (num_tokens, triton.cdiv(num_heads, block_h))
++    if num_tokens > 0:
++        _sparse_mla_dsv4_kernel[grid](
++            query_flat,
++            out_flat,
++            kv_main,
++            idx_main,
++            lens_main if lens_main is not None else idx_main,
++            kv_extra,
++            idx_extra,
++            lens_extra if lens_extra is not None else idx_extra,
++            sinks if sinks is not None else query_flat,
++            float(bmm1_scale),
++            pbs_main,
++            pbs_extra,
++            idx_main.shape[-1],
++            idx_extra.shape[-1] if has_extra else 0,
++            num_heads,
++            query_flat.stride(0),
++            query_flat.stride(1),
++            out_flat.stride(0),
++            out_flat.stride(1),
++            idx_main.stride(0),
++            idx_extra.stride(0),
++            HAS_EXTRA=has_extra,
++            HAS_SINK=sinks is not None,
++            HAS_LENS=lens_main is not None,
++            HAS_EXTRA_LENS=has_extra and lens_extra is not None,
++            IS_PACKED=packed_main,
++            EXTRA_IS_PACKED=packed_extra,
++            BLOCK_H=block_h,
++            BLOCK_N=32,
++            D=_D,
++            D_NOPE=_D_NOPE,
++            QUANT_TILE=_QUANT_TILE,
++            # The Triton interpreter (numpy) cannot emulate bf16 dots; the
++            # GPU build MUST use bf16 operands to fit Ada's 99 KiB smem
++            # (f32 operand tiles measured 295 KiB via AOT compile). The
++            # interpreter tier validates semantics in f32; the init-time
++            # self-test validates the shipped bf16 path on real silicon.
++            DOT_BF16=not _IS_INTERPRET,
++            num_warps=4,
++            num_stages=1,
++        )
++    return out
++
++
++def dequant_dsv4_packed_cache(kv_cache: torch.Tensor,
++                              pbs: int) -> torch.Tensor:
++    """Decode a packed fp8_ds_mla cache to f32 rows ``[pages*pbs, 512]``.
++
++    Reference-path helper (tests, self-test, torch fallback). Operates on
++    the byte container in its NATIVE storage layout - data first, scale
++    footer last - before any logical reshape.
++    """
++    pages = kv_cache.shape[0]
++    flat = kv_cache.reshape(pages, -1)
++    assert flat.shape[1] == pbs * _BPT_PACKED
++    data = flat[:, :pbs * _TOKEN_DATA_BYTES].reshape(pages, pbs,
++                                                     _TOKEN_DATA_BYTES)
++    nope = data[..., :_D_NOPE].view(torch.float8_e4m3fn).to(torch.float32)
++    rope = data[..., _D_NOPE:].contiguous().view(torch.bfloat16).to(
++        torch.float32)
++    scales = (flat[:, pbs * _TOKEN_DATA_BYTES:].reshape(
++        pages, pbs, _SCALE_BYTES)[..., :_NUM_SCALES].to(torch.int32) - 127)
++    factor = torch.ldexp(torch.ones_like(scales, dtype=torch.float32),
++                         scales)
++    factor = factor.repeat_interleave(_QUANT_TILE, dim=-1)
++    k = torch.cat([nope * factor, rope], dim=-1)
++    return k.reshape(pages * pbs, _D)
++
++
++def sparse_mla_dsv4_torch_ref(
++    query: torch.Tensor,
++    swa_kv_cache: torch.Tensor,
++    sparse_indices: torch.Tensor,
++    *,
++    compressed_kv_cache: torch.Tensor | None = None,
++    swa_topk_lens: torch.Tensor | None = None,
++    extra_sparse_indices: torch.Tensor | None = None,
++    extra_sparse_topk_lens: torch.Tensor | None = None,
++    out: torch.Tensor | None = None,
++    bmm1_scale: float = 1.0,
++    bmm2_scale: float = 1.0,
++    sinks: torch.Tensor | None = None,
++    kv_layout: str = "NHD",
++) -> torch.Tensor:
++    """Pure-torch reference with identical semantics (fp32 math)."""
++    assert float(bmm2_scale) == 1.0
++    orig_shape = query.shape
++    query_flat = query.reshape(-1, query.shape[-2], query.shape[-1])
++    num_tokens, num_heads, _ = query_flat.shape
++
++    def rows(cache: torch.Tensor) -> torch.Tensor:
++        cache3, pbs, packed = _normalize_kv_cache(cache, kv_layout,
++                                                  query.dtype, "cache")
++        cache3 = cache3.reshape(cache3.shape[0], -1)
++        if packed:
++            return dequant_dsv4_packed_cache(cache3, pbs)
++        return cache3.reshape(-1, _D).to(torch.float32)
++
++    segments = [(rows(swa_kv_cache), sparse_indices, swa_topk_lens)]
++    if extra_sparse_indices is not None:
++        assert compressed_kv_cache is not None
++        segments.append((rows(compressed_kv_cache), extra_sparse_indices,
++                         extra_sparse_topk_lens))
++
++    q = query_flat.to(torch.float32)
++    all_scores = []
++    all_values = []
++    for k_rows, indices, lens in segments:
++        idx, lens = _normalize_indices(indices, lens, num_tokens, "indices")
++        idx = idx.to(torch.int64)
++        valid = idx >= 0
++        if lens is not None:
++            width = idx.shape[-1]
++            pos = torch.arange(width, device=idx.device)
++            valid &= pos[None, :] < lens.to(torch.int64)[:, None]
++        k = k_rows[idx.clamp(min=0)]  # [T, K, D]
++        s = torch.einsum("thd,tkd->thk", q, k) * float(bmm1_scale)
++        s = s.masked_fill(~valid[:, None, :], float("-inf"))
++        all_scores.append(s)
++        all_values.append(torch.where(valid[..., None], k, 0.0))
++    scores = torch.cat(all_scores, dim=-1)  # [T, H, Ktot]
++    values = torch.cat(all_values, dim=-2)  # [T, Ktot, D]
++
++    if sinks is not None:
++        sink = sinks[:num_heads].to(torch.float32)
++        scores = torch.cat(
++            [scores,
++             sink.view(1, num_heads, 1).expand(num_tokens, -1, -1)],
++            dim=-1)
++        values = torch.cat(
++            [values, torch.zeros_like(values[:, :1])], dim=-2)
++
++    m = scores.amax(dim=-1, keepdim=True).clamp_min(_NEG_INF)
++    p = torch.exp(scores - m)
++    p = torch.nan_to_num(p, nan=0.0)  # -inf - m for all-masked rows
++    denom = p.sum(dim=-1, keepdim=True)
++    o = torch.einsum("thk,tkd->thd", p, values) / denom.clamp_min(1e-38)
++    o = torch.where(denom > 0, o, 0.0)
++    result = o.to(torch.bfloat16).reshape(*orig_shape[:-1], _D)
++    if out is not None:
++        out.copy_(result)
++        return out
++    return result
++
++
++@functools.cache
++def dsv4_sparse_mla_self_test() -> None:
++    """One-shot on-device self-test: Triton port vs. the torch reference.
++
++    Runs at attention-layer init on architectures that take the port (so a
++    codegen/driver regression fails the BOOT, attributed, instead of
++    corrupting outputs). Covers: packed + plain caches, both segments,
++    sinks, len-0 tokens and -1 index padding.
++    """
++    if os.getenv("VLLM_DSV4_SPARSE_MLA_SELFTEST", "1") in ("0", "false",
++                                                           "no", "off"):
++        logger.warning_once(
++            "DSv4 sparse-MLA Triton port self-test SKIPPED "
++            "(VLLM_DSV4_SPARSE_MLA_SELFTEST=0)")
++        return
++    if not (HAS_TRITON and torch.cuda.is_available()):
++        return
++    device = torch.device("cuda", torch.cuda.current_device())
++    torch.manual_seed(0)
++    pages, pbs, t, h = 6, 64, 4, 16
++    kv_f32 = torch.randn(pages * pbs, _D, device=device) * 2.0
++    packed = pack_dsv4_reference_cache(kv_f32, pbs)
++    plain = torch.randn(pages, pbs, _D, device=device,
++                        dtype=torch.bfloat16)
++    q = torch.randn(t, h, _D, device=device, dtype=torch.bfloat16)
++    idx = torch.randint(0, pages * pbs, (t, 128),
++                        device=device,
++                        dtype=torch.int32)
++    idx[0, 5] = -1  # index padding
++    lens = torch.tensor([128, 100, 0, 64], device=device, dtype=torch.int32)
++    eidx = torch.randint(0, pages * pbs, (t, 1, 256),
++                         device=device,
++                         dtype=torch.int32)
++    elens = torch.tensor([256, 0, 17, 256],
++                         device=device,
++                         dtype=torch.int32)
++    sinks = torch.full((h,), -float("inf"), device=device)
++    sinks[:8] = torch.randn(8, device=device)
++    kwargs = dict(
++        compressed_kv_cache=packed.view(pages, pbs, 1, _BPT_PACKED),
++        swa_topk_lens=lens,
++        extra_sparse_indices=eidx,
++        extra_sparse_topk_lens=elens,
++        bmm1_scale=_D**-0.5,
++        sinks=sinks,
++        kv_layout="NHD",
++    )
++    got = triton_sparse_mla_dsv4(q, plain.unsqueeze(-2), idx, **kwargs)
++    want = sparse_mla_dsv4_torch_ref(q, plain.unsqueeze(-2), idx, **kwargs)
++    denom = want.to(torch.float32).abs().clamp_min(1e-2)
++    worst_rel = ((got.to(torch.float32) - want.to(torch.float32)).abs() /
++                 denom).max().item()
++    cap = torch.cuda.get_device_capability(device)
++    logger.info(
++        "DSv4 sparse-MLA Triton port self-test on sm_%d%d (%s): "
++        "worst_rel=%.3e vs torch reference (torch %s, triton %s)",
++        cap[0], cap[1], torch.cuda.get_device_name(device), worst_rel,
++        torch.__version__, triton.__version__)
++    if worst_rel > 5e-2:
++        raise RuntimeError(
++            f"DSv4 sparse-MLA Triton port self-test FAILED on this device: "
++            f"worst_rel={worst_rel:.3e} vs torch reference. This is a "
++            f"codegen/driver regression, not a model problem. Set "
++            f"VLLM_DSV4_SPARSE_MLA_SELFTEST=0 only to triage.")
++
++
++def pack_dsv4_reference_cache(kv_rows: torch.Tensor,
++                              pbs: int) -> torch.Tensor:
++    """Encode f32 rows ``[pages*pbs, 512]`` into the packed fp8_ds_mla
++    byte layout (reference writer for tests/self-test; mirrors
++    ``fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu``: per-64-tile
++    power-of-two UE8M0 scales, FP8-E4M3 saturating quant, BF16 rope)."""
++    assert kv_rows.shape[-1] == _D and kv_rows.shape[0] % pbs == 0
++    pages = kv_rows.shape[0] // pbs
++    nope = kv_rows[:, :_D_NOPE].reshape(-1, _NUM_SCALES, _QUANT_TILE)
++    amax = nope.abs().amax(dim=-1).clamp_min(2.0**-126)
++    # Power-of-two scale covering amax/448 (mirror exp2f(ceil(log2)))
++    exponent = torch.ceil(torch.log2(amax / 448.0))
++    scale_byte = (exponent + 127).clamp(0, 254).to(torch.uint8)
++    inv_scale = torch.exp2(-exponent)
++    quant = (nope * inv_scale[..., None]).clamp(-448, 448).to(
++        torch.float8_e4m3fn)
++    rope = kv_rows[:, _D_NOPE:].to(torch.bfloat16)
++
++    # Assemble per-page byte regions, then concatenate: [data | footer].
++    # (Slice-views of the final tensor are non-contiguous; build forward.)
++    quant_u8 = quant.reshape(pages, pbs, _D_NOPE).view(torch.uint8)
++    rope_u8 = rope.reshape(pages, pbs, _D_ROPE).contiguous().view(torch.uint8)
++    data_bytes = torch.cat([quant_u8, rope_u8],
++                           dim=-1).reshape(pages, pbs * _TOKEN_DATA_BYTES)
++    pad = torch.zeros(pages, pbs, 1, dtype=torch.uint8,
++                      device=kv_rows.device)
++    footer_bytes = torch.cat(
++        [scale_byte.reshape(pages, pbs, _NUM_SCALES), pad],
++        dim=-1).reshape(pages, pbs * _SCALE_BYTES)
++    return torch.cat([data_bytes, footer_bytes],
++                     dim=1).view(pages, pbs, _BPT_PACKED)
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 8e01035ae..11f22bfd5 100644
+index 8e01035..11f22bf 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -57,7 +57,10 @@ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
@@ -11829,7 +12984,7 @@ index 8e01035ae..11f22bfd5 100644
          self,
          spec_decoding_stats: SpecDecodingStats | None,
 diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
-index f97f697de..df3827905 100644
+index f97f697..df38279 100644
 --- a/vllm/v1/engine/core.py
 +++ b/vllm/v1/engine/core.py
 @@ -147,6 +147,43 @@ class EngineCore:
@@ -11888,7 +13043,7 @@ index f97f697de..df3827905 100644
          self.check_for_draft_tokens = (
              self.use_spec_decode or vllm_config.model_config.is_diffusion
 diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
-index 323b1e763..f7ce6dbd9 100644
+index 323b1e7..f7ce6db 100644
 --- a/vllm/v1/kv_cache_interface.py
 +++ b/vllm/v1/kv_cache_interface.py
 @@ -378,6 +378,10 @@ class MLAAttentionSpec(FullAttentionSpec):
@@ -11903,7 +13058,7 @@ index 323b1e763..f7ce6dbd9 100644
              if self.model_version == "deepseek_v4":
                  # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.
 diff --git a/vllm/v1/spec_decode/dynamic/utils.py b/vllm/v1/spec_decode/dynamic/utils.py
-index de869b19a..348eaf2e9 100644
+index de869b1..348eaf2 100644
 --- a/vllm/v1/spec_decode/dynamic/utils.py
 +++ b/vllm/v1/spec_decode/dynamic/utils.py
 @@ -1,8 +1,16 @@
@@ -12041,7 +13196,7 @@ index de869b19a..348eaf2e9 100644
 +            vllm_num_speculative_tokens=self._num_spec_tokens,
 +        )
 diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
-index 9b93d1703..7a4b5617e 100644
+index 9b93d17..7a4b561 100644
 --- a/vllm/v1/worker/gpu/cudagraph_utils.py
 +++ b/vllm/v1/worker/gpu/cudagraph_utils.py
 @@ -110,6 +110,13 @@ def get_uniform_token_count(
@@ -12171,7 +13326,7 @@ index 9b93d1703..7a4b5617e 100644
          self.hidden_states: torch.Tensor | None = None
          self.aux_hidden_states: list[torch.Tensor] = []
 diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
-index 64c1096df..1ba367c3a 100644
+index 64c1096..1ba367c 100644
 --- a/vllm/v1/worker/gpu/input_batch.py
 +++ b/vllm/v1/worker/gpu/input_batch.py
 @@ -98,6 +98,10 @@ class InputBatch:
@@ -12237,7 +13392,7 @@ index 64c1096df..1ba367c3a 100644
          # last sampled token in addition to all draft tokens.
          BLOCK_SIZE=triton.next_power_of_2(
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index c74307d0b..f332743ff 100644
+index c74307d..f332743 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
 @@ -48,6 +48,7 @@ from vllm.tasks import SupportedTask
@@ -12550,7 +13705,7 @@ index c74307d0b..f332743ff 100644
  
          # Post-step KV connector related operations.
 diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
-index d5d68a014..cdb909254 100644
+index d5d68a0..cdb9092 100644
 --- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
 +++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
 @@ -135,7 +135,14 @@ class DFlashSpeculator(DraftModelSpeculator):
@@ -12697,7 +13852,7 @@ index d5d68a014..cdb909254 100644
      )
 diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/scheduler.py b/vllm/v1/worker/gpu/spec_decode/dspark/scheduler.py
 new file mode 100644
-index 000000000..28a341755
+index 0000000..28a3417
 --- /dev/null
 +++ b/vllm/v1/worker/gpu/spec_decode/dspark/scheduler.py
 @@ -0,0 +1,373 @@
@@ -13075,7 +14230,7 @@ index 000000000..28a341755
 +    def commit_length(self, length: int) -> None:
 +        self._prev_sched_l = length
 diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
-index 0236017cf..88841d5f4 100644
+index 0236017..88841d5 100644
 --- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
 +++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
 @@ -23,14 +23,17 @@ CUDA graphs (FULL, mirroring DFlash) cover the whole draft step: the parallel
@@ -13257,7 +14412,7 @@ index 0236017cf..88841d5f4 100644
              logits_i = base_logits[:, i] + bias
              if self.draft_logits is not None:
 diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/utils.py b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
-index acc32dafc..b5f2a540a 100644
+index acc32da..b5f2a54 100644
 --- a/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
 +++ b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
 @@ -18,8 +18,20 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
@@ -13282,7 +14437,7 @@ index acc32dafc..b5f2a540a 100644
              vllm_config.attention_config,
              use_non_causal=not causal,
 diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
-index c56252d55..2596a6c3e 100644
+index c56252d..2596a6c 100644
 --- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
 +++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
 @@ -103,12 +103,22 @@ class RejectionSampler:
@@ -13309,7 +14464,7 @@ index c56252d55..2596a6c3e 100644
          processed_logits = self.sampler.apply_sampling_params(
              logits,
 diff --git a/vllm/v1/worker/gpu/spec_decode/utils.py b/vllm/v1/worker/gpu/spec_decode/utils.py
-index e25672e95..830e99a8f 100644
+index e25672e..830e99a 100644
 --- a/vllm/v1/worker/gpu/spec_decode/utils.py
 +++ b/vllm/v1/worker/gpu/spec_decode/utils.py
 @@ -17,35 +17,58 @@ class DraftTokensHandler:
@@ -13383,7 +14538,7 @@ index e25672e95..830e99a8f 100644
              # This case only happens when async scheduling is disabled.
              draft_token_ids = [[-1] * self.num_draft_tokens for _ in self.req_ids]
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index e9b23f1c6..4439e410d 100644
+index e9b23f1..4439e41 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
 @@ -4,6 +4,7 @@
@@ -14411,7 +15566,7 @@ index e9b23f1c6..4439e410d 100644
              or self.speculative_config.uses_extract_hidden_states()
          ):
 diff --git a/vllm/v1/worker/gpu_ubatch_wrapper.py b/vllm/v1/worker/gpu_ubatch_wrapper.py
-index 76fa12b41..bd688d8e8 100644
+index 76fa12b..bd688d8 100644
 --- a/vllm/v1/worker/gpu_ubatch_wrapper.py
 +++ b/vllm/v1/worker/gpu_ubatch_wrapper.py
 @@ -288,6 +288,9 @@ class UBatchWrapper:
@@ -14425,7 +15580,7 @@ index 76fa12b41..bd688d8e8 100644
                  ubatch_metadata[0].context.cpu_wait_event.set()
                  for thread in ubatch_threads:
 diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
-index 03433ed75..f2c618169 100644
+index 03433ed..f2c6181 100644
 --- a/vllm/v1/worker/gpu_worker.py
 +++ b/vllm/v1/worker/gpu_worker.py
 @@ -412,6 +412,29 @@ class Worker(WorkerBase):
