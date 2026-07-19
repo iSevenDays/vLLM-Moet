@@ -146,6 +146,186 @@ index 0000000..df62c57
 +  m.def("concat_and_cache_nvfp4_ds_mla", &concat_and_cache_nvfp4_ds_mla,
 +        "Write MLA KV into the packed nvfp4_ds_mla layout (352 B/token)");
 +}
+diff --git a/tests/kernels/attention/test_triton_paged_mqa_logits_dsv4.py b/tests/kernels/attention/test_triton_paged_mqa_logits_dsv4.py
+new file mode 100644
+index 0000000..652ec9f
+--- /dev/null
++++ b/tests/kernels/attention/test_triton_paged_mqa_logits_dsv4.py
+@@ -0,0 +1,174 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Numerics for the Triton DSv4 paged-MQA-logits port (Ada / pre-SM90 route).
++
++Three tiers, mirroring the sparse-MLA port and how this one was validated
++off-GPU first:
++
++1. torch-reference invariants, CPU-only: causal/length masking, zero-length
++   rows, packed-cache round-trip.
++2. Triton kernel vs. torch reference under ``TRITON_INTERPRET=1`` (CPU, no
++   GPU - runs in CI), including the EXACT boot-time self-test path.
++3. Triton kernel vs. torch reference on CUDA (any arch), the init self-test,
++   and a CUDA-graph capture/replay test — the regression guard for the
++   host-sync bug that crashed decode graph capture on Ada (the old
++   ``int(lens.max().item())`` fallback).
++"""
++
++import os
++
++import pytest
++import torch
++
++from vllm.v1.attention.ops.triton_paged_mqa_logits_dsv4 import (
++    _self_test_case,
++    _worst_row_rel,
++    pack_fp8_indexer_cache_reference,
++    paged_mqa_logits_dsv4_triton,
++    paged_mqa_logits_torch_ref,
++)
++
++_INTERPRET = os.getenv("TRITON_INTERPRET", "0") == "1"
++
++
++def _mk_case(device, *, bsz=4, next_n=2, H=32, D=128, block_size=64,
++             max_model_len=256, seed=0):
++    torch.manual_seed(seed)
++    max_blocks = -(-max_model_len // block_size)
++    num_blocks = max_blocks * bsz + 3
++    kv_rows = torch.randn(num_blocks * block_size, D, device=device,
++                          dtype=torch.float32) * 2.0
++    kv_cache = pack_fp8_indexer_cache_reference(kv_rows, block_size)
++    q = (torch.randn(bsz, next_n, H, D, device=device, dtype=torch.float32)
++         ).clamp(-448, 448).to(torch.float8_e4m3fn)
++    weights = torch.randn(bsz * next_n, H, device=device, dtype=torch.float32)
++    # per-request context lengths spanning zero, sub-block, and full
++    base = torch.tensor([0, 65, 200, max_model_len][:bsz], device=device,
++                        dtype=torch.int32)
++    if bsz > 4:
++        base = torch.randint(0, max_model_len + 1, (bsz,), device=device,
++                             dtype=torch.int32)
++    context_lens = base[:, None].repeat(1, next_n).to(torch.int32)
++    block_tables = torch.zeros(bsz, max_blocks, device=device,
++                               dtype=torch.int32)
++    for b in range(bsz):
++        perm = torch.randperm(num_blocks, device=device).to(torch.int32)
++        block_tables[b] = perm[:max_blocks]
++    return dict(q_values=q, kv_cache=kv_cache, weights=weights,
++                context_lens=context_lens, block_tables=block_tables,
++                max_model_len=max_model_len)
++
++
++# ------------------------- Tier 1: CPU invariants -------------------------
++
++def test_pack_roundtrip_cpu():
++    torch.manual_seed(0)
++    D, block_size, num_blocks = 128, 64, 3
++    rows = torch.randn(num_blocks * block_size, D) * 3.0
++    cache = pack_fp8_indexer_cache_reference(rows, block_size)
++    assert cache.shape == (num_blocks, block_size, 1, D + 4)
++    assert cache.dtype == torch.uint8
++    kv = cache.reshape(num_blocks, block_size, D + 4).reshape(-1, D + 4)
++    deq = (kv[:, :D].view(torch.float8_e4m3fn).float()
++           * kv[:, D:].contiguous().view(torch.float32).view(-1, 1))
++    # per-token scale ~ amax/448 -> relative error bounded by FP8-E4M3 step
++    rel = (deq - rows).abs() / rows.abs().clamp_min(1e-3)
++    assert rel.median().item() < 0.1
++
++
++def test_ref_zero_length_row_is_all_neg_inf_cpu():
++    kw = _mk_case(torch.device("cpu"))
++    kw["context_lens"] = torch.zeros_like(kw["context_lens"])
++    out = paged_mqa_logits_torch_ref(**kw)
++    assert torch.isneginf(out).all()
++
++
++def test_ref_causal_and_length_mask_cpu():
++    kw = _mk_case(torch.device("cpu"), bsz=2, next_n=3, max_model_len=128)
++    out = paged_mqa_logits_torch_ref(**kw)
++    ctx = kw["context_lens"]
++    next_n = kw["q_values"].shape[1]
++    for b in range(ctx.shape[0]):
++        for j in range(next_n):
++            r = b * next_n + j
++            bound = int(ctx[b, j])  # exclusive causal length for this row
++            finite = torch.isfinite(out[r])
++            if bound <= 0:
++                assert not finite.any()
++            else:
++                assert finite[:bound].all()
++                assert not finite[bound:].any()
++
++
++# --------------- Tier 2: interpreter kernel vs reference (CPU) -------------
++
++_GRID = [
++    dict(),
++    dict(next_n=1, H=64, D=128, block_size=64),
++    dict(next_n=3, H=16, D=64, block_size=32, max_model_len=128),
++    dict(bsz=6, next_n=1, H=32, max_model_len=512, seed=7),
++]
++
++
++@pytest.mark.skipif(not _INTERPRET,
++                    reason="set TRITON_INTERPRET=1 for the CPU tier")
++@pytest.mark.parametrize("case_kw", _GRID)
++def test_kernel_matches_ref_interpreter(case_kw):
++    kw = _mk_case(torch.device("cpu"), **case_kw)
++    got = paged_mqa_logits_dsv4_triton(**kw)
++    want = paged_mqa_logits_torch_ref(**kw)
++    assert _worst_row_rel(got, want) < 3e-2
++
++
++@pytest.mark.skipif(not _INTERPRET,
++                    reason="set TRITON_INTERPRET=1 for the CPU tier")
++def test_boot_self_test_case_runs_on_cpu():
++    """Run the EXACT boot self-test path on CPU under the loader's bf16
++    ambient (the sibling port took two boot hits from this untested path:
++    positional-arg drift and default-dtype sensitivity)."""
++    old = torch.get_default_dtype()
++    torch.set_default_dtype(torch.bfloat16)
++    try:
++        assert _self_test_case(torch.device("cpu")) < 3e-2
++    finally:
++        torch.set_default_dtype(old)
++
++
++# ----------------------------- Tier 3: CUDA -------------------------------
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
++@pytest.mark.parametrize("case_kw", _GRID)
++def test_kernel_matches_ref_cuda(case_kw):
++    kw = _mk_case(torch.device("cuda"), **case_kw)
++    got = paged_mqa_logits_dsv4_triton(**kw)
++    want = paged_mqa_logits_torch_ref(**kw)
++    assert _worst_row_rel(got, want) < 3e-2
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
++def test_self_test_passes_on_this_device():
++    from vllm.v1.attention.ops.triton_paged_mqa_logits_dsv4 import (
++        dsv4_paged_mqa_logits_self_test)
++    dsv4_paged_mqa_logits_self_test.cache_clear()
++    dsv4_paged_mqa_logits_self_test()
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
++def test_cuda_graph_capturable():
++    """Decode routes this op through CUDA-graph capture on the serving box;
++    it must not sync with the host. This is the exact regression guard for
++    the crash the port fixes."""
++    device = torch.device("cuda")
++    kw = _mk_case(device)
++    s = torch.cuda.Stream()
++    s.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(s):
++        paged_mqa_logits_dsv4_triton(**kw)
++    torch.cuda.current_stream().wait_stream(s)
++    g = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(g):
++        out = paged_mqa_logits_dsv4_triton(**kw)
++    g.replay()
++    torch.cuda.synchronize()
++    want = paged_mqa_logits_torch_ref(**kw)
++    assert _worst_row_rel(out, want) < 3e-2
 diff --git a/tests/v1/attention/test_triton_sparse_mla_dsv4.py b/tests/v1/attention/test_triton_sparse_mla_dsv4.py
 new file mode 100644
 index 0000000..c4a144a
@@ -9522,7 +9702,7 @@ index b667b87..97824f4 100644
      )
      return fp8_buf, scale_buf
 diff --git a/vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py b/vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py
-index 1848c19..11e64ee 100644
+index 1848c19..ca878df 100644
 --- a/vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py
 +++ b/vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py
 @@ -98,7 +98,16 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4FlashMLABackend):
@@ -9615,7 +9795,7 @@ index 1848c19..11e64ee 100644
  
      backend_cls = DeepseekV4FlashInferMLASparseBackend
      use_fp8_ds_mla_layout: ClassVar[bool] = True
-@@ -576,13 +611,27 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
+@@ -576,13 +611,34 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
  
      def __init__(self, *args, **kwargs) -> None:
          super().__init__(*args, **kwargs)
@@ -9631,8 +9811,15 @@ index 1848c19..11e64ee 100644
 +            # corrupt outputs at the first request.
 +            from vllm.v1.attention.ops.triton_sparse_mla_dsv4 import (
 +                dsv4_sparse_mla_self_test)
++            from vllm.v1.attention.ops.triton_paged_mqa_logits_dsv4 import (
++                dsv4_paged_mqa_logits_self_test)
 +
 +            dsv4_sparse_mla_self_test()
++            # The DSA lightning-indexer's paged MQA logits also route to a
++            # Triton port here (DeepGEMM has no pre-SM90 kernel). Validate it
++            # against the torch reference on this silicon ONCE, before any
++            # graph capture; on mismatch the op keeps the torch reference.
++            dsv4_paged_mqa_logits_self_test()
 +        else:
 +            from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
  
@@ -9761,10 +9948,10 @@ index 18e3b10..d536692 100644
  
  
 diff --git a/vllm/utils/deep_gemm.py b/vllm/utils/deep_gemm.py
-index 0a1644b..ed40509 100644
+index 0a1644b..296bc79 100644
 --- a/vllm/utils/deep_gemm.py
 +++ b/vllm/utils/deep_gemm.py
-@@ -453,7 +453,204 @@ def fp8_gemm_nt(*args, **kwargs):
+@@ -453,7 +453,211 @@ def fp8_gemm_nt(*args, **kwargs):
      return _fp8_gemm_nt_impl(*args, disable_ue8m0_cast=not use_ue8m0, **kwargs)
  
  
@@ -9935,31 +10122,38 @@ index 0a1644b..ed40509 100644
 +        f"context_lens{tuple(context_lens.shape)} "
 +        f"block_tables{tuple(block_tables.shape)} mml={max_model_len}")
 +    dev = qv.device
++    num_blocks = kv_cache.shape[0]
 +    if context_lens.ndim == 2:
 +        lens2d = context_lens.to(dev)
 +    else:
 +        offs = torch.arange(next_n, device=dev, dtype=torch.int32)
 +        lens2d = context_lens.to(dev)[:, None] - (next_n - 1 - offs)[None, :]
++    # Capture-safe: no host sync, no data-dependent shapes/branches. Gather a
++    # STATIC number of blocks (block_tables.shape[1]); padding slots are
++    # clamped in-bounds and masked out, so the result is identical to the old
++    # dynamic-slice version but the op graph is value-independent — required
++    # inside CUDA-graph capture. The old int(lens2d[b].max().item()) synced
++    # the host and crashed decode graph capture on Ada (2026-07-19).
++    lens2d = lens2d.clamp(min=0)
++    max_nblk = block_tables.shape[1]
++    width = max_nblk * block_size
++    w_cols = min(width, max_model_len)
 +    logits = torch.full((bsz * next_n, max_model_len), float("-inf"),
 +                        dtype=torch.float32, device=dev)
 +    wf = weights.float()
++    pos = torch.arange(width, device=dev)
 +    for b in range(bsz):
-+        ctx_max = int(lens2d[b].max().item())
-+        if ctx_max <= 0:
-+            continue
-+        nblk = -(-ctx_max // block_size)
-+        blocks = block_tables[b, :nblk].long()
-+        kb = kv_cache[blocks].reshape(nblk * block_size, d + 4)
++        blocks = block_tables[b].long().clamp_(0, num_blocks - 1)
++        kb = kv_cache[blocks].reshape(width, d + 4)
 +        kf = (kb[:, :d].view(torch.float8_e4m3fn).float()
 +              * kb[:, d:].contiguous().view(torch.float32).view(-1, 1))
 +        qf = qv[b].float()                                # [next_n, H, D]
 +        s = torch.einsum("jhd,sd->jhs", qf, kf)
 +        w_b = wf[b * next_n:(b + 1) * next_n]             # [next_n, H]
-+        row = (torch.relu(s) * w_b[:, :, None]).sum(1)    # [next_n, S]
-+        pos = torch.arange(nblk * block_size, device=dev)
++        row = (torch.relu(s) * w_b[:, :, None]).sum(1)    # [next_n, width]
 +        row = row.masked_fill(pos[None, :] >= lens2d[b][:, None],
 +                              float("-inf"))
-+        logits[b * next_n:(b + 1) * next_n, :nblk * block_size] = row
++        logits[b * next_n:(b + 1) * next_n, :w_cols] = row[:, :w_cols]
 +    return logits
 +
 +
@@ -9969,7 +10163,7 @@ index 0a1644b..ed40509 100644
      _lazy_init()
      if _fp8_einsum_impl is None:
          return _missing(*args, **kwargs)
-@@ -528,6 +725,9 @@ def fp8_fp4_mqa_logits(
+@@ -528,6 +732,9 @@ def fp8_fp4_mqa_logits(
      Returns:
          Logits tensor of shape [M, N], dtype `torch.float32`.
      """
@@ -9979,7 +10173,7 @@ index 0a1644b..ed40509 100644
      _lazy_init()
      if _fp8_fp4_mqa_logits_impl is None:
          return _missing()
-@@ -556,6 +756,11 @@ def get_paged_mqa_logits_metadata(
+@@ -556,6 +763,11 @@ def get_paged_mqa_logits_metadata(
          Backend-specific tensor consumed by `fp8_fp4_paged_mqa_logits` to
          schedule work across SMs.
      """
@@ -9991,11 +10185,25 @@ index 0a1644b..ed40509 100644
      _lazy_init()
      if _get_paged_mqa_logits_metadata_impl is None:
          return _missing()
-@@ -600,6 +805,11 @@ def fp8_fp4_paged_mqa_logits(
+@@ -600,6 +812,25 @@ def fp8_fp4_paged_mqa_logits(
          Logits tensor of shape [B * next_n, max_model_len], dtype
          `torch.float32`.
      """
 +    if _use_torch_fallback():
++        # FP8 indexer path: prefer the performant, capture-safe Triton port
++        # (self-test-gated; maybe_* returns None until validated on this
++        # silicon at layer init). Fall through to the capture-safe torch
++        # reference otherwise. Both avoid the host sync that crashed
++        # DeepGEMM's absent-kernel path inside decode graph capture.
++        qv, qs = q
++        if qs is None:
++            from vllm.v1.attention.ops.triton_paged_mqa_logits_dsv4 import (
++                maybe_paged_mqa_logits_dsv4)
++            out = maybe_paged_mqa_logits_dsv4(qv, kv_cache, weights,
++                                              context_lens, block_tables,
++                                              max_model_len)
++            if out is not None:
++                return out
 +        return _torch_fp8_paged_mqa_logits(q, kv_cache, weights,
 +                                           context_lens, block_tables,
 +                                           schedule_metadata,
@@ -12189,6 +12397,465 @@ index 6aec1db..4359cb3 100644
  
      _fwd_grouped_kernel_stage1[grid](
          q,
+diff --git a/vllm/v1/attention/ops/triton_paged_mqa_logits_dsv4.py b/vllm/v1/attention/ops/triton_paged_mqa_logits_dsv4.py
+new file mode 100644
+index 0000000..a1e3b04
+--- /dev/null
++++ b/vllm/v1/attention/ops/triton_paged_mqa_logits_dsv4.py
+@@ -0,0 +1,453 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Triton port of DeepGEMM's ``fp8_paged_mqa_logits`` (DSv4 lightning indexer).
++
++The DSA "lightning indexer" scores every cached context token against the
++decode query and the top-k of those scores select the sparse-attention
++candidate set. On Hopper/Blackwell vLLM computes the paged variant with
++DeepGEMM's ``fp8_paged_mqa_logits``; DeepGEMM has no pre-SM90 kernel, so on
++Ada (sm_89) ``vllm/utils/deep_gemm.py`` fell back to a dequantized torch
++reference.
++
++That reference was correct but **not CUDA-graph-capturable**: it read a
++data-dependent context bound to the host (``int(lens[b].max().item())``)
++to size a dynamic slice. With ``VLLM_USE_BREAKABLE_CUDAGRAPH`` the indexer
++runs inside decode graph capture, where any host sync is illegal — the
++engine died at ``profile_cudagraph_memory`` with
++``cudaErrorStreamCaptureUnsupported`` (field-hit on the 4090, 2026-07-19,
++AFTER ~10 min of weight load). The sibling sparse-MLA attention core had
++already been made capture-safe; this indexer op is its sibling on the same
++attention path and had been missed.
++
++This module is the performant, capture-safe replacement:
++
++* a Triton kernel (``_paged_mqa_logits_kernel``) that computes the logits
++  directly from the paged FP8 indexer cache — no dequantize-to-a-temp, no
++  host sync, static launch geometry, lengths consumed on-device;
++* a pure-torch reference (``paged_mqa_logits_torch_ref``) — the capture-safe
++  rewrite of the old fallback, semantics identical to DeepGEMM's and to the
++  upstream reference ``_ref_fp8_fp4_paged_mqa_logits`` in
++  ``tests/kernels/attention/test_deepgemm_attention.py``; it is the
++  self-test oracle and the automatic degrade target;
++* a reference cache packer, an on-device init self-test, and a module build
++  id — mirroring ``triton_sparse_mla_dsv4.py``.
++
++Semantics (FP8 indexer path; ``q_scale`` folded into ``weights``):
++
++    logits[b*next_n + j, s] = sum_h relu(q[b,j,h,:] . k_deq[s,:]) * w[r,h]
++
++for candidate token ``s`` up to the causal bound of draft row ``j``
++(``s <= context_len[b] - next_n + j``), ``-inf`` elsewhere. ``k_deq`` is the
++paged FP8-E4M3 cache row times its per-token f32 scale.
++
++FP8 indexer cache layout (``[num_blocks, block_size, 1, D+4]`` uint8): the
++first ``D`` bytes are FP8-E4M3 values, the last 4 bytes are the little-endian
++f32 dequant scale for that (block, position).
++
++Safety model: the kernel is used ONLY after ``dsv4_paged_mqa_logits_self_test``
++has validated it against the torch reference on the actual silicon (run once
++at attention-layer init, BEFORE any capture). If the self-test does not run,
++or fails, or Triton is unavailable, the op transparently uses the torch
++reference (correct, capture-safe, slower). This keeps a boot correct even
++where the kernel has never been proven.
++
++Env knobs (read lazily):
++
++* ``VLLM_DSV4_PAGED_MQA_LOGITS_FORCE_TORCH=1`` — never use the kernel; always
++  the torch reference (triage / A-B oracle).
++* ``VLLM_DSV4_PAGED_MQA_LOGITS_SELFTEST=0`` — skip the init self-test (the
++  kernel then stays disabled, torch reference is used).
++"""
++
++import functools
++import os
++
++import torch
++
++from vllm.logger import init_logger
++from vllm.triton_utils import HAS_TRITON, tl, triton
++
++logger = init_logger(__name__)
++
++# Finite value never used as a sentinel here (the indexer wants true -inf for
++# masked candidates so top-k excludes them); kept only for documentation
++# parity with the sparse-MLA port.
++_NEG_INF = float("-inf")
++
++_IS_INTERPRET = os.getenv("TRITON_INTERPRET", "0") == "1"
++
++# Set True by the on-device self-test once the kernel matches the reference on
++# this silicon. Until then the op uses the torch reference.
++_KERNEL_TRUSTED = False
++
++
++def _force_torch() -> bool:
++    return os.getenv("VLLM_DSV4_PAGED_MQA_LOGITS_FORCE_TORCH", "0") in (
++        "1", "true", "yes", "on")
++
++
++@functools.cache
++def _module_build_id() -> str:
++    """Short content hash of THIS file, logged by the self-test. 'Which
++    build produced this log' burned a deploy cycle on the sibling port."""
++    import hashlib
++    with open(__file__, "rb") as f:
++        return hashlib.sha256(f.read()).hexdigest()[:12]
++
++
++@triton.jit
++def _decode_fp8_e4m3(b):
++    """FP8-E4M3 byte (uint32 lane) -> f32, integer math.
++
++    Portable to the Triton interpreter (numpy) so the CPU tier can run the
++    kernel. The producers saturate to +/-448, so the NaN encodings 0x7F /
++    0xFF never occur and are not handled."""
++    sign = (b >> 7) & 1
++    expo = ((b >> 3) & 0xF).to(tl.float32)
++    mant = (b & 0x7).to(tl.float32)
++    mag = tl.where(
++        expo == 0.0,
++        mant * 0.001953125,               # subnormal: mant/8 * 2^-6
++        tl.exp2(expo - 7.0) * (1.0 + mant * 0.125),
++    )
++    return tl.where(sign == 1, -mag, mag)
++
++
++@triton.jit
++def _paged_mqa_logits_kernel(
++    q_ptr,          # uint8 view of FP8 q, [num_rows, H, D]
++    kv_ptr,         # uint8 [num_blocks, block_size, D+4]
++    w_ptr,          # f32 [num_rows, H]
++    bt_ptr,         # int32 [B, max_blocks]
++    len_ptr,        # int32 [num_rows] per-row causal length (clamped >=0)
++    out_ptr,        # f32 [num_rows, max_model_len]
++    next_n,
++    num_blocks,
++    max_model_len,
++    H,
++    stride_q_row,
++    stride_q_h,
++    stride_kv_blk,
++    stride_kv_pos,
++    stride_w_row,
++    stride_bt_b,
++    stride_out_row,
++    D: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_SIZE: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++    DOT_BF16: tl.constexpr,
++):
++    r = tl.program_id(0)        # output row = b * next_n + j
++    blk = tl.program_id(1)      # logical block index into block_tables
++    b = r // next_n
++
++    n_offs = tl.arange(0, BLOCK_N)
++    n_ok = n_offs < BLOCK_SIZE
++    d_offs = tl.arange(0, D)
++
++    # physical page; clamp padding/invalid table slots in-bounds (their
++    # candidates are length-masked out below, so the value is irrelevant).
++    phys = tl.load(bt_ptr + b * stride_bt_b + blk)
++    phys = tl.where((phys >= 0) & (phys < num_blocks), phys, 0).to(tl.int64)
++
++    # Dequantize the K tile: FP8-E4M3 bytes * per-token f32 scale.
++    base = phys * stride_kv_blk + n_offs[:, None] * stride_kv_pos
++    kb = tl.load(kv_ptr + base + d_offs[None, :], mask=n_ok[:, None],
++                 other=0).to(tl.uint32)
++    k = _decode_fp8_e4m3(kb)                                # [BLOCK_N, D]
++    s_base = phys * stride_kv_blk + n_offs * stride_kv_pos + D
++    c0 = tl.load(kv_ptr + s_base + 0, mask=n_ok, other=0).to(tl.uint32)
++    c1 = tl.load(kv_ptr + s_base + 1, mask=n_ok, other=0).to(tl.uint32)
++    c2 = tl.load(kv_ptr + s_base + 2, mask=n_ok, other=0).to(tl.uint32)
++    c3 = tl.load(kv_ptr + s_base + 3, mask=n_ok, other=0).to(tl.uint32)
++    scale = ((c3 << 24) | (c2 << 16) | (c1 << 8) | c0).to(
++        tl.float32, bitcast=True)                           # [BLOCK_N]
++    k = k * scale[:, None]
++    if DOT_BF16:
++        k = k.to(tl.bfloat16)
++
++    # sum_h relu(q_h . k_n) * w_h, tiled over heads.
++    acc = tl.zeros([BLOCK_N], tl.float32)
++    for h0 in range(0, H, BLOCK_H):
++        h_offs = h0 + tl.arange(0, BLOCK_H)
++        h_ok = h_offs < H
++        qb = tl.load(
++            q_ptr + r * stride_q_row + h_offs[:, None] * stride_q_h
++            + d_offs[None, :], mask=h_ok[:, None], other=0).to(tl.uint32)
++        q = _decode_fp8_e4m3(qb)                            # [BLOCK_H, D]
++        w = tl.load(w_ptr + r * stride_w_row + h_offs, mask=h_ok, other=0.0)
++        if DOT_BF16:
++            s = tl.dot(q.to(tl.bfloat16), tl.trans(k))
++        else:
++            s = tl.dot(q, tl.trans(k))                      # [BLOCK_H, N]
++        s = tl.maximum(s, 0.0) * w[:, None]
++        s = tl.where(h_ok[:, None], s, 0.0)
++        acc += tl.sum(s, axis=0)
++
++    length = tl.load(len_ptr + r)
++    n_pos = blk * BLOCK_SIZE + n_offs
++    valid = n_ok & (n_pos < length) & (n_pos < max_model_len)
++    out = tl.where(valid, acc, float("-inf"))
++    tl.store(out_ptr + r * stride_out_row + n_pos, out,
++             mask=n_pos < max_model_len)
++
++
++def _per_row_lengths(context_lens: torch.Tensor, next_n: int,
++                     bsz: int) -> torch.Tensor:
++    """Per-(request, draft-row) causal length, capture-safe (no host sync).
++
++    Row ``j`` of request ``b`` attends to tokens ``s <= context_len - next_n
++    + j``; the equivalent exclusive length is ``context_len - next_n + 1 +
++    j`` (== ``context_lens[b, j]`` when a 2-D per-row length is supplied).
++    """
++    dev = context_lens.device
++    if context_lens.ndim == 2:
++        lens2d = context_lens
++    else:
++        offs = torch.arange(next_n, device=dev, dtype=torch.int32)
++        lens2d = context_lens[:, None] - (next_n - 1 - offs)[None, :]
++    return lens2d.reshape(bsz * next_n).clamp_(min=0).to(torch.int32).contiguous()
++
++
++def paged_mqa_logits_dsv4_triton(
++    q_values: torch.Tensor,
++    kv_cache: torch.Tensor,
++    weights: torch.Tensor,
++    context_lens: torch.Tensor,
++    block_tables: torch.Tensor,
++    max_model_len: int,
++) -> torch.Tensor:
++    """Capture-safe Triton paged MQA logits (FP8 indexer path).
++
++    q_values: FP8-E4M3 ``[B, next_n, H, D]`` (per-token q scale folded into
++    ``weights``). kv_cache: uint8 ``[num_blocks, block_size, 1, D+4]``.
++    weights: f32 ``[B*next_n, H]``. context_lens: int32 ``[B]`` or
++    ``[B, next_n]``. block_tables: int32 ``[B, max_blocks]``. Returns f32
++    ``[B*next_n, max_model_len]``.
++
++    No host synchronization, no data-dependent shapes.
++    """
++    assert q_values.dtype == torch.float8_e4m3fn, q_values.dtype
++    assert kv_cache.dtype == torch.uint8, kv_cache.dtype
++    bsz, next_n, H, D = q_values.shape
++    num_blocks, block_size = kv_cache.shape[0], kv_cache.shape[1]
++    dev = q_values.device
++    num_rows = bsz * next_n
++
++    q_u8 = q_values.contiguous().view(torch.uint8)              # [B,next_n,H,D]
++    q_u8 = q_u8.view(num_rows, H, D)
++    kv = kv_cache.reshape(num_blocks, block_size, D + 4)
++    w = weights.contiguous()
++    bt = block_tables.contiguous()
++    lens_row = _per_row_lengths(context_lens.to(dev), next_n, bsz)
++    out = torch.full((num_rows, max_model_len), float("-inf"),
++                     dtype=torch.float32, device=dev)
++
++    logger.info_once(
++        "DSv4 paged-MQA-logits Triton port geometry: q%s %s kv_cache%s %s "
++        "weights%s ctx_lens%s block_tables%s mml=%d (module build %s)",
++        tuple(q_values.shape), q_values.dtype, tuple(kv_cache.shape),
++        kv_cache.dtype, tuple(weights.shape), tuple(context_lens.shape),
++        tuple(block_tables.shape), max_model_len, _module_build_id())
++
++    if num_rows == 0:
++        return out
++    max_blocks = bt.shape[1]
++    block_h = 32 if H >= 32 else 16
++    grid = (num_rows, max_blocks)
++    _paged_mqa_logits_kernel[grid](
++        q_u8, kv, w, bt, lens_row, out,
++        next_n, num_blocks, max_model_len, H,
++        q_u8.stride(0), q_u8.stride(1),
++        kv.stride(0), kv.stride(1),
++        w.stride(0),
++        bt.stride(0),
++        out.stride(0),
++        D=D,
++        BLOCK_N=triton.next_power_of_2(block_size),
++        BLOCK_SIZE=block_size,
++        BLOCK_H=block_h,
++        # interpreter (numpy) cannot emulate bf16 dot -> f32 there; GPU build
++        # uses bf16 operands (fp8 MMA parity + smem headroom).
++        DOT_BF16=not _IS_INTERPRET,
++        num_warps=4,
++        num_stages=1,
++    )
++    return out
++
++
++def paged_mqa_logits_torch_ref(
++    q_values: torch.Tensor,
++    kv_cache: torch.Tensor,
++    weights: torch.Tensor,
++    context_lens: torch.Tensor,
++    block_tables: torch.Tensor,
++    max_model_len: int,
++) -> torch.Tensor:
++    """Pure-torch reference; capture-safe; the self-test oracle and the
++    automatic degrade target. Semantics identical to DeepGEMM's op and to
++    ``_ref_fp8_fp4_paged_mqa_logits`` (upstream diff gate 1e-3)."""
++    qv = q_values
++    bsz, next_n, H, d = qv.shape
++    num_blocks, block_size = kv_cache.shape[0], kv_cache.shape[1]
++    dev = qv.device
++    if context_lens.ndim == 2:
++        lens2d = context_lens.to(dev)
++    else:
++        offs = torch.arange(next_n, device=dev, dtype=torch.int32)
++        lens2d = context_lens.to(dev)[:, None] - (next_n - 1 - offs)[None, :]
++    lens2d = lens2d.clamp(min=0)
++    kv = kv_cache.reshape(num_blocks, block_size, d + 4)
++    max_nblk = block_tables.shape[1]
++    width = max_nblk * block_size
++    w_cols = min(width, max_model_len)
++    logits = torch.full((bsz * next_n, max_model_len), float("-inf"),
++                        dtype=torch.float32, device=dev)
++    wf = weights.float()
++    pos = torch.arange(width, device=dev)
++    for b in range(bsz):
++        blocks = block_tables[b].long().clamp_(0, num_blocks - 1)
++        kb = kv[blocks].reshape(width, d + 4)
++        kf = (kb[:, :d].view(torch.float8_e4m3fn).float()
++              * kb[:, d:].contiguous().view(torch.float32).view(-1, 1))
++        qf = qv[b].float()                                   # [next_n, H, d]
++        s = torch.einsum("jhd,sd->jhs", qf, kf)
++        w_b = wf[b * next_n:(b + 1) * next_n]                # [next_n, H]
++        row = (torch.relu(s) * w_b[:, :, None]).sum(1)       # [next_n, width]
++        row = row.masked_fill(pos[None, :] >= lens2d[b][:, None],
++                              float("-inf"))
++        logits[b * next_n:(b + 1) * next_n, :w_cols] = row[:, :w_cols]
++    return logits
++
++
++def pack_fp8_indexer_cache_reference(kv_rows: torch.Tensor,
++                                     block_size: int) -> torch.Tensor:
++    """Encode f32 rows ``[num_blocks*block_size, D]`` into the FP8 indexer
++    cache byte layout ``[num_blocks, block_size, 1, D+4]`` uint8 (per-token
++    f32 scale in the trailing 4 bytes). Reference writer for the self-test
++    and tests; saturating FP8-E4M3 so the kernel's integer decode is exact."""
++    n, d = kv_rows.shape
++    assert n % block_size == 0
++    num_blocks = n // block_size
++    amax = kv_rows.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
++    scale = (amax / 448.0).to(torch.float32)                 # per-token f32
++    quant = (kv_rows / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
++    qb = quant.view(torch.uint8)                             # [n, d]
++    sb = scale.contiguous().view(torch.uint8).reshape(n, 4)  # [n, 4]
++    row_bytes = torch.cat([qb, sb], dim=-1)                  # [n, d+4]
++    return row_bytes.reshape(num_blocks, block_size, 1, d + 4).contiguous()
++
++
++def _worst_row_rel(got: torch.Tensor, want: torch.Tensor) -> float:
++    """Worst per-row error relative to the row's magnitude, over the finite
++    (unmasked) region. The kernel rounds q,k to bf16 before the dot while the
++    reference uses f32, so near-zero logits carry ~1e-3 absolute noise; a
++    row-relative metric (floor 1.0) scores that as ~1e-3 while a wrong decode
++    / mask / index scores O(1). Masked positions must be -inf in both."""
++    got = got.float()
++    want = want.float()
++    fin = torch.isfinite(want)
++    if not bool(fin.any()):
++        return 0.0
++    row_ref = torch.where(fin, want.abs(), torch.zeros_like(want)) \
++        .amax(dim=-1, keepdim=True).clamp_min(1.0)
++    err = torch.where(fin, (got - want).abs() / row_ref,
++                      torch.zeros_like(want))
++    mask_mismatch = (torch.isfinite(got) != fin)
++    penalty = 1.0e30 if bool(mask_mismatch.any()) else 0.0
++    return max(err.max().item(), penalty)
++
++
++def _self_test_case(device: torch.device) -> float:
++    """Build and run the canonical self-test; return worst_row_rel.
++
++    Keyword-only kernel/ref invocation and explicit dtypes throughout (the
++    two field-hits the sibling port took at boot: positional drift and the
++    loader's bf16 default-dtype ambient). Covers packed cache, next_n>1,
++    len-0 rows, partial final block, and padded block-table slots."""
++    torch.manual_seed(0)
++    num_blocks, block_size, bsz, next_n, H, D = 8, 64, 4, 2, 32, 128
++    max_model_len = 256
++    kv_rows = torch.randn(num_blocks * block_size, D, device=device,
++                          dtype=torch.float32) * 2.0
++    kv_cache = pack_fp8_indexer_cache_reference(kv_rows, block_size)
++    q = (torch.randn(bsz, next_n, H, D, device=device, dtype=torch.float32)
++         ).clamp(-448, 448).to(torch.float8_e4m3fn)
++    weights = torch.randn(bsz * next_n, H, device=device, dtype=torch.float32)
++    context_lens = torch.tensor([[200, 201], [0, 1], [64, 65], [255, 256]],
++                                device=device, dtype=torch.int32)
++    max_blocks = -(-max_model_len // block_size)
++    block_tables = torch.zeros(bsz, max_blocks, device=device,
++                               dtype=torch.int32)
++    perm = torch.randperm(num_blocks, device=device).to(torch.int32)
++    for b in range(bsz):
++        need = min(max_blocks, num_blocks)
++        block_tables[b, :need] = perm[:need]
++    kwargs = dict(q_values=q, kv_cache=kv_cache, weights=weights,
++                  context_lens=context_lens, block_tables=block_tables,
++                  max_model_len=max_model_len)
++    got = paged_mqa_logits_dsv4_triton(**kwargs)
++    want = paged_mqa_logits_torch_ref(**kwargs)
++    return _worst_row_rel(got, want)
++
++
++@functools.cache
++def dsv4_paged_mqa_logits_self_test() -> None:
++    """One-shot on-device self-test; enables the kernel iff it matches the
++    torch reference on this silicon. Runs at attention-layer init (before any
++    graph capture). On failure the op keeps using the torch reference — a
++    codegen/driver regression degrades performance, never correctness."""
++    global _KERNEL_TRUSTED
++    if _force_torch():
++        logger.warning_once(
++            "DSv4 paged-MQA-logits: VLLM_DSV4_PAGED_MQA_LOGITS_FORCE_TORCH=1 "
++            "- using the torch reference, kernel disabled")
++        return
++    if os.getenv("VLLM_DSV4_PAGED_MQA_LOGITS_SELFTEST", "1") in (
++            "0", "false", "no", "off"):
++        logger.warning_once(
++            "DSv4 paged-MQA-logits self-test SKIPPED - kernel stays disabled, "
++            "torch reference in use (VLLM_DSV4_PAGED_MQA_LOGITS_SELFTEST=0)")
++        return
++    if not (HAS_TRITON and torch.cuda.is_available()):
++        return
++    device = torch.device("cuda", torch.cuda.current_device())
++    worst = _self_test_case(device)
++    cap = torch.cuda.get_device_capability(device)
++    if worst <= 3e-2:
++        _KERNEL_TRUSTED = True
++        logger.info(
++            "DSv4 paged-MQA-logits Triton port self-test on sm_%d%d (%s): "
++            "worst_row_rel=%.3e vs torch reference - kernel ENABLED "
++            "(module build %s, torch %s, triton %s)",
++            cap[0], cap[1], torch.cuda.get_device_name(device), worst,
++            _module_build_id(), torch.__version__, triton.__version__)
++    else:
++        _KERNEL_TRUSTED = False
++        logger.error(
++            "DSv4 paged-MQA-logits Triton port self-test FAILED on sm_%d%d: "
++            "worst_row_rel=%.3e vs torch reference (threshold 3e-2) - keeping "
++            "the torch reference fallback (correct, slower). This is a "
++            "codegen/driver mismatch; module build %s, torch %s, triton %s.",
++            cap[0], cap[1], worst, _module_build_id(), torch.__version__,
++            triton.__version__)
++
++
++def maybe_paged_mqa_logits_dsv4(
++    q_values: torch.Tensor,
++    kv_cache: torch.Tensor,
++    weights: torch.Tensor,
++    context_lens: torch.Tensor,
++    block_tables: torch.Tensor,
++    max_model_len: int,
++) -> torch.Tensor | None:
++    """Return kernel logits iff the kernel has been trusted by the on-device
++    self-test (and Triton is present and it isn't force-disabled); otherwise
++    None so the caller uses the capture-safe torch reference. Performs no
++    self-test and no host sync — safe to call inside CUDA-graph capture."""
++    if not (_KERNEL_TRUSTED and HAS_TRITON and not _force_torch()):
++        return None
++    return paged_mqa_logits_dsv4_triton(q_values, kv_cache, weights,
++                                        context_lens, block_tables,
++                                        max_model_len)
 diff --git a/vllm/v1/attention/ops/triton_sparse_mla_dsv4.py b/vllm/v1/attention/ops/triton_sparse_mla_dsv4.py
 new file mode 100644
 index 0000000..9de723a
