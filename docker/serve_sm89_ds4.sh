@@ -99,7 +99,7 @@ fi
 # makes the quant cache invalid. The engine then does a new quantization.
 if [ "$RESIDENCY" = gpu ]; then
   RESVOL=""
-  RESENV="-e VLLM_MOE_W2_BASE_CACHE_GB=0 -e VLLM_MOE_W2_PLANES_CACHE=/plane-cache"
+  RESENV="-e VLLM_MOE_W2_BASE_CACHE_GB=0 -e VLLM_MOE_W2_PLANES_CACHE=/plane-cache -e VLLM_MOE_W2_FORCE_RESIDENT=1"
 else
   RESVOL="-v $STORE:/packs"
   RESENV="-e VLLM_MOE_W2_BASE_CACHE_GB=$BASE_GB -e VLLM_MOE_W2_PLANES_CACHE=/plane-cache -e VLLM_MOE_W2_STORE_DIR=/packs -e VLLM_MOE_W2_BASE_RAM_GB=$ARENA_GB"
