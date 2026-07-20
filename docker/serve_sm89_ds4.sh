@@ -16,14 +16,35 @@
 #    Clients then use  http://<this-host>:8001/v1  (OpenAI-compatible).
 #    Quick test:       curl http://localhost:8001/v1/models
 #
-# 2) TWO GPUS (bigger expert pool -> faster decode).
+# 2) TWO GPUS. Select the TP size and the expert residency. These are two
+#    independent choices.
 #
-#        TP=2 GPUS='"device=0,1"' ./docker/serve_sm89_ds4.sh
+#      # gpu residency. Use this mode when the host has much VRAM and little RAM
+#      # (for example, 2 x 48 GB cards and 20 to 30 GB RAM). The 2-bit base shards
+#      # across the cards. The base stays on the GPUs. There is no host base cache.
+#      # The RAM use is low. This mode is the fastest.
+#        RESIDENCY=gpu TP=2 GPUS='"device=0,1"' UTIL=0.95 ./docker/serve_sm89_ds4.sh
 #
-#    WARNING: TP2 needs roughly 2x the host RAM (two pinned arenas plus
-#    ~26 GiB of /dev/shm). On this 38 GiB host a TP2 attempt once hard-hung
-#    the whole box - raise host RAM / the LXC memory cap FIRST. The MEM_GB
-#    hard cap below contains a failed attempt (container dies, host lives).
+#      # host residency (default). Use this mode when the host has much RAM and
+#      # little VRAM. The planes stay in pinned host RAM. The GPU streams a pool.
+#      # host residency at TP2 needs approximately 2 x the host RAM (two pinned
+#      # arenas and approximately 26 GiB of /dev/shm). Increase the host RAM or the
+#      # LXC cap before you use host residency at TP2.
+#
+#  ############################################################################
+#  ##  WARNING: THE QUANTIZATION CACHE IS SPECIFIC TO (TP SIZE, RESIDENCY).  ##
+#  ##  To serve on N GPUs, do the first-run quantization at TP=N with the    ##
+#  ##  same residency. host residency writes base.rank<i>of<N>.pack.         ##
+#  ##  gpu residency writes the plane cache. A cache from TP1 (or host) does ##
+#  ##  not apply to a TP2 (or gpu) run. In that condition the engine does a  ##
+#  ##  new quantization. A new quantization needs 15 to 20 minutes.          ##
+#  ##  Select the TP size and the residency before the first boot.           ##
+#  ##  A first-run quantization is long. Keep READY_TIMEOUT_S high. A small  ##
+#  ##  value stops the quantization (see below).                             ##
+#  ############################################################################
+#
+#    The MEM_GB hard cap contains a failed attempt. The container stops. The
+#    host continues to operate.
 #
 # 3) IMAGE VERSION.
 #
@@ -47,12 +68,18 @@ UTIL=${UTIL:-0.90}           # fraction of VRAM vLLM may use
 PORT=${PORT:-8001}           # API port (reachable only with NETWORK=host)
 GPUS=${GPUS:-'"device=0"'}   # which GPUs; two cards: '"device=0,1"' + TP=2
 TP=${TP:-1}                  # tensor parallelism = number of GPUs used
-BASE_GB=${BASE_GB:-20}       # GPU expert-pool GiB per rank - THE speed knob
-STORE=${STORE:-$CACHE/packs} # on-disk quant pack (real fs, NOT overlayfs)
-ARENA_GB=${ARENA_GB:-14}     # pinned host-RAM cache over the pack, per rank
+RESIDENCY=${RESIDENCY:-host} # 'host' = 2-bit base in pinned RAM + GPU pool (RAM-heavy);
+                             # 'gpu'  = base sharded ONTO the GPUs, no host cache (VRAM-heavy,
+                             # low RAM). Changing RESIDENCY (or TP) INVALIDATES the quant cache.
+READY_TIMEOUT_S=${READY_TIMEOUT_S:-1800}  # engine-ready wait (vLLM default 600); a long
+                             # first-run quant is KILLED at 600s -> raise it.
+BASE_GB=${BASE_GB:-20}       # host residency: GPU expert-pool GiB/rank (THE speed knob).
+                             # gpu residency forces BASE_CACHE_GB=0 (base lives on the GPUs).
+STORE=${STORE:-$CACHE/packs} # host residency only: on-disk quant pack (real fs, NOT overlayfs)
+ARENA_GB=${ARENA_GB:-14}     # host residency only: pinned host-RAM cache over the pack, per rank
 MEM_GB=${MEM_GB:-30}         # HARD container RAM cap - protects the host
 NAME=${NAME:-moet}
-IMG=${IMG:-vllm-moet-sm89:v024}
+IMG=${IMG:-vllm-moet-sm89:v0251}
 
 mkdir -p "$CACHE/planes" "$CACHE/jit" "$STORE"
 docker rm -f "$NAME" 2>/dev/null || true
@@ -65,18 +92,28 @@ else
   TPARGS=""
   IPCARGS="--shm-size 8g"
 fi
+# Expert residency. Refer to header section 2 and the TECHNICAL NOTES.
+# 'gpu' sets BASE_CACHE_GB=0. The 2-bit base then stays on the GPUs. TP shards it.
+# There is no host pack or arena. 'host' uses a pinned-RAM base, an on-disk pack, and a
+# GPU pool. Both modes keep the plane cache. A change to the residency or the TP size
+# makes the quant cache invalid. The engine then does a new quantization.
+if [ "$RESIDENCY" = gpu ]; then
+  RESVOL=""
+  RESENV="-e VLLM_MOE_W2_BASE_CACHE_GB=0 -e VLLM_MOE_W2_PLANES_CACHE=/plane-cache"
+else
+  RESVOL="-v $STORE:/packs"
+  RESENV="-e VLLM_MOE_W2_BASE_CACHE_GB=$BASE_GB -e VLLM_MOE_W2_PLANES_CACHE=/plane-cache -e VLLM_MOE_W2_STORE_DIR=/packs -e VLLM_MOE_W2_BASE_RAM_GB=$ARENA_GB"
+fi
 docker run -d --name "$NAME" --restart "$RESTART" --gpus "$GPUS" --network "$NETWORK" $IPCARGS \
   --memory "${MEM_GB}g" --memory-swap "$((MEM_GB + 2))g" \
   -v "$MODEL":/model:ro \
   -v "$CACHE/planes":/plane-cache \
   -v "$CACHE/jit":/root/.cache \
-  -v "$STORE":/packs \
+  $RESVOL \
   -e VLLM_MOE_W2=1 \
   -e VLLM_MOE_W2_DELTA_GB=0 \
-  -e VLLM_MOE_W2_BASE_CACHE_GB="$BASE_GB" \
-  -e VLLM_MOE_W2_PLANES_CACHE=/plane-cache \
-  -e VLLM_MOE_W2_STORE_DIR=/packs \
-  -e VLLM_MOE_W2_BASE_RAM_GB="$ARENA_GB" \
+  $RESENV \
+  -e VLLM_ENGINE_READY_TIMEOUT_S="$READY_TIMEOUT_S" \
   -e TRITON_CACHE_DIR=/root/.cache/triton \
   -e TORCHINDUCTOR_CACHE_DIR=/root/.cache/torchinductor \
   "$IMG" \
@@ -89,7 +126,12 @@ docker run -d --name "$NAME" --restart "$RESTART" --gpus "$GPUS" --network "$NET
   --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"],"cudagraph_capture_sizes":[1,2,4,8,12,16,24]}' \
   --port "$PORT"
 BUILD=$(docker exec "$NAME" cat /opt/moet-checks/SOURCE.txt 2>/dev/null | grep -v '^#' | head -1 || true)
-echo "started $NAME (sm_89, gpus=${GPUS} tp=${TP}, memcap=${MEM_GB}g, base-cache ${BASE_GB} GiB/rank, arena ${ARENA_GB} GiB/rank, store ${STORE}->/packs, port ${PORT}, network=$NETWORK, restart=$RESTART, max-model-len=$MAXLEN, util=$UTIL)"
+echo "started $NAME (sm_89, gpus=${GPUS} tp=${TP} residency=${RESIDENCY}, memcap=${MEM_GB}g, ready-timeout=${READY_TIMEOUT_S}s, port ${PORT}, network=$NETWORK, restart=$RESTART, max-model-len=$MAXLEN, util=$UTIL)"
+if [ "$RESIDENCY" = gpu ]; then
+  echo "  residency=gpu: 2-bit base GPU-RESIDENT (BASE_CACHE_GB=0), sharded across ${TP} rank(s); no host pack/arena. Watch for: 'moe_w2 planes: ... GPU-RESIDENT' and ~37 GiB/card VRAM."
+else
+  echo "  residency=host: base-cache ${BASE_GB} GiB/rank + arena ${ARENA_GB} GiB/rank + pack ${STORE}->/packs."
+fi
 echo "image build (vllm fork SHA): ${BUILD:-UNKNOWN - pre-observability image, REBUILD from current main}"
 echo "healthy-boot markers:  docker logs -f $NAME 2>&1 | grep -E 'moe_w2'"
 echo "  1) 'moe_w2: env ... does NOTHING — did you mean ...' (only if you typoed a knob)"
@@ -138,11 +180,32 @@ exit 0
 # server should not be reachable. It also means PORT is unreachable until
 # a NETWORK=host relaunch - that is the point.
 #
-# TP2 ON A SMALL HOST: two pinned arenas + ~26 GiB /dev/shm for inter-worker
-# tensor passing did not fit 38 GiB - the first TP2 attempt swap-stormed the
-# host into a hard hang (even sshd stopped). Hence: TP1 keeps shm at 8g and
-# skips --ipc host entirely; TP2 requires more host RAM first. TP>1 also
-# needs --disable-custom-all-reduce on these boards.
+# TP2 ON A SMALL HOST (host residency): two pinned arenas + ~26 GiB /dev/shm for
+# inter-worker tensor passing did not fit 38 GiB - the first TP2 attempt swap-stormed
+# the host into a hard hang (even sshd stopped). A later base-cache TP2 run OOM-killed
+# a worker at the 30 GB container cap (OOMKilled=true, 2026-07-19). Hence: TP1 keeps
+# shm at 8g and skips --ipc host; host-residency TP2 needs more host RAM first. TP>1
+# also needs --disable-custom-all-reduce on these boards.
+#
+# EXPERT RESIDENCY. The quantization cache is specific to (TP size, residency).
+#   host (default): the 2-bit base stays in pinned host RAM. It uses an on-disk pack
+#     and an MRU arena. The GPU keeps a BASE_GB pool. Use this mode for a host with much
+#     RAM and little VRAM. host residency at TP2 uses much RAM (see above).
+#   gpu (BASE_CACHE_GB=0): the base shards onto the GPUs. TP splits approximately 73 GiB
+#     into approximately 36 GiB per rank. This fits two 48 GB cards. There is no host
+#     pack or arena. Use this mode for a host with much VRAM and little RAM (this box).
+#     This mode prevents the host-RAM out-of-memory condition.
+#   The cache depends on the TP size and the residency. host writes
+#     base.rank<i>of<N>.pack. gpu writes the plane cache. A cache from TP1 or host does
+#     not apply to a TP2 or gpu run. In that condition the engine does a new
+#     quantization (15 to 20 minutes). Select the TP size and the residency before the
+#     first boot. To serve on N GPUs, do the quantization at TP=N.
+#
+# READY_TIMEOUT_S. VLLM_ENGINE_READY_TIMEOUT_S has a default of 600 seconds. A first-run
+# quantization needs 15 to 20 minutes. This time is more than the default. Thus the
+# engine-ready wait stops the workers. It then shows "Engine core initialization failed
+# ... Failed core proc(s): {}". This launcher sets 1800 seconds. The quantization can
+# then complete.
 #
 # MEM_GB HARD CAP: belt-and-suspenders against the above. If a load
 # overshoots, the cgroup OOM-killer takes the CONTAINER (fast, contained)
