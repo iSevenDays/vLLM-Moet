@@ -1,0 +1,95 @@
+diff --git a/vllm/model_executor/layers/attention/mla_attention.py b/vllm/model_executor/layers/attention/mla_attention.py
+index 027f19a..67ea494 100644
+--- a/vllm/model_executor/layers/attention/mla_attention.py
++++ b/vllm/model_executor/layers/attention/mla_attention.py
+@@ -188,6 +188,7 @@
+ """
+ 
+ import functools
++import os
+ from abc import abstractmethod
+ from dataclasses import dataclass
+ from enum import Enum
+@@ -800,6 +801,12 @@
+             else:
+                 mqa_q = (mqa_ql_nope, mqa_q_pe)
+             if self.impl.dcp_world_size > 1:
++                # Quantized KV caches are fine under DCP as long as the query
++                # that rides the all-gather stays bf16 (packed-cache sparse
++                # impls); impls that quantize the query itself are not wired.
++                assert not (fp8_attention and self.impl.supports_quant_query_input), (
++                    "DCP does not support fp8-quantized query input."
++                )
+                 if isinstance(mqa_q, tuple):
+                     # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
+                     mqa_q = torch.cat(mqa_q, dim=-1)
+@@ -813,19 +820,22 @@
+ 
+             # correct dcp attn_out with lse.
+             if self.impl.dcp_world_size > 1:
++                # Kernels differ in LSE convention: FA3-style impls emit
++                # natural-log LSE, the SM120 sparse kernels emit log2.
++                lse_base_e = not getattr(self.impl, "returns_base2_lse", False)
+                 if self.dcp_a2a:
+                     attn_out = dcp_a2a_lse_reduce(
+                         attn_out,
+                         lse,
+                         get_dcp_group(),
+-                        is_lse_base_on_e=self.impl.lse_base_on_e,
++                        is_lse_base_on_e=lse_base_e,
+                     )
+                 else:
+                     attn_out = cp_lse_ag_out_rs(
+                         attn_out,
+                         lse,
+                         get_dcp_group(),
+-                        is_lse_base_on_e=self.impl.lse_base_on_e,
++                        is_lse_base_on_e=lse_base_e,
+                     )
+ 
+             # v_up projection
+@@ -1001,12 +1011,21 @@
+         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
+             self.kv_cache_dtype, vllm_config.model_config
+         )
++        from vllm.v1.kv_cache_interface import KVQuantMode, get_kv_quant_mode
++
+         return MLAAttentionSpec(
+             block_size=vllm_config.cache_config.block_size,
+             num_kv_heads=1,
+             head_size=self.head_size,
+             dtype=kv_cache_dtype,
+             cache_dtype_str=vllm_config.cache_config.cache_dtype,
++            # Without this the model runner falls back to the "auto"
++            # (656-byte) kv cache shape for the packed nvfp4 layout.
++            kv_quant_mode=(
++                get_kv_quant_mode(vllm_config.cache_config.cache_dtype)
++                if vllm_config.cache_config.cache_dtype == "nvfp4"
++                else KVQuantMode.NONE
++            ),
+         )
+ 
+     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):
+@@ -1425,6 +1444,13 @@
+         cache_config = vllm_config.cache_config
+         model_config = vllm_config.model_config
+ 
++        # VLLM_MLA_CHUNKED_WORKSPACE_TOKENS: cap override (in tokens) for the
++        # chunked-context workspace. Diagnostic/workaround knob for the
++        # multi-chunk context path; raising it makes contexts up to the cap
++        # single-chunk at the cost of workspace + up-projection memory.
++        workspace_cap = int(
++            os.environ.get("VLLM_MLA_CHUNKED_WORKSPACE_TOKENS", 64 * 1024)
++        )
+         chunked_prefill_workspace_size = min(
+             # Try for 8 full length request or at least 4 pages per-request
+             max(
+@@ -1439,7 +1465,7 @@
+             # which would result in up-projected context being
+             #   2*(192*128)*(64*1024) = 3gb
+             # (assuming 192 QK head dim, 128 heads, and fp16)
+-            64 * 1024,
++            workspace_cap,
+         )
+ 
+         # Enforce that we enough for at least 1 page per request

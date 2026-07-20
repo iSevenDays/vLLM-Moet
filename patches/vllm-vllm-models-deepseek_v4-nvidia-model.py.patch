@@ -1,0 +1,61 @@
+diff --git a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
+index 5f4a638..66b1b00 100644
+--- a/vllm/models/deepseek_v4/nvidia/model.py
++++ b/vllm/models/deepseek_v4/nvidia/model.py
+@@ -70,6 +70,9 @@
+     DeepseekV4FlashInferSM120Attention,
+ )
+ from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
+ from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
+ from vllm.platforms import current_platform
+ from vllm.sequence import IntermediateTensors
+@@ -775,17 +778,45 @@
+             "Use FLASHINFER_MLA_SPARSE_DSV4 for DeepSeek V4 FlashInfer "
+             "sparse MLA."
+         )
++    pre_sm90 = device_capability is not None and device_capability.major < 9
+     if backend == AttentionBackendEnum.FLASHINFER_MLA_SPARSE_DSV4:
+-        if device_capability is not None and device_capability.major == 12:
++        if device_capability is not None and (
++                device_capability.major == 12 or pre_sm90):
++            # the "SM120" class is the fp8_ds_mla-layout call surface: on
++            # SM12x it runs FlashInfer's sparse-MLA decode API; on Ada
++            # FlashInfer's resolver has no kernel, so the same calls
++            # route to vLLM's Triton port (vllm/utils/flashinfer.py
++            # dispatch). The class name is its birthplace, not its gate.
+             return DeepseekV4FlashInferSM120Attention
+         return DeepseekV4FlashInferMLAAttention
+     if backend in (
+         AttentionBackendEnum.FLASHMLA_SPARSE,
+         AttentionBackendEnum.FLASHMLA_SPARSE_DSV4,
+     ):
++        if pre_sm90:
++            raise ValueError(
++                f"{backend.name} needs FlashMLA sparse kernels (SM90+); "
++                f"this device is sm_{device_capability.major}"
++                f"{device_capability.minor}. Use "
++                "FLASHINFER_MLA_SPARSE_DSV4 (or no explicit backend) on "
++                "pre-Hopper GPUs.")
+         return DeepseekV4FlashMLAAttention
+ 
+     if device_capability is not None and device_capability.major == 12:
++        return DeepseekV4FlashInferSM120Attention
++    if pre_sm90:
++        # FlashMLA's sparse decode kernel aborts on pre-SM90 ("Unsupported
++        # architecture for sparse decode fwd" - field-hit on Ada at decode
++        # capture, AFTER prefill profiling passed). Route to the FlashInfer
++        # sparse-MLA decode API instead; log it, once, because the default
++        # differs from every other CUDA arch.
++        logger.info_once(
++            "DeepseekV4 attention: FlashMLA sparse decode is SM90+; "
++            "sm_%d%d routes to DeepseekV4FlashInferSM120Attention "
++            "(fp8_ds_mla layout; decode+prefill via vLLM's Triton "
++            "sparse-MLA port - FlashInfer's resolver has no pre-SM100 "
++            "kernel)",
++            device_capability.major, device_capability.minor)
+         return DeepseekV4FlashInferSM120Attention
+     return DeepseekV4FlashMLAAttention
+ 

@@ -1,0 +1,134 @@
+diff --git a/vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py b/vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py
+index 1848c19..ca878df 100644
+--- a/vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py
++++ b/vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py
+@@ -98,7 +98,16 @@
+ 
+     @classmethod
+     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
+-        return capability.major in [10, 12]
++        # SM10x: FlashInfer trtllm-gen. SM12x: FlashInfer's sparse-MLA
++        # decode API. Ada (8.9): FlashInfer's resolver has NO kernel
++        # (its deepest gate, _resolve_dsv4_sparse_mla_backend, refuses
++        # pre-SM100 - field-hit at decode capture); Ada runs vLLM's
++        # Triton port of the same call surface
++        # (vllm/v1/attention/ops/triton_sparse_mla_dsv4.py), routed in
++        # vllm/utils/flashinfer.py. FlashMLA's sparse kernels are
++        # SM90-only, so Ada has no other DSv4 route.
++        return capability.major in [10, 12] or (
++            capability.major == 8 and capability.minor == 9)
+ 
+     @classmethod
+     def supports_combination(
+@@ -122,18 +131,34 @@
+             if kv_cache_dtype not in (None, "auto", "bfloat16", "fp8", "fp8_e4m3"):
+                 return "kv_cache_dtype not supported"
+             return None
+-        if device_capability.major == 12:
++        if device_capability.major == 12 or (
++                device_capability.major == 8
++                and device_capability.minor == 9):
+             if kv_cache_dtype not in ("fp8", "fp8_e4m3", "fp8_ds_mla"):
+                 return "kv_cache_dtype not supported"
+-            from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
++            if device_capability.major == 12:
++                # SM12x: FlashInfer sparse-MLA decode API mode.
++                from vllm.utils.flashinfer import (
++                    has_flashinfer_sparse_mla_sm120)
+ 
+-            if not has_flashinfer_sparse_mla_sm120():
+-                return (
+-                    "FLASHINFER_MLA_SPARSE_DSV4 SM120 requires FlashInfer's "
+-                    "sparse MLA decode API"
+-                )
++                if not has_flashinfer_sparse_mla_sm120():
++                    return (
++                        "FLASHINFER_MLA_SPARSE_DSV4 on this arch requires "
++                        "FlashInfer's sparse MLA decode API"
++                    )
++            else:
++                # Ada: FlashInfer's resolver refuses SM89, so decode and
++                # prefill route to vLLM's Triton sparse-MLA port instead
++                # (same cache layout and call surface). Needs Triton only.
++                from vllm.triton_utils import HAS_TRITON
++
++                if not HAS_TRITON:
++                    return (
++                        "FLASHINFER_MLA_SPARSE_DSV4 on sm_89 uses vLLM's "
++                        "Triton sparse-MLA port and requires Triton"
++                    )
+             return None
+-        return "FLASHINFER_MLA_SPARSE_DSV4 requires SM10x or SM12x"
++        return "FLASHINFER_MLA_SPARSE_DSV4 requires SM10x, SM12x or SM8.9"
+ 
+     @staticmethod
+     def get_kv_cache_shape(
+@@ -144,7 +169,10 @@
+         cache_dtype_str: str = "auto",
+     ) -> tuple[int, ...]:
+         device_capability = current_platform.get_device_capability()
+-        if device_capability is not None and device_capability.major == 12:
++        if device_capability is not None and (
++                device_capability.major == 12
++                or (device_capability.major == 8
++                    and device_capability.minor == 9)):
+             return DeepseekV4FlashMLABackend.get_kv_cache_shape(
+                 num_blocks,
+                 block_size,
+@@ -526,7 +554,14 @@
+ 
+ 
+ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
+-    """DeepSeek V4 sparse MLA attention through FlashInfer's SM120 kernels."""
++    """DeepSeek V4 sparse MLA attention, fp8_ds_mla layout.
++
++    On SM12x the decode/prefill calls run FlashInfer's SM120 sparse-MLA
++    kernels. On Ada (sm_89) the identical calls are routed by
++    ``vllm/utils/flashinfer.py`` to vLLM's Triton port of that API
++    (FlashInfer's resolver refuses pre-SM100). The class name records
++    where the call surface was born, not which arch executes it.
++    """
+ 
+     backend_cls = DeepseekV4FlashInferMLASparseBackend
+     use_fp8_ds_mla_layout: ClassVar[bool] = True
+@@ -576,13 +611,34 @@
+ 
+     def __init__(self, *args, **kwargs) -> None:
+         super().__init__(*args, **kwargs)
+-        from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
++        device_capability = current_platform.get_device_capability()
++        if device_capability is not None and device_capability.major < 9:
++            # Pre-SM90 (Ada): FlashInfer's resolver has no kernel here;
++            # this layer's decode AND prefill go through vLLM's Triton
++            # sparse-MLA port. Validate the port against the torch
++            # reference on this exact silicon ONCE, at init: a
++            # codegen/driver regression must fail the BOOT (attributed,
++            # before 40+ s of weight loading is wasted per retry), not
++            # corrupt outputs at the first request.
++            from vllm.v1.attention.ops.triton_sparse_mla_dsv4 import (
++                dsv4_sparse_mla_self_test)
++            from vllm.v1.attention.ops.triton_paged_mqa_logits_dsv4 import (
++                dsv4_paged_mqa_logits_self_test)
+ 
+-        if not has_flashinfer_sparse_mla_sm120():
+-            raise RuntimeError(
+-                "FLASHINFER_MLA_SPARSE_DSV4 on SM120 requires FlashInfer's "
+-                "sparse MLA decode API."
+-            )
++            dsv4_sparse_mla_self_test()
++            # The DSA lightning-indexer's paged MQA logits also route to a
++            # Triton port here (DeepGEMM has no pre-SM90 kernel). Validate it
++            # against the torch reference on this silicon ONCE, before any
++            # graph capture; on mismatch the op keeps the torch reference.
++            dsv4_paged_mqa_logits_self_test()
++        else:
++            from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
++
++            if not has_flashinfer_sparse_mla_sm120():
++                raise RuntimeError(
++                    "FLASHINFER_MLA_SPARSE_DSV4 on SM120 requires "
++                    "FlashInfer's sparse MLA decode API."
++                )
+         self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe()
+         # Per-tensor FP8 cache path scales.
+         if self.kv_cache_torch_dtype != torch.float8_e4m3fn:

@@ -1,0 +1,174 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Numerics for the Triton DSv4 paged-MQA-logits port (Ada / pre-SM90 route).
+
+Three tiers, mirroring the sparse-MLA port and how this one was validated
+off-GPU first:
+
+1. torch-reference invariants, CPU-only: causal/length masking, zero-length
+   rows, packed-cache round-trip.
+2. Triton kernel vs. torch reference under ``TRITON_INTERPRET=1`` (CPU, no
+   GPU - runs in CI), including the EXACT boot-time self-test path.
+3. Triton kernel vs. torch reference on CUDA (any arch), the init self-test,
+   and a CUDA-graph capture/replay test — the regression guard for the
+   host-sync bug that crashed decode graph capture on Ada (the old
+   ``int(lens.max().item())`` fallback).
+"""
+
+import os
+
+import pytest
+import torch
+
+from vllm.v1.attention.ops.triton_paged_mqa_logits_dsv4 import (
+    _self_test_case,
+    _worst_row_rel,
+    pack_fp8_indexer_cache_reference,
+    paged_mqa_logits_dsv4_triton,
+    paged_mqa_logits_torch_ref,
+)
+
+_INTERPRET = os.getenv("TRITON_INTERPRET", "0") == "1"
+
+
+def _mk_case(device, *, bsz=4, next_n=2, H=32, D=128, block_size=64,
+             max_model_len=256, seed=0):
+    torch.manual_seed(seed)
+    max_blocks = -(-max_model_len // block_size)
+    num_blocks = max_blocks * bsz + 3
+    kv_rows = torch.randn(num_blocks * block_size, D, device=device,
+                          dtype=torch.float32) * 2.0
+    kv_cache = pack_fp8_indexer_cache_reference(kv_rows, block_size)
+    q = (torch.randn(bsz, next_n, H, D, device=device, dtype=torch.float32)
+         ).clamp(-448, 448).to(torch.float8_e4m3fn)
+    weights = torch.randn(bsz * next_n, H, device=device, dtype=torch.float32)
+    # per-request context lengths spanning zero, sub-block, and full
+    base = torch.tensor([0, 65, 200, max_model_len][:bsz], device=device,
+                        dtype=torch.int32)
+    if bsz > 4:
+        base = torch.randint(0, max_model_len + 1, (bsz,), device=device,
+                             dtype=torch.int32)
+    context_lens = base[:, None].repeat(1, next_n).to(torch.int32)
+    block_tables = torch.zeros(bsz, max_blocks, device=device,
+                               dtype=torch.int32)
+    for b in range(bsz):
+        perm = torch.randperm(num_blocks, device=device).to(torch.int32)
+        block_tables[b] = perm[:max_blocks]
+    return dict(q_values=q, kv_cache=kv_cache, weights=weights,
+                context_lens=context_lens, block_tables=block_tables,
+                max_model_len=max_model_len)
+
+
+# ------------------------- Tier 1: CPU invariants -------------------------
+
+def test_pack_roundtrip_cpu():
+    torch.manual_seed(0)
+    D, block_size, num_blocks = 128, 64, 3
+    rows = torch.randn(num_blocks * block_size, D) * 3.0
+    cache = pack_fp8_indexer_cache_reference(rows, block_size)
+    assert cache.shape == (num_blocks, block_size, 1, D + 4)
+    assert cache.dtype == torch.uint8
+    kv = cache.reshape(num_blocks, block_size, D + 4).reshape(-1, D + 4)
+    deq = (kv[:, :D].view(torch.float8_e4m3fn).float()
+           * kv[:, D:].contiguous().view(torch.float32).view(-1, 1))
+    # per-token scale ~ amax/448 -> relative error bounded by FP8-E4M3 step
+    rel = (deq - rows).abs() / rows.abs().clamp_min(1e-3)
+    assert rel.median().item() < 0.1
+
+
+def test_ref_zero_length_row_is_all_neg_inf_cpu():
+    kw = _mk_case(torch.device("cpu"))
+    kw["context_lens"] = torch.zeros_like(kw["context_lens"])
+    out = paged_mqa_logits_torch_ref(**kw)
+    assert torch.isneginf(out).all()
+
+
+def test_ref_causal_and_length_mask_cpu():
+    kw = _mk_case(torch.device("cpu"), bsz=2, next_n=3, max_model_len=128)
+    out = paged_mqa_logits_torch_ref(**kw)
+    ctx = kw["context_lens"]
+    next_n = kw["q_values"].shape[1]
+    for b in range(ctx.shape[0]):
+        for j in range(next_n):
+            r = b * next_n + j
+            bound = int(ctx[b, j])  # exclusive causal length for this row
+            finite = torch.isfinite(out[r])
+            if bound <= 0:
+                assert not finite.any()
+            else:
+                assert finite[:bound].all()
+                assert not finite[bound:].any()
+
+
+# --------------- Tier 2: interpreter kernel vs reference (CPU) -------------
+
+_GRID = [
+    dict(),
+    dict(next_n=1, H=64, D=128, block_size=64),
+    dict(next_n=3, H=16, D=64, block_size=32, max_model_len=128),
+    dict(bsz=6, next_n=1, H=32, max_model_len=512, seed=7),
+]
+
+
+@pytest.mark.skipif(not _INTERPRET,
+                    reason="set TRITON_INTERPRET=1 for the CPU tier")
+@pytest.mark.parametrize("case_kw", _GRID)
+def test_kernel_matches_ref_interpreter(case_kw):
+    kw = _mk_case(torch.device("cpu"), **case_kw)
+    got = paged_mqa_logits_dsv4_triton(**kw)
+    want = paged_mqa_logits_torch_ref(**kw)
+    assert _worst_row_rel(got, want) < 3e-2
+
+
+@pytest.mark.skipif(not _INTERPRET,
+                    reason="set TRITON_INTERPRET=1 for the CPU tier")
+def test_boot_self_test_case_runs_on_cpu():
+    """Run the EXACT boot self-test path on CPU under the loader's bf16
+    ambient (the sibling port took two boot hits from this untested path:
+    positional-arg drift and default-dtype sensitivity)."""
+    old = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        assert _self_test_case(torch.device("cpu")) < 3e-2
+    finally:
+        torch.set_default_dtype(old)
+
+
+# ----------------------------- Tier 3: CUDA -------------------------------
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("case_kw", _GRID)
+def test_kernel_matches_ref_cuda(case_kw):
+    kw = _mk_case(torch.device("cuda"), **case_kw)
+    got = paged_mqa_logits_dsv4_triton(**kw)
+    want = paged_mqa_logits_torch_ref(**kw)
+    assert _worst_row_rel(got, want) < 3e-2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_self_test_passes_on_this_device():
+    from vllm.v1.attention.ops.triton_paged_mqa_logits_dsv4 import (
+        dsv4_paged_mqa_logits_self_test)
+    dsv4_paged_mqa_logits_self_test.cache_clear()
+    dsv4_paged_mqa_logits_self_test()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_cuda_graph_capturable():
+    """Decode routes this op through CUDA-graph capture on the serving box;
+    it must not sync with the host. This is the exact regression guard for
+    the crash the port fixes."""
+    device = torch.device("cuda")
+    kw = _mk_case(device)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        paged_mqa_logits_dsv4_triton(**kw)
+    torch.cuda.current_stream().wait_stream(s)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        out = paged_mqa_logits_dsv4_triton(**kw)
+    g.replay()
+    torch.cuda.synchronize()
+    want = paged_mqa_logits_torch_ref(**kw)
+    assert _worst_row_rel(out, want) < 3e-2

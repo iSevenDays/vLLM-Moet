@@ -63,8 +63,18 @@ MODEL=${MODEL:-/root/models/DeepSeek-V4-Flash}   # checkpoint dir (read-only)
 CACHE=${CACHE:-/root/models/moet-cache}          # quant caches; ~90 GB free
 NETWORK=${NETWORK:-none}     # 'none' = unreachable (first boot); 'host' = production
 RESTART=${RESTART:-no}       # production: unless-stopped (survives crashes/reboots)
-MAXLEN=${MAXLEN:-16384}      # context length
-UTIL=${UTIL:-0.90}           # fraction of VRAM vLLM may use
+MAXLEN=${MAXLEN:-131072}     # context length (prod target; lower for first-run smoke)
+UTIL=${UTIL:-0.98}           # fraction of VRAM vLLM may use (raised from 0.96; 2x48GiB
+                             # at TP2 RESIDENCY=gpu leaves ~5 GiB/card for everything-not-
+                             # weights, so every basis point matters. 0.98 + trimmed graphs
+                             # + smaller batch is the working budget for 131K sparse MLA).
+BATCHED_TOKENS=${BATCHED_TOKENS:-512}   # max-num-batched-tokens (lowered from 2048 to fit
+                             # KV budget at 131K; prefill is the spike, decode is small).
+NUM_SEQS=${NUM_SEQS:-2}      # max-num-seqs (lowered from 4; pairs with BATCHED_TOKENS=512).
+CUDAGRAPH_SIZES=${CUDAGRAPH_SIZES:-1,2,4,8}  # cudagraph_capture_sizes, comma-sep (trimmed
+                             # from [1,2,4,8,12,16,24]; each capture is a CUDA graph copy
+                             # of weights+workspace, ~80-100 MiB each at this model size).
+MTP_TOKENS=${MTP_TOKENS:-2}  # num_speculative_tokens for deepseek_mtp draft.
 PORT=${PORT:-8001}           # API port (reachable only with NETWORK=host)
 GPUS=${GPUS:-'"device=0"'}   # which GPUs; two cards: '"device=0,1"' + TP=2
 TP=${TP:-1}                  # tensor parallelism = number of GPUs used
@@ -123,20 +133,20 @@ docker run -d --name "$NAME" --restart "$RESTART" --gpus "$GPUS" --network "$NET
   "$IMG" \
   --model /model --served-model-name deepseek-v4-flash --trust-remote-code \
   --kv-cache-dtype fp8 --block-size 256 --max-model-len "$MAXLEN" \
-  --gpu-memory-utilization "$UTIL" --max-num-batched-tokens 2048 --max-num-seqs 4 \
+  --gpu-memory-utilization "$UTIL" --max-num-batched-tokens "$BATCHED_TOKENS" --max-num-seqs "$NUM_SEQS" \
   --tokenizer-mode deepseek_v4 --no-scheduler-reserve-full-isl \
   $TPARGS \
-  --speculative-config '{"method": "deepseek_mtp", "num_speculative_tokens": 2}' \
-  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"],"cudagraph_capture_sizes":[1,2,4,8,12,16,24]}' \
+  --speculative-config '{"method": "deepseek_mtp", "num_speculative_tokens": '"$MTP_TOKENS"'}' \
+  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"],"cudagraph_capture_sizes":['"$CUDAGRAPH_SIZES"']}' \
   --port "$PORT"
 BUILD=$(docker exec "$NAME" cat /opt/moet-checks/SOURCE.txt 2>/dev/null | grep -v '^#' | head -1 || true)
-echo "started $NAME (sm_89, gpus=${GPUS} tp=${TP} residency=${RESIDENCY}, memcap=${MEM_GB}g, ready-timeout=${READY_TIMEOUT_S}s, port ${PORT}, network=$NETWORK, restart=$RESTART, max-model-len=$MAXLEN, util=$UTIL)"
+echo "started $NAME (sm_89, gpus=${GPUS} tp=${TP} residency=${RESIDENCY}, memcap=${MEM_GB}g, ready-timeout=${READY_TIMEOUT_S}s, port ${PORT}, network=$NETWORK, restart=$RESTART, max-model-len=$MAXLEN, util=$UTIL, batched=$BATCHED_TOKENS, seqs=$NUM_SEQS, mtp=$MTP_TOKENS, graphs=[$CUDAGRAPH_SIZES])"
 if [ "$RESIDENCY" = gpu ]; then
   echo "  residency=gpu: 2-bit base GPU-RESIDENT (BASE_CACHE_GB=0), sharded across ${TP} rank(s); no host pack/arena. FORCE_RESIDENT=${FORCE_RESIDENT} (1 = bypass the boot-guard VRAM-budget refusal on >=48 GiB cards). Watch for: 'moe_w2 planes: ... GPU-RESIDENT' and ~37 GiB/card VRAM."
 else
   echo "  residency=host: base-cache ${BASE_GB} GiB/rank + arena ${ARENA_GB} GiB/rank + pack ${STORE}->/packs."
 fi
-echo "image build (vllm fork SHA): ${BUILD:-UNKNOWN - pre-observability image, REBUILD from current main}"
+echo "image build (upstream v0.25.1 SHA): ${BUILD:-UNKNOWN - pre-observability image, REBUILD from current main}"
 echo "healthy-boot markers:  docker logs -f $NAME 2>&1 | grep -E 'moe_w2'"
 echo "  1) 'moe_w2: env ... does NOTHING — did you mean ...' (only if you typoed a knob)"
 echo "  2) 'sm_89 Triton emulation ready on <GPU> ... self-test worst_rel=...'"
@@ -217,9 +227,26 @@ exit 0
 # TP1 (RSS ~20-26 GiB) + margin; only +2 GiB swap so it cannot lean on USB
 # swap. Also cap the LXC itself: pct set 100 -memory 32000 -swap 4000.
 #
-# IMAGE IDENTITY + TRIAGE: the start banner prints the vllm fork SHA baked
-# into the image (/opt/moet-checks/SOURCE.txt; 'UNKNOWN' = stale image,
-# rebuild). 'Failed core proc(s): {}' in a crash means NO Python exception
+# VRAM-BUDGET TUNING (UTIL / BATCHED_TOKENS / NUM_SEQS / CUDAGRAPH_SIZES /
+#   MTP_TOKENS): at TP=2 RESIDENCY=gpu on 2x48 GiB cards, the 2-bit base
+#   (~73 GiB) shards to ~36 GiB/rank, and weights + norms + embeddings take
+#   the budget to ~43 GiB/card. That leaves ~5 GiB/card for CUDA runtime,
+#   activations, workspace, and KV cache. Sparse MLA's KV cost is tiny
+#   (~584 B/token; 131K x 1 seq = 73 MiB), but vLLM reserves a num_blocks
+#   budget up front; without trimming the other levers it ends up negative.
+#   Defaults reflect the working config measured on this box:
+#     UTIL=0.98            (raised from 0.96; +0.97 GiB/card vs 0.94)
+#     BATCHED_TOKENS=512   (was 2048; prefill is the spike)
+#     NUM_SEQS=2           (was 4)
+#     CUDAGRAPH_SIZES=1,2,4,8  (was 1,2,4,8,12,16,24; ~80-100 MiB each)
+#     MTP_TOKENS=2
+#   Override any of them via env to test smaller-first smoke runs (e.g.
+#   MAXLEN=8192 UTIL=0.94 ./docker/serve_sm89_ds4.sh).
+#
+# IMAGE IDENTITY + TRIAGE: the start banner prints the upstream v0.25.1 SHA
+# the patches/ set was diffed against (/opt/moet-checks/SOURCE.txt;
+# 'UNKNOWN' = stale image, rebuild). 'Failed core proc(s): {}' in a crash
+# means NO Python exception
 # existed - check dmesg for the OOM-killer or the faulthandler stacks in
 # docker logs (PYTHONFAULTHANDLER=1 is baked into the image).
 # ============================================================================

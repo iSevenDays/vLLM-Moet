@@ -1,0 +1,15 @@
+diff --git a/vllm/v1/attention/backends/flashinfer.py b/vllm/v1/attention/backends/flashinfer.py
+index 5e2295c..a73bf09 100755
+--- a/vllm/v1/attention/backends/flashinfer.py
++++ b/vllm/v1/attention/backends/flashinfer.py
+@@ -414,7 +414,9 @@
+ 
+     @staticmethod
+     def get_dtype_for_flashinfer(kv_cache_dtype: str) -> torch.dtype:
+-        if kv_cache_dtype in ("fp8", "fp8_e4m3"):
++        # "fp8_ds_mla" is the target's packed sparse-MLA format; dense layers
++        # sharing the cache config (e.g. DSpark draft heads) store plain e4m3.
++        if kv_cache_dtype in ("fp8", "fp8_e4m3", "fp8_ds_mla"):
+             return torch.float8_e4m3fn
+         elif kv_cache_dtype == "fp8_e5m2":
+             return torch.float8_e5m2

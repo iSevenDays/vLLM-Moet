@@ -20,9 +20,10 @@ noqa'd `self.drafter: NgramProposer | ...` pattern is legal).
 Run from the repo root (after the fork worktree is checked out at the
 lineage branch, e.g. inside the fork clone):
 
-    python3 tools/check_scope_shadowing.py [FILES-list ...]
+    python3 tools/check_scope_shadowing.py [overlay-python-file ...]
 
-defaults to every patch/FILES*.txt list; file paths resolve against the
+defaults to every overlay/vllm/**/*.py file (the source of truth since
+the overlay-patch workflow refactor); file paths resolve against the
 CURRENT working directory (run it from the vllm tree being checked).
 Exit 1 on findings.
 """
@@ -89,14 +90,15 @@ def check_file(fn: str) -> int:
 
 
 def main() -> int:
-    lists = sys.argv[1:] or sorted(
-        glob.glob(os.path.join(REPO, "patch", "FILES*.txt")))
-    files: set[str] = set()
-    for lst in lists:
-        for line in open(lst):
-            line = line.strip()
-            if line and not line.startswith("#") and line.endswith(".py"):
-                files.add(line)
+    if sys.argv[1:]:
+        files = {a for a in sys.argv[1:] if a.endswith(".py")}
+    else:
+        overlay_root = os.path.join(REPO, "overlay", "vllm")
+        files = {
+            os.path.relpath(os.path.join(dp, f), REPO)
+            for dp, _ds, fs in os.walk(overlay_root)
+            for f in fs if f.endswith(".py")
+        }
     bad = 0
     checked = 0
     for fn in sorted(files):

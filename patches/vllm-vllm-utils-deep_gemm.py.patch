@@ -1,0 +1,264 @@
+diff --git a/vllm/utils/deep_gemm.py b/vllm/utils/deep_gemm.py
+index 0a1644b..296bc79 100644
+--- a/vllm/utils/deep_gemm.py
++++ b/vllm/utils/deep_gemm.py
+@@ -453,7 +453,211 @@
+     return _fp8_gemm_nt_impl(*args, disable_ue8m0_cast=not use_ue8m0, **kwargs)
+ 
+ 
++# ---------------------------------------------------------------------------
++# Pre-SM90 torch fallbacks (Ada sm_89 and older): DeepGEMM kernels are
++# SM90/SM100/family-120 only, but the DeepSeek-V4 model graph calls three of
++# these entry points unconditionally on CUDA (o_proj fp8_einsum, the DSA
++# indexer's mqa-logits pair). On unsupported arches we run dequantized torch
++# reference math instead of crashing inside DeepGEMM's JIT. Semantics are
++# lifted from the upstream-validated references in
++# tests/kernels/attention/test_deepgemm_attention.py (diff gate 1e-3 there).
++# Correctness-first: expect a real throughput cost on the indexer; a native
++# sm_89 kernel port is the follow-up, not this fallback.
++
++_fallback_warned: set[str] = set()
++
++
++def _use_torch_fallback() -> bool:
++    return (current_platform.is_cuda()
++            and not current_platform.support_deep_gemm())
++
++
++def _warn_fallback(name: str) -> None:
++    if name not in _fallback_warned:
++        _fallback_warned.add(name)
++        logger.warning(
++            "deep_gemm.%s: DeepGEMM does not support this GPU arch "
++            "(pre-SM90) — using the dequantized torch REFERENCE fallback. "
++            "Correct but slow; a native kernel port is the fix.", name)
++
++
++def _scales_to_fp32(scales: torch.Tensor) -> torch.Tensor:
++    """Scale tensor -> f32. UE8M0 (exponent-only, e.g. the weight
++    scale_inv of scale_fmt=ue8m0 checkpoints - field-hit on the very
++    first o_proj) decodes by exponent-field bitcast, exact for every
++    byte; raw f32 passes through. The packed-int32 SM100 layouts are
++    never produced on the fallback arches and stay rejected."""
++    if scales.dtype == getattr(torch, "float8_e8m0fnu", None):
++        return (scales.view(torch.uint8).to(torch.int32) << 23).view(
++            torch.float32)
++    assert scales.dtype == torch.float32, (
++        f"torch fallback expects f32 or e8m0 block scales, "
++        f"got {scales.dtype}")
++    return scales
++
++
++def _expand_block_scales(vals: torch.Tensor, scales: torch.Tensor):
++    """values.float() * block-scales broadcast to the value shape."""
++    x = vals.float()
++    sc = _scales_to_fp32(scales)
++    assert sc.ndim == x.ndim, (sc.shape, x.shape)
++    for d in range(x.ndim):
++        if sc.shape[d] != x.shape[d]:
++            assert x.shape[d] % sc.shape[d] == 0, (
++                "ragged block-scale dims are not supported by the torch "
++                f"fallback: values {tuple(x.shape)} vs scales "
++                f"{tuple(sc.shape)} at dim {d}")
++            sc = sc.repeat_interleave(x.shape[d] // sc.shape[d], dim=d)
++    return x * sc
++
++
++_fallback_shapes_logged: set[str] = set()
++
++
++def _log_fallback_shapes(name: str, detail: str) -> None:
++    """One INFO line with the ACTUAL tensor geometry the first time each
++    fallback runs — a shape mismatch then diagnoses from the log instead
++    of costing a deploy cycle (the o_proj 2-D-weight einsum did exactly
++    that before this line existed)."""
++    if name not in _fallback_shapes_logged:
++        _fallback_shapes_logged.add(name)
++        logger.info("deep_gemm fallback %s: %s", name, detail)
++
++
++def _einsum_operand(sub: str, tensor: torch.Tensor, dims: dict) -> torch.Tensor:
++    """Reshape a dequantized operand to its subscript arity. DeepGEMM's
++    einsum accepts operands whose LOGICAL rank exceeds their storage rank
++    (o_proj passes wo_a's plain 2-D [h*d, r] linear weight for subscript
++    'hdr'); torch.einsum does not. Split the storage using dims already
++    pinned by the output/other operands; at most one letter may remain
++    unknown (reshape -1 infers it)."""
++    if tensor.ndim == len(sub):
++        for ch, n in zip(sub, tensor.shape):
++            dims.setdefault(ch, n)
++        return tensor
++    shape = [dims.get(ch, -1) for ch in sub]
++    assert shape.count(-1) <= 1, (
++        f"fallback einsum cannot infer '{sub}' from storage "
++        f"{tuple(tensor.shape)} with known dims {dims}")
++    view = tensor.reshape(shape)
++    for ch, n in zip(sub, view.shape):
++        dims.setdefault(ch, n)
++    return view
++
++
++def _torch_fp8_einsum(subscripts, a, b, out, **_kwargs) -> torch.Tensor:
++    _warn_fallback("fp8_einsum")
++    av = _expand_block_scales(*a) if isinstance(a, tuple) else a.float()
++    bv = _expand_block_scales(*b) if isinstance(b, tuple) else b.float()
++    lhs, out_sub = subscripts.replace(" ", "").split("->")
++    sub_a, sub_b = lhs.split(",")
++    dims: dict = {ch: n for ch, n in zip(out_sub, out.shape)}
++    av = _einsum_operand(sub_a, av, dims)
++    bv = _einsum_operand(sub_b, bv, dims)
++    _log_fallback_shapes(
++        "fp8_einsum",
++        f"'{subscripts}' a{tuple(a[0].shape) if isinstance(a, tuple) else tuple(a.shape)}"
++        f"->{tuple(av.shape)} b{tuple(b[0].shape) if isinstance(b, tuple) else tuple(b.shape)}"
++        f"->{tuple(bv.shape)} out{tuple(out.shape)} {out.dtype}")
++    out.copy_(
++        torch.einsum(f"{sub_a},{sub_b}->{out_sub}", av, bv).to(out.dtype))
++    return out
++
++
++def _torch_fp8_mqa_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke,
++                          clean_logits: bool = False) -> torch.Tensor:
++    """Reference lightning-indexer logits (prefill, unpaged):
++    logits[m, n] = sum_h weights[m, h] * relu(q[m, h, :] . k[n, :]),
++    -inf outside [ks[m], ke[m]). FP8 path only (q scale folded into
++    weights; k dequantized by its per-row scale)."""
++    _warn_fallback("fp8_fp4_mqa_logits")
++    qv, qs = q
++    if qs is not None:
++        raise RuntimeError(
++            "torch fallback supports the FP8 indexer path only (q_scale "
++            "is not None -> FP4 Q); serve pre-SM90 with the FP8 indexer "
++            "cache")
++    k, k_scale = kv
++    _log_fallback_shapes(
++        "fp8_fp4_mqa_logits",
++        f"q{tuple(qv.shape)} {qv.dtype} k{tuple(k.shape)} {k.dtype} "
++        f"k_scale{tuple(k_scale.shape)} {k_scale.dtype} "
++        f"weights{tuple(weights.shape)} ks/ke{tuple(cu_seqlen_ks.shape)}")
++    kf = k.float() * _scales_to_fp32(k_scale).view(-1, 1)  # [N, D]
++    qf = qv.float()                                       # [M, H, D]
++    M, H, _ = qf.shape
++    n = kf.shape[0]
++    logits = torch.zeros(M, n, dtype=torch.float32, device=kf.device)
++    wf = weights.float()
++    for h in range(H):                       # bounds the [M, N] temporaries
++        logits += torch.relu(qf[:, h, :] @ kf.T) * wf[:, h:h + 1]
++    pos = torch.arange(n, device=kf.device)
++    mask = ((pos[None, :] >= cu_seqlen_ks[:, None])
++            & (pos[None, :] < cu_seqlen_ke[:, None]))
++    return logits.masked_fill(~mask, float("-inf"))
++
++
++def _torch_fp8_paged_mqa_logits(q, kv_cache, weights, context_lens,
++                                block_tables, schedule_metadata,
++                                max_model_len: int,
++                                clean_logits: bool = False) -> torch.Tensor:
++    """Reference paged variant (decode): FP8 indexer cache layout
++    [num_blocks, block_size, 1, D+4] u8 — D fp8 bytes then a 4-byte f32
++    per-position scale. context_lens [B] (per-request length; draft row j
++    sees length-(next_n-1-j)) or [B, next_n] (explicit per-row lengths)."""
++    _warn_fallback("fp8_fp4_paged_mqa_logits")
++    qv, qs = q
++    if qs is not None:
++        raise RuntimeError(
++            "torch fallback supports the FP8 indexer path only (FP4 Q is "
++            "not wired); serve pre-SM90 with the FP8 indexer cache")
++    bsz, next_n, _h, d = qv.shape
++    block_size = kv_cache.shape[1]
++    _log_fallback_shapes(
++        "fp8_fp4_paged_mqa_logits",
++        f"q{tuple(qv.shape)} {qv.dtype} kv_cache{tuple(kv_cache.shape)} "
++        f"{kv_cache.dtype} weights{tuple(weights.shape)} "
++        f"context_lens{tuple(context_lens.shape)} "
++        f"block_tables{tuple(block_tables.shape)} mml={max_model_len}")
++    dev = qv.device
++    num_blocks = kv_cache.shape[0]
++    if context_lens.ndim == 2:
++        lens2d = context_lens.to(dev)
++    else:
++        offs = torch.arange(next_n, device=dev, dtype=torch.int32)
++        lens2d = context_lens.to(dev)[:, None] - (next_n - 1 - offs)[None, :]
++    # Capture-safe: no host sync, no data-dependent shapes/branches. Gather a
++    # STATIC number of blocks (block_tables.shape[1]); padding slots are
++    # clamped in-bounds and masked out, so the result is identical to the old
++    # dynamic-slice version but the op graph is value-independent — required
++    # inside CUDA-graph capture. The old int(lens2d[b].max().item()) synced
++    # the host and crashed decode graph capture on Ada (2026-07-19).
++    lens2d = lens2d.clamp(min=0)
++    max_nblk = block_tables.shape[1]
++    width = max_nblk * block_size
++    w_cols = min(width, max_model_len)
++    logits = torch.full((bsz * next_n, max_model_len), float("-inf"),
++                        dtype=torch.float32, device=dev)
++    wf = weights.float()
++    pos = torch.arange(width, device=dev)
++    for b in range(bsz):
++        blocks = block_tables[b].long().clamp_(0, num_blocks - 1)
++        kb = kv_cache[blocks].reshape(width, d + 4)
++        kf = (kb[:, :d].view(torch.float8_e4m3fn).float()
++              * kb[:, d:].contiguous().view(torch.float32).view(-1, 1))
++        qf = qv[b].float()                                # [next_n, H, D]
++        s = torch.einsum("jhd,sd->jhs", qf, kf)
++        w_b = wf[b * next_n:(b + 1) * next_n]             # [next_n, H]
++        row = (torch.relu(s) * w_b[:, :, None]).sum(1)    # [next_n, width]
++        row = row.masked_fill(pos[None, :] >= lens2d[b][:, None],
++                              float("-inf"))
++        logits[b * next_n:(b + 1) * next_n, :w_cols] = row[:, :w_cols]
++    return logits
++
++
+ def fp8_einsum(*args, **kwargs):
++    if _use_torch_fallback():
++        return _torch_fp8_einsum(*args, **kwargs)
+     _lazy_init()
+     if _fp8_einsum_impl is None:
+         return _missing(*args, **kwargs)
+@@ -528,6 +732,9 @@
+     Returns:
+         Logits tensor of shape [M, N], dtype `torch.float32`.
+     """
++    if _use_torch_fallback():
++        return _torch_fp8_mqa_logits(q, kv, weights, cu_seqlen_ks,
++                                      cu_seqlen_ke, clean_logits)
+     _lazy_init()
+     if _fp8_fp4_mqa_logits_impl is None:
+         return _missing()
+@@ -556,6 +763,11 @@
+         Backend-specific tensor consumed by `fp8_fp4_paged_mqa_logits` to
+         schedule work across SMs.
+     """
++    if _use_torch_fallback():
++        # the torch fallback ignores scheduling metadata; shape matches
++        # the (num_sms + 1, 2) i32 buffer the indexer copies into
++        return torch.zeros((num_sms + 1, 2), dtype=torch.int32,
++                           device=context_lens.device)
+     _lazy_init()
+     if _get_paged_mqa_logits_metadata_impl is None:
+         return _missing()
+@@ -600,6 +812,25 @@
+         Logits tensor of shape [B * next_n, max_model_len], dtype
+         `torch.float32`.
+     """
++    if _use_torch_fallback():
++        # FP8 indexer path: prefer the performant, capture-safe Triton port
++        # (self-test-gated; maybe_* returns None until validated on this
++        # silicon at layer init). Fall through to the capture-safe torch
++        # reference otherwise. Both avoid the host sync that crashed
++        # DeepGEMM's absent-kernel path inside decode graph capture.
++        qv, qs = q
++        if qs is None:
++            from vllm.v1.attention.ops.triton_paged_mqa_logits_dsv4 import (
++                maybe_paged_mqa_logits_dsv4)
++            out = maybe_paged_mqa_logits_dsv4(qv, kv_cache, weights,
++                                              context_lens, block_tables,
++                                              max_model_len)
++            if out is not None:
++                return out
++        return _torch_fp8_paged_mqa_logits(q, kv_cache, weights,
++                                           context_lens, block_tables,
++                                           schedule_metadata,
++                                           max_model_len, clean_logits)
+     _lazy_init()
+     if _fp8_fp4_paged_mqa_logits_impl is None:
+         return _missing()

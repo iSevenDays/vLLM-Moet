@@ -1,0 +1,26 @@
+diff --git a/vllm/v1/attention/backends/mla/sparse_utils.py b/vllm/v1/attention/backends/mla/sparse_utils.py
+index 522b52b..c2fe0d8 100644
+--- a/vllm/v1/attention/backends/mla/sparse_utils.py
++++ b/vllm/v1/attention/backends/mla/sparse_utils.py
+@@ -128,6 +128,9 @@
+     prefill_workspace_request_ids: torch.Tensor | None = None,
+     prefill_workspace_starts: torch.Tensor | None = None,
+     return_valid_counts: bool = False,
++    dcp_world_size: int = 1,
++    dcp_rank: int = 0,
++    cp_kv_cache_interleave_size: int = 1,
+ ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+     """
+     out[token_id, indice_id] =
+@@ -150,6 +153,11 @@
+ 
+     When return_valid_counts is True, also returns the count of valid (non -1)
+     indices per row, computed during the same kernel pass (no extra overhead).
++
++    When dcp_world_size > 1, token_indices are *global* token positions under
++    interleaved decode-context-parallel sharding: entries owned by other
++    ranks become -1 and owned entries are translated to this rank's local
++    slot ids via the (local) block_table.
+     """
+     assert req_id.dtype == torch.int32
+     assert block_table.dtype == torch.int32

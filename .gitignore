@@ -12,11 +12,13 @@ __pycache__/
 # Internal session logs / research harnesses (not for publication)
 internal/
 
-# local artifacts (wheels kept out of git)
-patch/*.whl
+# local artifacts (wheels kept out of git anywhere in the tree)
+*.whl
 
 # bench: smoke-test results are transient (real releases are committed)
 bench/results/smoke/
-vllm/
+# baseline clone at the repo root (read-only, pinned at v0.25.1).
+# Anchored so it does NOT match overlay/vllm/ which IS tracked.
+/vllm/
 .omc
 .codebase-memory

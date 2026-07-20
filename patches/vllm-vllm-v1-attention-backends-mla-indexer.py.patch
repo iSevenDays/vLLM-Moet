@@ -1,0 +1,186 @@
+diff --git a/vllm/v1/attention/backends/mla/indexer.py b/vllm/v1/attention/backends/mla/indexer.py
+index b38445f..dd0f700 100644
+--- a/vllm/v1/attention/backends/mla/indexer.py
++++ b/vllm/v1/attention/backends/mla/indexer.py
+@@ -27,6 +27,10 @@
+ from vllm.v1.attention.backends.utils import (
+     get_dcp_local_seq_lens,
+     split_decodes_and_prefills,
++)
++from vllm.v1.attention.ops.dcp_sparse_topk import (
++    dcp_local_count_from_global,
++    dcp_local_count_int,
+ )
+ from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
+ from vllm.v1.worker.cp_utils import get_total_cp_world_size
+@@ -363,6 +367,26 @@
+                 f"(compress_ratio={self.compress_ratio})."
+             )
+ 
++        # Decode context parallelism: the indexer scores only the local KV
++        # shard, so decode/prefill K extents must be the *local* prefix
++        # counts rather than the global sequence lengths.
++        # (dcp_world_size / dcp_rank / cp_kv_cache_interleave_size were
++        # resolved above from parallel_config - upstream's derivation; the
++        # pre-0.25 try/except re-derivation that lived here made
++        # get_dcp_group function-local via its late import and would break
++        # the earlier use with UnboundLocalError.)
++        if self.dcp_world_size > 1:
++            assert self.compress_ratio == 1, (
++                "DCP for the DSA indexer is only supported without KV "
++                "compression (DeepseekV4 compress_ratio > 1 is not wired up)."
++            )
++            # Address-stable buffer holding the DCP-local decode K extents.
++            self.dcp_local_seq_lens_buffer = torch.zeros(
++                (scheduler_config.max_num_batched_tokens,),
++                dtype=torch.int32,
++                device=self.device,
++            )
++
+         # Pre-allocate buffers for CUDA graph compatibility when
+         if self.compress_ratio > 1:
+             # compress_ratio > 1 (DeepseekV4)
+@@ -607,8 +631,35 @@
+             # slice below).
+             assert common_attn_metadata.seq_lens_cpu_upper_bound is not None
+             seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
++
++            # DCP: chunk boundaries feed a per-chunk all-gather in the indexer
++            # op, so they must be identical on every rank. Split by rank 0's
++            # local counts (the per-rank maximum, computable everywhere) and
++            # let each rank size its own gather/ks/ke from its true local
++            # counts below.
++            chunk_seq_lens_cpu = compressed_seq_lens_cpu
++            compressed_seq_lens_gpu = compressed_seq_lens
++            if self.dcp_world_size > 1:
++                chunk_seq_lens_cpu = dcp_local_count_from_global(
++                    compressed_seq_lens_cpu,
++                    self.dcp_world_size,
++                    0,
++                    self.cp_kv_cache_interleave_size,
++                )
++                compressed_seq_lens_gpu = dcp_local_count_from_global(
++                    compressed_seq_lens,
++                    self.dcp_world_size,
++                    self.dcp_rank,
++                    self.cp_kv_cache_interleave_size,
++                )
++                compressed_seq_lens_cpu = dcp_local_count_from_global(
++                    compressed_seq_lens_cpu,
++                    self.dcp_world_size,
++                    self.dcp_rank,
++                    self.cp_kv_cache_interleave_size,
++                )
+             chunk_specs = split_indexer_prefill_chunks(
+-                compressed_seq_lens_cpu[num_decodes:],
++                chunk_seq_lens_cpu[num_decodes:],
+                 prefill_query_lens_cpu,
+                 self.max_prefill_buffer_size,
+                 max_logits_bytes,
+@@ -617,13 +668,25 @@
+ 
+             chunks = []
+             for req_slice, query_slice in chunk_specs:
++                if self.dcp_world_size > 1:
++                    # Every rank must walk the same chunk list (each chunk
++                    # ends in an all-gather). Drop a chunk only when rank 0 -
++                    # whose local count upper-bounds all ranks - is empty,
++                    # which implies every rank is empty.
++                    rank0_total = int(
++                        chunk_seq_lens_cpu[req_slice.start : req_slice.stop]
++                        .sum()
++                        .item()
++                    )
++                    if rank0_total == 0:
++                        continue
+                 metadata = build_prefill_chunk_metadata(
+                     req_slice.start,
+                     req_slice.stop,
+                     query_start_loc,
+                     query_start_loc_cpu,
+                     seq_lens,
+-                    compressed_seq_lens,
++                    compressed_seq_lens_gpu,
+                     compressed_seq_lens_cpu,
+                     common_attn_metadata.block_table_tensor,
+                     self.compress_ratio,
+@@ -632,6 +695,9 @@
+                     dcp_rank=self.dcp_rank,
+                     dcp_world_size=self.dcp_world_size,
+                     cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
++                    # A rank with an empty local shard still builds the chunk
++                    # (ks/ke all zero) so it participates in the merge.
++                    allow_empty=self.dcp_world_size > 1,
+                 )
+                 # Skip when total_seq_lens is 0 (i.e., no compressed token).
+                 if metadata is not None:
+@@ -717,6 +783,26 @@
+                     self.expanded_seq_lens_buffer[num_decodes:num_decode_tokens] = 0
+                     seq_lens = self.expanded_seq_lens_buffer[:num_decode_tokens]
+ 
++            # DCP: replace the global per-row K extents with this rank's
++            # local prefix counts (the paged logits kernel and the topk both
++            # walk the local shard only). Copy into an owned buffer: on the
++            # plain-decode path seq_lens aliases common_attn_metadata.
++            if self.dcp_world_size > 1:
++                flat_seq_lens = seq_lens.reshape(-1)
++                num_rows = flat_seq_lens.shape[0]
++                self.dcp_local_seq_lens_buffer[:num_rows] = (
++                    dcp_local_count_from_global(
++                        flat_seq_lens,
++                        self.dcp_world_size,
++                        self.dcp_rank,
++                        self.cp_kv_cache_interleave_size,
++                    )
++                )
++                self.dcp_local_seq_lens_buffer[num_rows:] = 0
++                seq_lens = self.dcp_local_seq_lens_buffer[:num_rows].view(
++                    seq_lens.shape
++                )
++
+             # Non-MTP: deep_gemm paged MQA logits requires 2D context_lens
+             # (csrc/apis/attention.hpp). Unsqueeze to (B, 1) so downstream
+             # kernels see the same (B, next_n) layout as the MTP path.
+@@ -740,9 +826,21 @@
+                 global_seq_lens=global_seq_lens_for_decode,
+             )
+ 
++        # max_seq_len is consumed by the decode topk kernels as the scan
++        # bound over logits columns; under DCP those columns cover only the
++        # local shard, so hand the kernels the (exact) local maximum.
++        max_seq_len = common_attn_metadata.max_seq_len
++        if self.dcp_world_size > 1:
++            max_seq_len = dcp_local_count_int(
++                max_seq_len,
++                self.dcp_world_size,
++                self.dcp_rank,
++                self.cp_kv_cache_interleave_size,
++            )
++
+         attn_metadata = DeepseekV32IndexerMetadata(
+             seq_lens=common_attn_metadata.seq_lens,
+-            max_seq_len=common_attn_metadata.max_seq_len,
++            max_seq_len=max_seq_len,
+             slot_mapping=compressed_slot_mapping,
+             num_decodes=num_decodes,
+             num_decode_tokens=num_decode_tokens,
+@@ -770,9 +868,18 @@
+     dcp_rank: int = 0,
+     dcp_world_size: int = 1,
+     cp_kv_cache_interleave_size: int = 1,
++    allow_empty: bool = False,
+ ) -> DeepseekV32IndexerPrefillChunkMetadata | None:
++    """Build one indexer prefill chunk.
++
++    Under DCP (``dcp_world_size > 1``) ``compressed_seq_lens[_cpu]`` are this
++    rank's *local* shard counts: the K gather, ``cu_seq_lens``,
++    ``token_to_seq`` and the per-token causal extents ``ks``/``ke`` all live
++    in local-shard coordinates. ``allow_empty`` keeps zero-length chunks
++    alive (rank-aligned chunking requires every rank to visit every chunk).
++    """
+     total_seq_lens = compressed_seq_lens_cpu[start_idx:end_idx].sum().item()
+-    if total_seq_lens == 0:
++    if total_seq_lens == 0 and not allow_empty:
+         return None
+ 
+     num_reqs = end_idx - start_idx

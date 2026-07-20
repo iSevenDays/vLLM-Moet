@@ -1,0 +1,47 @@
+diff --git a/vllm/model_executor/layers/quantization/utils/fp8_utils.py b/vllm/model_executor/layers/quantization/utils/fp8_utils.py
+index 32a2d86..831eb65 100644
+--- a/vllm/model_executor/layers/quantization/utils/fp8_utils.py
++++ b/vllm/model_executor/layers/quantization/utils/fp8_utils.py
+@@ -915,14 +915,22 @@
+     assert len(block_size) == 2
+     block_n, block_k = block_size[0], block_size[1]
+ 
+-    # Triton cannot currently bind E8M0 scale tensors directly. On ROCm,
+-    # DeepSeek-V4 checkpoints store block scales in exponent-only E8M0 format,
+-    # so decode them to fp32 before launching the kernel.
+-    if current_platform.is_rocm() or current_platform.is_xpu():
+-        if As.dtype == torch.float8_e8m0fnu:
+-            As = _upcast_e8m0_to_fp32(As).contiguous()
+-        if Bs.dtype == torch.float8_e8m0fnu:
+-            Bs = _upcast_e8m0_to_fp32(Bs).contiguous()
++    # Triton cannot bind E8M0 scale tensors on ANY platform: its dtype
++    # canonicalisation table has no float8_e8m0fnu entry, so the JIT
++    # binder raises KeyError and the C++ runtime terminates the process
++    # (no Python traceback - the engine just aborts). This guard used to
++    # be ROCm/XPU-only on the assumption that CUDA always consumes UE8M0
++    # scales through DeepGEMM before this fallback is reached - FALSE on
++    # Ada (sm_89): there is no family-120 DeepGEMM path, the DS4
++    # attention fp8 block-scaled linear lands HERE, and the e8m0 Bs of a
++    # scale_fmt=ue8m0 checkpoint aborted the engine at first forward.
++    # Decode unconditionally: E8M0 is exponent-only, the fp32 upcast is
++    # exact (2^(byte-127) via exponent-field bitcast), and the cost is a
++    # few thousand elements per call next to the GEMM itself.
++    if As.dtype == torch.float8_e8m0fnu:
++        As = _upcast_e8m0_to_fp32(As).contiguous()
++    if Bs.dtype == torch.float8_e8m0fnu:
++        Bs = _upcast_e8m0_to_fp32(Bs).contiguous()
+ 
+     assert A.shape[-1] == B.shape[-1]
+     assert A.shape[:-1] == As.shape[:-1] and A.is_contiguous()
+@@ -1122,6 +1130,11 @@
+         r = wq.size(0) // g
+         wq = wq.view(g, r, d)
+         ws = ws.view(g, r // quant_block_shape[0], d // quant_block_shape[1])
++        # SM12x consumer Blackwell: DeepGEMM nv-dev's fp8_einsum consumes RAW
++        # row-major f32 block scales (its own SM120 test convention) and NaNs
++        # on the SM100-style packed layout — skip the transform.
++        if current_platform.is_device_capability_family(120):
++            return wq, ws.contiguous()
+         dg_ws = deepgemm_post_process_weight_scale_block(
+             ws=ws,
+             mn=r,
