@@ -3,11 +3,17 @@
 import torch
 import torch.nn as nn
 
+from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
     fused_inv_rope_fp8_quant,
 )
+from vllm.models.deepseek_v4.nvidia.ops.triton_ada_fp8_bmm import (
+    ada_fp8_grouped_mm,
+)
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import fp8_einsum
+
+logger = init_logger(__name__)
 
 
 def compute_fp8_einsum_recipe() -> tuple[tuple[int, int, int], bool]:
@@ -58,16 +64,27 @@ def deep_gemm_fp8_o_proj(
         rope_dim=rope_dim,
         tma_aligned_scales=tma_aligned_scales,
     )
-    z = torch.empty(
-        (o.shape[0], n_groups, o_lora_rank),
-        device=o.device,
-        dtype=torch.bfloat16,
-    )
-    fp8_einsum(
-        "bhr,hdr->bhd",
-        (o_fp8, o_scale),
-        (wo_a.weight, wo_a.weight_scale_inv),
-        z,
-        recipe=einsum_recipe,
-    )
+    if current_platform.is_device_capability(89):
+        logger.info_once(
+            "DeepSeek V4 o_proj: using native SM89 block-scaled FP8 grouped matmul"
+        )
+        z = ada_fp8_grouped_mm(
+            o_fp8,
+            o_scale,
+            wo_a.weight,
+            wo_a.weight_scale_inv,
+        )
+    else:
+        z = torch.empty(
+            (o.shape[0], n_groups, o_lora_rank),
+            device=o.device,
+            dtype=torch.bfloat16,
+        )
+        fp8_einsum(
+            "bhr,hdr->bhd",
+            (o_fp8, o_scale),
+            (wo_a.weight, wo_a.weight_scale_inv),
+            z,
+            recipe=einsum_recipe,
+        )
     return wo_b(z.flatten(1))

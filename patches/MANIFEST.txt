@@ -3,6 +3,7 @@
 # (regenerate via `python3 tools/gen_patches.py`).
 vllm-csrc-nvfp4_ds_mla-concat_and_cache_nvfp4_ds_mla.cu.patch
 vllm-tests-kernels-attention-test_triton_paged_mqa_logits_dsv4.py.patch
+vllm-tests-kernels-test_triton_ada_fp8_bmm.py.patch
 vllm-tests-v1-attention-test_triton_sparse_mla_dsv4.py.patch
 vllm-tools-nvfp4_flashinfer_sm120-README.md.patch
 vllm-tools-nvfp4_flashinfer_sm120-nvfp4_expand.cuh.patch
@@ -35,6 +36,7 @@ vllm-vllm-models-deepseek_v4-nvidia-flashinfer_sparse.py.patch
 vllm-vllm-models-deepseek_v4-nvidia-model.py.patch
 vllm-vllm-models-deepseek_v4-nvidia-mtp.py.patch
 vllm-vllm-models-deepseek_v4-nvidia-ops-o_proj.py.patch
+vllm-vllm-models-deepseek_v4-nvidia-ops-triton_ada_fp8_bmm.py.patch
 vllm-vllm-utils-deep_gemm.py.patch
 vllm-vllm-utils-flashinfer.py.patch
 vllm-vllm-v1-attention-backends-flashinfer.py.patch
