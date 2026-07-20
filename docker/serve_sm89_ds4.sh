@@ -71,6 +71,10 @@ TP=${TP:-1}                  # tensor parallelism = number of GPUs used
 RESIDENCY=${RESIDENCY:-host} # 'host' = 2-bit base in pinned RAM + GPU pool (RAM-heavy);
                              # 'gpu'  = base sharded ONTO the GPUs, no host cache (VRAM-heavy,
                              # low RAM). Changing RESIDENCY (or TP) INVALIDATES the quant cache.
+FORCE_RESIDENT=${FORCE_RESIDENT:-0}  # gpu residency: set 1 to bypass the boot-guard VRAM-budget
+                             # check (VLLM_MOE_W2_FORCE_RESIDENT). The guard refuses knife-edge
+                             # configs that DO serve on >=48 GiB cards; set 1 to consent past the
+                             # refusal. No effect under RESIDENCY=host.
 READY_TIMEOUT_S=${READY_TIMEOUT_S:-1800}  # engine-ready wait (vLLM default 600); a long
                              # first-run quant is KILLED at 600s -> raise it.
 BASE_GB=${BASE_GB:-20}       # host residency: GPU expert-pool GiB/rank (THE speed knob).
@@ -99,7 +103,7 @@ fi
 # makes the quant cache invalid. The engine then does a new quantization.
 if [ "$RESIDENCY" = gpu ]; then
   RESVOL=""
-  RESENV="-e VLLM_MOE_W2_BASE_CACHE_GB=0 -e VLLM_MOE_W2_PLANES_CACHE=/plane-cache -e VLLM_MOE_W2_FORCE_RESIDENT=1"
+  RESENV="-e VLLM_MOE_W2_BASE_CACHE_GB=0 -e VLLM_MOE_W2_PLANES_CACHE=/plane-cache -e VLLM_MOE_W2_FORCE_RESIDENT=$FORCE_RESIDENT"
 else
   RESVOL="-v $STORE:/packs"
   RESENV="-e VLLM_MOE_W2_BASE_CACHE_GB=$BASE_GB -e VLLM_MOE_W2_PLANES_CACHE=/plane-cache -e VLLM_MOE_W2_STORE_DIR=/packs -e VLLM_MOE_W2_BASE_RAM_GB=$ARENA_GB"
@@ -128,7 +132,7 @@ docker run -d --name "$NAME" --restart "$RESTART" --gpus "$GPUS" --network "$NET
 BUILD=$(docker exec "$NAME" cat /opt/moet-checks/SOURCE.txt 2>/dev/null | grep -v '^#' | head -1 || true)
 echo "started $NAME (sm_89, gpus=${GPUS} tp=${TP} residency=${RESIDENCY}, memcap=${MEM_GB}g, ready-timeout=${READY_TIMEOUT_S}s, port ${PORT}, network=$NETWORK, restart=$RESTART, max-model-len=$MAXLEN, util=$UTIL)"
 if [ "$RESIDENCY" = gpu ]; then
-  echo "  residency=gpu: 2-bit base GPU-RESIDENT (BASE_CACHE_GB=0), sharded across ${TP} rank(s); no host pack/arena. Watch for: 'moe_w2 planes: ... GPU-RESIDENT' and ~37 GiB/card VRAM."
+  echo "  residency=gpu: 2-bit base GPU-RESIDENT (BASE_CACHE_GB=0), sharded across ${TP} rank(s); no host pack/arena. FORCE_RESIDENT=${FORCE_RESIDENT} (1 = bypass the boot-guard VRAM-budget refusal on >=48 GiB cards). Watch for: 'moe_w2 planes: ... GPU-RESIDENT' and ~37 GiB/card VRAM."
 else
   echo "  residency=host: base-cache ${BASE_GB} GiB/rank + arena ${ARENA_GB} GiB/rank + pack ${STORE}->/packs."
 fi
