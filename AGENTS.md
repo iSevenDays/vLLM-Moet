@@ -5,6 +5,35 @@ Multiple agents and humans work on this project concurrently, often in the
 the generated patch as a source file. Read this before your first commit;
 every rule below traces back to a real incident.
 
+## Serving rule — the quantization cache is specific to the GPU count and the residency
+
+Read this rule before you serve on more than one GPU. Read this rule before you change the
+residency.
+
+The engine caches the 2-bit quantization for one configuration only. The cache depends on two
+values:
+- the tensor-parallel size N (the number of GPUs);
+- the residency (`host` or `gpu`).
+
+`host` residency writes a pack file `base.rank<i>of<N>.pack`. `gpu` residency
+(`VLLM_MOE_W2_BASE_CACHE_GB=0`) writes the plane cache. A cache from one configuration does
+not apply to a different configuration. A cache from TP1 does not apply to a TP2 run. A cache
+from `host` does not apply to a `gpu` run. In these conditions the engine does a new
+quantization. A new quantization needs 15 to 20 minutes.
+
+Obey these steps:
+1. Select the GPU count and the residency before the first boot.
+2. To serve on N GPUs, do the first-run quantization at `TP=N`.
+3. If the host has much VRAM and little RAM (for example, 2 x 48 GB VRAM and 20 to 30 GB RAM),
+   use `gpu` residency (`RESIDENCY=gpu`). The base then stays on the GPUs. This mode also
+   prevents the host-RAM out-of-memory condition.
+4. Keep `VLLM_ENGINE_READY_TIMEOUT_S` more than the quantization time. The default value is
+   600 seconds. This value is too small and stops the quantization. The launcher sets 1800
+   seconds.
+
+For the launch commands and more data, refer to `docker/serve_sm89_ds4.sh`, header section 2,
+and the TECHNICAL NOTES.
+
 ## The iron rule
 
 Every `patch/vllm-moet-<tag>.patch` is a **generated artifact**:
