@@ -1,9 +1,14 @@
-# Frontier MoE on consumer Blackwell (SM120)
+# Frontier MoE on Ada and consumer Blackwell
 
-**Official vLLM v0.24.0 + a 7.4k‑line patch** that serves frontier Mixture‑of‑Experts models —
-**GLM‑5.2 (753B)**, **DeepSeek‑V4‑Flash (159B)** and **Kimi‑K2.7‑Code (1T)** — on
-consumer/workstation Blackwell (RTX PRO 6000, RTX 5090), hardware their official checkpoints
-cannot even fit on. Three ideas carry it:
+This project serves large Mixture-of-Experts models on Ada and Blackwell GPUs.
+The active Ada image uses official vLLM v0.25.1 at commit `752a3a504`.
+It applies generated per-file patches from `patches/`.
+The full source files in `overlay/vllm/` are the source of those patches.
+Historical Blackwell measurements in this document used the v0.24.0 image.
+
+The supported models include **GLM-5.2 (753B)**,
+**DeepSeek-V4-Flash (159B)**, and **Kimi-K2.7-Code (1T)**.
+Three methods make these configurations possible:
 
 1. **2‑bit experts with FP4 recovery** — routed experts compress to a sign‑symmetric 2‑bit
    codebook on hand‑written SM120 SASS kernels; a runtime FP4 tier (delta cache + confidence
@@ -13,10 +18,9 @@ cannot even fit on. Three ideas carry it:
    the GPU becomes an **expert cache** (miss → batched fetch + bit‑identical graph replay).
    That puts 753B on two 96 GB cards and 159B on a single RTX 5090, and the packs double as
    a **persistent quantization cache** (reboots skip the re‑quant).
-3. **A rebuilt serving base** — vLLM v0.24.0 actually working on SM120 (the release is
-   broken‑as‑shipped), plus MTP speculative decoding (incl. under pipeline parallelism,
-   bit‑deterministic), an **NVFP4 KV cache** (352 B/token), and agent‑ready tool/reasoning
-   parsing.
+3. **A patched serving base** - The Ada image uses vLLM v0.25.1. The historical SM120 image
+   uses vLLM v0.24.0. The runtime also supports MTP speculative decoding, an NVFP4 KV cache
+   on Blackwell, and tool and reasoning parsers.
 
 ---
 
@@ -82,6 +86,12 @@ share across ranks): DS4 on 4× RTX 5090 **PP4** does 184 tok/s vs 93 without (~
 decode under PP is **bit‑deterministic** (6/6 identical runs, with and without MTP).
 Methodology: **[docs/v024-port.md](docs/v024-port.md)**.
 
+The Ada TP2 field configuration uses two 48 GiB RTX 4090 D cards and GPU-resident experts.
+The launcher sets a 30 GiB container memory limit. Before the native SM89 output-projection
+change, a two-request run reported 33.8 generated tokens/s. This value is not comparable to
+the single-stream RTX PRO 6000 values in the table. Rebuild the Ada image before you measure
+the new kernel. See [docs/ada-sm89-port.md](docs/ada-sm89-port.md).
+
 ---
 
 ## How it fits — 2‑bit experts at FP4 quality
@@ -111,6 +121,11 @@ precision — FP8 on DS4, NVFP4 on GLM) and recover FP4 precision adaptively:
   A‑fragment; the prefill GEMM is load‑issue‑bound, not DRAM‑bound): bit‑identical outputs,
   1.3× on the GEMM, **+12% e2e prefill** on one card — default on (`VLLM_MOE_W2_AFRAG=0`
   opts out).
+
+On Ada, the 2-bit MoE kernel decodes the expert codes in registers and uses BF16 tensor
+cores. DeepSeek-V4 uses a separate native SM89 FP8 kernel for its attention output
+projection. This kernel does not materialize dequantized FP32 weights. See the Ada port
+guide for the dispatch rules and validation results.
 
 All three checkpoint flavors load: **FP4 experts** (DeepSeek‑V4‑Flash — codes remap),
 **FP8 block‑quant** (Flash‑Base, GLM‑5.2‑FP8) and **modelopt NVFP4** (GLM‑5.2‑NVFP4) — the
@@ -438,20 +453,15 @@ Quality release **`v2026.07.17-quality`** — dataset evals vs the committed **n
 <!-- bench:quality:end -->
 
 ## Repository layout
-- **`patch/vllm-moet-v0.24.0.patch`** — the delta vs official vLLM `v0.24.0` (37 files,
-  +7.4k lines; applies clean on the tag). Goes with the pins above.
-- **`Dockerfile.sm120-v024`** — the image: official `vllm/vllm-openai:v0.24.0` + patch + pins +
-  cubins.
-- **`kernels/`** — SASS (`sass/`) + prebuilt SM120 cubins (`cubins-sm120/`, incl. the K=6144
-  GLM‑5.x family) + generators (`gen/`) + `MANIFEST.md`.
-- **`docs/v024-port.md`** — the port: pins, SM120 fixes, apply recipe, benchmark methodology.
-- **`docs/quality.md`** — quality methodology.
-- **`bench/`** — the release benchmark system: recipes (the tested serve configs, one YAML per
-  supported model×hardware combo), the runner that stands up each config and measures it, and
-  committed results per release. The table above is rendered from `bench/results/` by
-  `bench/runner/render.py` (CI keeps them in sync); process: **[bench/README.md](bench/README.md)**,
-  per‑release detail: `docs/benchmarks/`.
-- **`Dockerfile.recipes`** — the user‑facing image: picks a recipe by id, downloads the
-  checkpoint into the `/models` volume, and serves the exact benchmarked configuration
-  (`docker/serve_recipe.py` is the entrypoint; the bench's docker runtime measures this same
-  image).
+
+- **`overlay/vllm/`** contains the complete modified vLLM files. Edit these files.
+- **`patches/`** contains the generated per-file patches for official vLLM v0.25.1.
+- **`vllm/`** is the read-only v0.25.1 baseline at commit `752a3a504`.
+- **`Dockerfile.sm89-v0251`** builds the current Ada image.
+- **`docker/serve_sm89_ds4.sh`** starts DeepSeek-V4-Flash on Ada.
+- **`kernels/`** contains the kernel sources, generated files, cubins, and validation tools.
+- **`docs/ada-sm89-port.md`** describes the current Ada path.
+- **`docs/v024-port.md`** records the historical v0.24.0 Blackwell path.
+- **`docs/quality.md`** describes the quality method.
+- **`bench/`** contains benchmark recipes, the runner, and committed results.
+- **`Dockerfile.recipes`** builds the benchmark recipe image.

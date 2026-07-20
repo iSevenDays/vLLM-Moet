@@ -23,7 +23,7 @@
 #      # (for example, 2 x 48 GB cards and 20 to 30 GB RAM). The 2-bit base shards
 #      # across the cards. The base stays on the GPUs. There is no host base cache.
 #      # The RAM use is low. This mode is the fastest.
-#        RESIDENCY=gpu TP=2 GPUS='"device=0,1"' UTIL=0.95 ./docker/serve_sm89_ds4.sh
+#        RESIDENCY=gpu TP=2 GPUS='"device=0,1"' UTIL=0.98 ./docker/serve_sm89_ds4.sh
 #
 #      # host residency (default). Use this mode when the host has much RAM and
 #      # little VRAM. The planes stay in pinned host RAM. The GPU streams a pool.
@@ -50,8 +50,8 @@
 #
 #        IMG=vllm-moet-sm89:v0251 ./docker/serve_sm89_ds4.sh
 #
-#    v024 = vLLM 0.24 lineage, v0251 = vLLM 0.25.1 lineage. Build them with
-#    Dockerfile.sm89-v024 / Dockerfile.sm89-v0251 from the repo root.
+#    v0251 is the current vLLM 0.25.1 lineage. Build it with
+#    Dockerfile.sm89-v0251 from the repository root.
 #
 # Every knob below has a one-line comment. The deep WHY (what broke when a
 # default was different, exact RAM math, ZFS notes) is collected in the
@@ -72,8 +72,8 @@ BATCHED_TOKENS=${BATCHED_TOKENS:-512}   # max-num-batched-tokens (lowered from 2
                              # KV budget at 131K; prefill is the spike, decode is small).
 NUM_SEQS=${NUM_SEQS:-2}      # max-num-seqs (lowered from 4; pairs with BATCHED_TOKENS=512).
 CUDAGRAPH_SIZES=${CUDAGRAPH_SIZES:-1,2,4,8}  # cudagraph_capture_sizes, comma-sep (trimmed
-                             # from [1,2,4,8,12,16,24]; each capture is a CUDA graph copy
-                             # of weights+workspace, ~80-100 MiB each at this model size).
+                             # from [1,2,4,8,12,16,24] to reduce captured buffers and
+                             # workspaces. Graph capture does not copy the model weights).
 MTP_TOKENS=${MTP_TOKENS:-2}  # num_speculative_tokens for deepseek_mtp draft.
 PORT=${PORT:-8001}           # API port (reachable only with NETWORK=host)
 GPUS=${GPUS:-'"device=0"'}   # which GPUs; two cards: '"device=0,1"' + TP=2
@@ -147,11 +147,12 @@ else
   echo "  residency=host: base-cache ${BASE_GB} GiB/rank + arena ${ARENA_GB} GiB/rank + pack ${STORE}->/packs."
 fi
 echo "image build (upstream v0.25.1 SHA): ${BUILD:-UNKNOWN - pre-observability image, REBUILD from current main}"
-echo "healthy-boot markers:  docker logs -f $NAME 2>&1 | grep -E 'moe_w2'"
+echo "healthy-boot markers:  docker logs -f $NAME 2>&1 | grep -E 'moe_w2|o_proj'"
 echo "  1) 'moe_w2: env ... does NOTHING — did you mean ...' (only if you typoed a knob)"
 echo "  2) 'sm_89 Triton emulation ready on <GPU> ... self-test worst_rel=...'"
-echo "  3) 'moe_w2 planes: ... -> PINNED HOST RAM (base cache ...)'"
-echo "on failure:            docker logs $NAME 2>&1 | grep -B2 -A30 -E 'EngineCore.*(Error|Traceback|CRITICAL)|moe_w2'"
+echo "  3) 'moe_w2 planes: ... -> GPU-RESIDENT' or '-> PINNED HOST RAM'"
+echo "  4) 'DeepSeek V4 o_proj: using native SM89 block-scaled FP8 grouped matmul'"
+echo "on failure:            docker logs $NAME 2>&1 | grep -B2 -A30 -E 'EngineCore.*(Error|Traceback|CRITICAL)|moe_w2|o_proj'"
 echo "                       docker inspect $NAME --format '{{.State.ExitCode}} {{.State.OOMKilled}}'"
 echo "  'Failed core proc(s): {}' (empty set) = EngineCore died with NO Python exception:"
 echo "    host OOM-killer  -> sudo dmesg -T | grep -iE 'oom|killed process' | tail -5   (and: free -g)"
@@ -163,17 +164,12 @@ exit 0
 #  Fuller story: docs/ada-sm89-port.md, § Observability + Troubleshooting.)
 #
 # WHY the moe_w2 envs are NOT optional on Ada + DS4-Flash:
-#   VLLM_MOE_W2_BASE_CACHE_GB   DS4-Flash 2-bit planes are ~1.69 GiB/layer x
-#                               43 layers = ~73 GiB. GPU-RESIDENT planes fit
-#                               only the 96 GB SM120 board - on 24-48 GB Ada
-#                               the base cache is mandatory: planes live
-#                               host-side, the GPU streams BASE_GB worth of
-#                               expert slots. Pool coverage is the dominant
-#                               perf knob (DS4 measured: 15%->19% coverage
-#                               = +33% decode) - raise BASE_GB when VRAM
-#                               allows and watch the '[base] KPI' log line.
-#                               The plane-budget preflight fails EARLY with
-#                               this remedy if the env is dropped.
+#   VLLM_MOE_W2_BASE_CACHE_GB   DS4-Flash 2-bit planes use approximately
+#                               73 GiB. TP2 GPU residency shards them to
+#                               approximately 36 GiB per card. Use this mode
+#                               on two 48 GiB cards with a small host. Host
+#                               residency moves the base to host RAM and uses
+#                               BASE_CACHE_GB as the GPU expert-pool size.
 #   VLLM_MOE_W2_DELTA_GB=0      the w4/w4q FP4 delta tiers are not ported
 #                               to Ada (_require_kernels names this fix).
 #   VLLM_MOE_W2_PLANES_CACHE    PLANES, plural - the singular spelling is a
