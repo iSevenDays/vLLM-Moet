@@ -85,9 +85,8 @@ smoke results (`bench/results/smoke/`).
 
    > `Three-tier starvation fix ships: step-scoped seen windows (vllm 9736e4d34)`
 
-6. **Push both together** (`fork moet-v0.25.1` + `origin main`) once the
-   pre-push checklist passes — or leave both unpushed. Avoid a lasting
-   state where only one side is pushed.
+6. **Push `origin main`** once the pre-push checklist passes. The fork
+   branch stays on the build box (no push access to the fork remote).
 
 ## Concurrency — several agents, one checkout
 
