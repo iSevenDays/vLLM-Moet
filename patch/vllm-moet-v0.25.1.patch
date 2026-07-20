@@ -16623,3 +16623,107 @@ index 03433ed..f2c6181 100644
      def take_draft_token_ids(self) -> DraftTokenIds | None:
          return self.model_runner.take_draft_token_ids()
  
+diff --git a/vllm/model_executor/warmup/flashinfer_sparse_mla_warmup.py b/vllm/model_executor/warmup/flashinfer_sparse_mla_warmup.py
+index 80dfd5199..31738226b 100644
+--- a/vllm/model_executor/warmup/flashinfer_sparse_mla_warmup.py
++++ b/vllm/model_executor/warmup/flashinfer_sparse_mla_warmup.py
+@@ -219,6 +219,86 @@ def flashinfer_sparse_mla_decode_autotune_warmup(worker: "Worker") -> None:
+     _flashinfer_sparse_mla_decode_autotune(worker, mixed_tokens)
+ 
+ 
++def _warmup_dsv4_sparse_indexer_kernels(runner: "GPUModelRunner") -> None:
++    """JIT the DSA lightning indexer Triton kernels directly.
++
++    Why: `sparse_attn_indexer` returns its fake stub when
++    `attn_metadata is None` (profile/dummy mode), so `_dummy_run` never
++    invokes the indexer kernels and they would JIT at first real request
++    instead of during warmup. Call them with small synthetic inputs to
++    force compilation now.
++    """
++    from vllm.models.deepseek_v4.common.ops.cache_utils import (
++        compute_global_topk_indices_and_lens,
++    )
++    from vllm.models.deepseek_v4.sparse_mla import build_c128a_topk_metadata
++
++    device = runner.device
++    cache_block_size = runner.vllm_config.cache_config.block_size
++    num_reqs = max(1, getattr(runner, "max_num_reqs", 1))
++
++    num_tokens = 32
++    num_decode_tokens = 24
++    num_prefill_tokens = num_tokens - num_decode_tokens
++    topk = 64
++    max_compressed_tokens = 8192
++    max_blocks_per_req = 32
++
++    positions = torch.arange(num_tokens, dtype=torch.int32, device=device)
++    token_to_req = torch.randint(
++        0, num_reqs, (num_tokens,), dtype=torch.int32, device=device
++    )
++    block_table = torch.arange(
++        max_blocks_per_req, dtype=torch.int32, device=device
++    ).repeat(num_reqs, 1)
++    slot_mapping = torch.zeros(num_tokens, dtype=torch.int32, device=device)
++
++    c128a_compress_ratio = 128
++    c128a_block_size = cache_block_size // c128a_compress_ratio
++    global_decode_buffer = torch.zeros(
++        (num_decode_tokens, topk), dtype=torch.int32, device=device
++    )
++    decode_lens_buffer = torch.zeros(
++        num_decode_tokens, dtype=torch.int32, device=device
++    )
++    prefill_buffer = torch.zeros(
++        (num_prefill_tokens, topk), dtype=torch.int32, device=device
++    )
++    build_c128a_topk_metadata(
++        positions=positions,
++        compress_ratio=c128a_compress_ratio,
++        num_decode_tokens=num_decode_tokens,
++        token_to_req_indices=token_to_req,
++        block_table=block_table,
++        block_size=c128a_block_size,
++        slot_mapping=slot_mapping,
++        global_decode_buffer=global_decode_buffer,
++        decode_lens_buffer=decode_lens_buffer,
++        prefill_buffer=prefill_buffer,
++        max_compressed_tokens=max_compressed_tokens,
++    )
++
++    c4a_compress_ratio = 4
++    c4a_block_size = cache_block_size // c4a_compress_ratio
++    topk_indices = torch.randint(
++        0,
++        max_compressed_tokens,
++        (num_decode_tokens, topk),
++        dtype=torch.int32,
++        device=device,
++    )
++    is_valid_token = torch.ones(
++        num_decode_tokens, dtype=torch.int32, device=device
++    )
++    compute_global_topk_indices_and_lens(
++        topk_indices=topk_indices,
++        token_to_req_indices=token_to_req[:num_decode_tokens],
++        block_table=block_table,
++        block_size=c4a_block_size,
++        is_valid_token=is_valid_token,
++    )
++
++
+ def deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
+     """Warm DSv4 sparse-MLA mixed prefill+decode attention."""
+     runner = worker.model_runner
+@@ -253,3 +333,12 @@ def deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
+                 force_attention=True,
+                 create_mixed_batch=True,
+             )
++
++    try:
++        _warmup_dsv4_sparse_indexer_kernels(runner)
++    except Exception as exc:
++        logger.warning(
++            "DSv4 sparse indexer kernel warmup skipped: %r. "
++            "Kernels will JIT at first request.",
++            exc,
++        )
