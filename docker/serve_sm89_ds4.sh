@@ -63,18 +63,18 @@ MODEL=${MODEL:-/root/models/DeepSeek-V4-Flash}   # checkpoint dir (read-only)
 CACHE=${CACHE:-/root/models/moet-cache}          # quant caches; ~90 GB free
 NETWORK=${NETWORK:-none}     # 'none' = unreachable (first boot); 'host' = production
 RESTART=${RESTART:-no}       # production: unless-stopped (survives crashes/reboots)
-MAXLEN=${MAXLEN:-131072}     # context length (prod target; lower for first-run smoke)
+MAXLEN=${MAXLEN:-262144}     # context length (prod target; lower for first-run smoke)
 UTIL=${UTIL:-0.98}           # fraction of VRAM vLLM may use (raised from 0.96; 2x48GiB
                              # at TP2 RESIDENCY=gpu leaves ~5 GiB/card for everything-not-
                              # weights, so every basis point matters. 0.98 + trimmed graphs
                              # + smaller batch is the working budget for 131K sparse MLA).
-BATCHED_TOKENS=${BATCHED_TOKENS:-512}   # max-num-batched-tokens (lowered from 2048 to fit
+BATCHED_TOKENS=${BATCHED_TOKENS:-1024}   # max-num-batched-tokens (lowered from 2048 to fit
                              # KV budget at 131K; prefill is the spike, decode is small).
-NUM_SEQS=${NUM_SEQS:-2}      # max-num-seqs (lowered from 4; pairs with BATCHED_TOKENS=512).
+NUM_SEQS=${NUM_SEQS:-4}      # max-num-seqs (lowered from 4; pairs with BATCHED_TOKENS=512).
 CUDAGRAPH_SIZES=${CUDAGRAPH_SIZES:-1,2,4,8}  # cudagraph_capture_sizes, comma-sep (trimmed
                              # from [1,2,4,8,12,16,24] to reduce captured buffers and
                              # workspaces. Graph capture does not copy the model weights).
-MTP_TOKENS=${MTP_TOKENS:-2}  # num_speculative_tokens for deepseek_mtp draft.
+MTP_TOKENS=${MTP_TOKENS:-1}  # num_speculative_tokens for deepseek_mtp draft.
 PORT=${PORT:-8001}           # API port (reachable only with NETWORK=host)
 GPUS=${GPUS:-'"device=0"'}   # which GPUs; two cards: '"device=0,1"' + TP=2
 TP=${TP:-1}                  # tensor parallelism = number of GPUs used
@@ -131,10 +131,13 @@ docker run -d --name "$NAME" --restart "$RESTART" --gpus "$GPUS" --network "$NET
   -e TRITON_CACHE_DIR=/root/.cache/triton \
   -e TORCHINDUCTOR_CACHE_DIR=/root/.cache/torchinductor \
   "$IMG" \
-  --model /model --served-model-name deepseek-v4-flash --trust-remote-code \
+  --model /model --served-model-name deepseek-v4-flash --served-model-name auto --trust-remote-code \
   --kv-cache-dtype fp8 --block-size 256 --max-model-len "$MAXLEN" \
   --gpu-memory-utilization "$UTIL" --max-num-batched-tokens "$BATCHED_TOKENS" --max-num-seqs "$NUM_SEQS" \
   --tokenizer-mode deepseek_v4 --no-scheduler-reserve-full-isl \
+  --tool-call-parser deepseek_v4 \
+  --enable-auto-tool-choice \
+  --reasoning-parser deepseek_v4 \
   $TPARGS \
   --speculative-config '{"method": "deepseek_mtp", "num_speculative_tokens": '"$MTP_TOKENS"'}' \
   --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"],"cudagraph_capture_sizes":['"$CUDAGRAPH_SIZES"']}' \
