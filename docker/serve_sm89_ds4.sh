@@ -5,7 +5,7 @@
 # into a reusable on-disk "pack" (slow); every later run boots from that
 # pack in ~10 minutes. Watch progress:  docker logs -f moet
 #
-# The three things you will actually change:
+# The four things you will actually change:
 #
 # 1) PRODUCTION / make the API reachable.
 #    The default network=none is a deliberate air-gap for the first
@@ -32,11 +32,11 @@
 #      # LXC cap before you use host residency at TP2.
 #
 #  ############################################################################
-#  ##  WARNING: THE QUANTIZATION CACHE IS SPECIFIC TO (TP SIZE, RESIDENCY).  ##
+#  ##  THE CACHE IS SPECIFIC TO TP SIZE, RESIDENCY, AND QUANTIZER SETTINGS. ##
 #  ##  To serve on N GPUs, do the first-run quantization at TP=N with the    ##
 #  ##  same residency. host residency writes base.rank<i>of<N>.pack.         ##
 #  ##  gpu residency writes the plane cache. A cache from TP1 (or host) does ##
-#  ##  not apply to a TP2 (or gpu) run. In that condition the engine does a  ##
+#  ##  not apply to a TP2 (or gpu) run. SCALE_REFIT also changes the cache.  ##
 #  ##  new quantization. A new quantization needs 15 to 20 minutes.          ##
 #  ##  Select the TP size and the residency before the first boot.           ##
 #  ##  A first-run quantization is long. Keep READY_TIMEOUT_S high. A small  ##
@@ -53,6 +53,44 @@
 #    v0251 is the current vLLM 0.25.1 lineage. Build it with
 #    Dockerfile.sm89-v0251 from the repository root.
 #
+# 4) QUALITY, SPEED, AND MEMORY CONTROLS.
+#
+#    SCALE_REFIT=1 is the normal Ada setting. During quantization, it tests a
+#    second scale for each block of 32 expert weights. It uses the second scale
+#    only when the exact block error is smaller. It does not use more VRAM and
+#    it does not change the serving kernel. Set SCALE_REFIT=0 only for a
+#    comparison or a rollback. A change to SCALE_REFIT causes a new 15 to 20
+#    minute quantization because the cache content changes.
+#
+#    PREFIX_CACHING=0 is the correctness baseline. Prefix caching saves the KV
+#    data for repeated prompt prefixes. It can make a repeated long prompt load
+#    faster, but it does not make normal token generation faster. Set it to 1
+#    only after the saved long agent prompt gives the correct answer with 0.
+#    If the answer changes with 1, set it back to 0.
+#
+#    MTP_TOKENS=0 disables speculative decoding. MTP uses a small draft head to
+#    propose tokens. Accepted draft tokens can increase generation speed. A low
+#    acceptance value adds work and can reduce speed. The measured Ada run
+#    accepted approximately one half token for each step, so 0 is the default.
+#    Test MTP_TOKENS=1 only after the answer is correct. Keep 1 only when the
+#    generated-token rate increases and the answer does not change.
+#
+#    NUM_SEQS=4 lets the scheduler run four requests. It does not reserve four
+#    complete 262K contexts. The measured KV pool holds approximately 286K
+#    tokens in total. Thus, it holds one 262K request or several shorter
+#    requests. Set NUM_SEQS=1 or 2 when long requests cause memory pressure.
+#
+#    BATCHED_TOKENS controls the number of prompt tokens in one prefill step.
+#    A larger value can load prompts faster but uses more workspace. Reduce it
+#    after an out-of-memory error during prompt load. CUDAGRAPH_SIZES controls
+#    the request shapes that vLLM captures. A shorter list saves some VRAM.
+#    These controls do not reduce the model weight allocation.
+#
+#    UTIL controls the vLLM VRAM budget. Keep 0.98 on the two 48 GiB cards.
+#    Reduce it only when another process needs VRAM. A smaller value can leave
+#    no memory for KV blocks because the model weights use approximately
+#    43 GiB on each card.
+#
 # Every knob below has a one-line comment. The deep WHY (what broke when a
 # default was different, exact RAM math, ZFS notes) is collected in the
 # TECHNICAL NOTES block at the BOTTOM of this file - read it when something
@@ -63,24 +101,25 @@ MODEL=${MODEL:-/root/models/DeepSeek-V4-Flash}   # checkpoint dir (read-only)
 CACHE=${CACHE:-/root/models/moet-cache}          # quant caches; ~90 GB free
 NETWORK=${NETWORK:-none}     # 'none' = unreachable (first boot); 'host' = production
 RESTART=${RESTART:-no}       # production: unless-stopped (survives crashes/reboots)
-MAXLEN=${MAXLEN:-131072}     # context length (prod target; lower for first-run smoke)
+MAXLEN=${MAXLEN:-262144}     # maximum context length; lower for the first boot test
 UTIL=${UTIL:-0.98}           # fraction of VRAM vLLM may use (raised from 0.96; 2x48GiB
                              # at TP2 RESIDENCY=gpu leaves ~5 GiB/card for everything-not-
                              # weights, so every basis point matters. 0.98 + trimmed graphs
                              # + smaller batch is the working budget for 131K sparse MLA).
-BATCHED_TOKENS=${BATCHED_TOKENS:-512}   # max-num-batched-tokens (lowered from 2048 to fit
-                             # KV budget at 131K; prefill is the spike, decode is small).
-NUM_SEQS=${NUM_SEQS:-2}      # max-num-seqs (lowered from 4; pairs with BATCHED_TOKENS=512).
+BATCHED_TOKENS=${BATCHED_TOKENS:-1024}  # max-num-batched-tokens; prefill uses most workspace
+NUM_SEQS=${NUM_SEQS:-4}      # request scheduler limit, not four full-length KV allocations
 CUDAGRAPH_SIZES=${CUDAGRAPH_SIZES:-1,2,4,8}  # cudagraph_capture_sizes, comma-sep (trimmed
                              # from [1,2,4,8,12,16,24] to reduce captured buffers and
                              # workspaces. Graph capture does not copy the model weights).
-MTP_TOKENS=${MTP_TOKENS:-2}  # num_speculative_tokens for deepseek_mtp draft.
+MTP_TOKENS=${MTP_TOKENS:-0}  # speculative tokens; read header section 4 before you enable
+PREFIX_CACHING=${PREFIX_CACHING:-0}  # reuse repeated prompt KV; read header section 4
+SCALE_REFIT=${SCALE_REFIT:-1}  # normal W2 conversion; 0 is for comparison or rollback
 PORT=${PORT:-8001}           # API port (reachable only with NETWORK=host)
 GPUS=${GPUS:-'"device=0"'}   # which GPUs; two cards: '"device=0,1"' + TP=2
 TP=${TP:-1}                  # tensor parallelism = number of GPUs used
 RESIDENCY=${RESIDENCY:-host} # 'host' = 2-bit base in pinned RAM + GPU pool (RAM-heavy);
                              # 'gpu'  = base sharded ONTO the GPUs, no host cache (VRAM-heavy,
-                             # low RAM). Changing RESIDENCY (or TP) INVALIDATES the quant cache.
+                             # low RAM). TP, RESIDENCY, and SCALE_REFIT identify the quant cache.
 FORCE_RESIDENT=${FORCE_RESIDENT:-0}  # gpu residency: set 1 to bypass the boot-guard VRAM-budget
                              # check (VLLM_MOE_W2_FORCE_RESIDENT). The guard refuses knife-edge
                              # configs that DO serve on >=48 GiB cards; set 1 to consent past the
@@ -106,6 +145,16 @@ else
   TPARGS=""
   IPCARGS="--shm-size 8g"
 fi
+if [ "$MTP_TOKENS" -gt 0 ]; then
+  MTPARGS="--speculative-config {\"method\":\"deepseek_mtp\",\"num_speculative_tokens\":$MTP_TOKENS}"
+else
+  MTPARGS=""
+fi
+if [ "$PREFIX_CACHING" = 1 ]; then
+  PREFIXARGS=""
+else
+  PREFIXARGS="--no-enable-prefix-caching"
+fi
 # Expert residency. Refer to header section 2 and the TECHNICAL NOTES.
 # 'gpu' sets BASE_CACHE_GB=0. The 2-bit base then stays on the GPUs. TP shards it.
 # There is no host pack or arena. 'host' uses a pinned-RAM base, an on-disk pack, and a
@@ -126,6 +175,7 @@ docker run -d --name "$NAME" --restart "$RESTART" --gpus "$GPUS" --network "$NET
   $RESVOL \
   -e VLLM_MOE_W2=1 \
   -e VLLM_MOE_W2_DELTA_GB=0 \
+  -e VLLM_MOE_W2_SCALE_REFIT="$SCALE_REFIT" \
   $RESENV \
   -e VLLM_ENGINE_READY_TIMEOUT_S="$READY_TIMEOUT_S" \
   -e TRITON_CACHE_DIR=/root/.cache/triton \
@@ -135,12 +185,11 @@ docker run -d --name "$NAME" --restart "$RESTART" --gpus "$GPUS" --network "$NET
   --kv-cache-dtype fp8 --block-size 256 --max-model-len "$MAXLEN" \
   --gpu-memory-utilization "$UTIL" --max-num-batched-tokens "$BATCHED_TOKENS" --max-num-seqs "$NUM_SEQS" \
   --tokenizer-mode deepseek_v4 --no-scheduler-reserve-full-isl \
-  $TPARGS \
-  --speculative-config '{"method": "deepseek_mtp", "num_speculative_tokens": '"$MTP_TOKENS"'}' \
+  $TPARGS $PREFIXARGS $MTPARGS \
   --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"],"cudagraph_capture_sizes":['"$CUDAGRAPH_SIZES"']}' \
   --port "$PORT"
 BUILD=$(docker exec "$NAME" cat /opt/moet-checks/SOURCE.txt 2>/dev/null | grep -v '^#' | head -1 || true)
-echo "started $NAME (sm_89, gpus=${GPUS} tp=${TP} residency=${RESIDENCY}, memcap=${MEM_GB}g, ready-timeout=${READY_TIMEOUT_S}s, port ${PORT}, network=$NETWORK, restart=$RESTART, max-model-len=$MAXLEN, util=$UTIL, batched=$BATCHED_TOKENS, seqs=$NUM_SEQS, mtp=$MTP_TOKENS, graphs=[$CUDAGRAPH_SIZES])"
+echo "started $NAME (sm_89, gpus=${GPUS} tp=${TP} residency=${RESIDENCY}, memcap=${MEM_GB}g, ready-timeout=${READY_TIMEOUT_S}s, port ${PORT}, network=$NETWORK, restart=$RESTART, max-model-len=$MAXLEN, util=$UTIL, batched=$BATCHED_TOKENS, seqs=$NUM_SEQS, mtp=$MTP_TOKENS, prefix-cache=$PREFIX_CACHING, scale-refit=$SCALE_REFIT, graphs=[$CUDAGRAPH_SIZES])"
 if [ "$RESIDENCY" = gpu ]; then
   echo "  residency=gpu: 2-bit base GPU-RESIDENT (BASE_CACHE_GB=0), sharded across ${TP} rank(s); no host pack/arena. FORCE_RESIDENT=${FORCE_RESIDENT} (1 = bypass the boot-guard VRAM-budget refusal on >=48 GiB cards). Watch for: 'moe_w2 planes: ... GPU-RESIDENT' and ~37 GiB/card VRAM."
 else
@@ -228,14 +277,16 @@ exit 0
 #   (~73 GiB) shards to ~36 GiB/rank, and weights + norms + embeddings take
 #   the budget to ~43 GiB/card. That leaves ~5 GiB/card for CUDA runtime,
 #   activations, workspace, and KV cache. Sparse MLA's KV cost is tiny
-#   (~584 B/token; 131K x 1 seq = 73 MiB), but vLLM reserves a num_blocks
+#   (~584 B/token; 262K x 1 seq = 146 MiB), but vLLM reserves a num_blocks
 #   budget up front; without trimming the other levers it ends up negative.
-#   Defaults reflect the working config measured on this box:
+#   Defaults are the correctness-first configuration for this box:
 #     UTIL=0.98            (raised from 0.96; +0.97 GiB/card vs 0.94)
-#     BATCHED_TOKENS=512   (was 2048; prefill is the spike)
-#     NUM_SEQS=2           (was 4)
+#     BATCHED_TOKENS=1024  (prefill is the workspace spike)
+#     NUM_SEQS=4           (four short requests; full 262K requests share KV)
 #     CUDAGRAPH_SIZES=1,2,4,8  (was 1,2,4,8,12,16,24; ~80-100 MiB each)
-#     MTP_TOKENS=2
+#     MTP_TOKENS=0         (the live draft accepted only about one half token)
+#     PREFIX_CACHING=0     (isolate long-context correctness before reuse)
+#     SCALE_REFIT=1        (same-size W2 conversion with lower block SSE)
 #   Override any of them via env to test smaller-first smoke runs (e.g.
 #   MAXLEN=8192 UTIL=0.94 ./docker/serve_sm89_ds4.sh).
 #

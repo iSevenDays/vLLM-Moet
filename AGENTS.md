@@ -8,24 +8,26 @@ SHA-roundtrip discipline that the three incidents motivated is now
 tool-enforced by `tools/gen_patches.py --verify` — the rule still lives
 in your head, but the gate runs in code.
 
-## Serving rule — the quantization cache is specific to the GPU count and the residency
+## Serving rule - the quantization cache is specific to the serving configuration
 
-Read this rule before you serve on more than one GPU. Read this rule before you change the
-residency.
+Read this rule before you serve on more than one GPU. Read this rule before you
+change the residency or the quantizer settings.
 
-The engine caches the 2-bit quantization for one configuration only. The cache depends on two
-values:
+The engine caches the 2-bit quantization for one configuration only. The cache
+depends on these values:
 - the tensor-parallel size N (the number of GPUs);
-- the residency (`host` or `gpu`).
+- the residency (`host` or `gpu`);
+- the quantizer settings, such as `VLLM_MOE_W2_SCALE_REFIT`.
 
 `host` residency writes a pack file `base.rank<i>of<N>.pack`. `gpu` residency
 (`VLLM_MOE_W2_BASE_CACHE_GB=0`) writes the plane cache. A cache from one configuration does
-not apply to a different configuration. A cache from TP1 does not apply to a TP2 run. A cache
-from `host` does not apply to a `gpu` run. In these conditions the engine does a new
-quantization. A new quantization needs 15 to 20 minutes.
+not apply to a different configuration. A cache from TP1 does not apply to a
+TP2 run. A cache from `host` does not apply to a `gpu` run. A cache with scale
+refit disabled does not apply when scale refit is enabled. In these conditions,
+the engine does a new quantization. A new quantization needs 15 to 20 minutes.
 
 Obey these steps:
-1. Select the GPU count and the residency before the first boot.
+1. Select the GPU count, residency, and quantizer settings before the first boot.
 2. To serve on N GPUs, do the first-run quantization at `TP=N`.
 3. If the host has much VRAM and little RAM (for example, 2 x 48 GB VRAM and 20 to 30 GB RAM),
    use `gpu` residency (`RESIDENCY=gpu`). The base then stays on the GPUs. This mode also

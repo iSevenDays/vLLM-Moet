@@ -54,7 +54,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 _ALIGN = 4096
-_PACK_VERSION = 1
+_PACK_VERSION = 2
 
 
 def _ckpt_id():
@@ -73,6 +73,16 @@ def _ckpt_id():
             _ckpt_id as planes_ckpt_id,
         )
         return planes_ckpt_id()
+    except Exception:  # noqa: BLE001 - uninitialized config/offline use
+        return None
+
+
+def _quantizer_id():
+    try:
+        from vllm.model_executor.layers.quantization.utils.moe_w2_planes_cache import (  # noqa: E501
+            quantizer_id,
+        )
+        return quantizer_id()
     except Exception:  # noqa: BLE001 - uninitialized config/offline use
         return None
 
@@ -158,7 +168,8 @@ class MmapPackStore:
         self._sidecar_path = os.path.join(dir_, base + ".json")
         self._meta = dict(version=_PACK_VERSION, tag=tag, E=n_experts,
                           n_layers=n_layers, slot_bytes=slot_bytes,
-                          stride=self.stride, ckpt_id=_ckpt_id(), layers=[])
+                          stride=self.stride, ckpt_id=_ckpt_id(),
+                          quantizer_id=_quantizer_id(), layers=[])
         # Identity + geometry gate for the persistent-quant-cache property.
         # ckpt_id (checkpoint path + safetensors-index sha1, the planes
         # cache's convention) is what actually ties the raw rows to A MODEL
@@ -169,7 +180,7 @@ class MmapPackStore:
         # is treated as stale — one rebuild re-stamps it; operators can
         # instead pre-stamp known-good packs (tools/stamp_pack_identity.py).
         _CHECK = ("version", "E", "n_layers", "slot_bytes", "stride",
-                  "ckpt_id")
+                  "ckpt_id", "quantizer_id")
         if os.path.exists(self._sidecar_path):
             try:
                 with open(self._sidecar_path) as f:
@@ -631,8 +642,9 @@ def pack_has_layer(tag: str, layer_key: int, n_layers: int, n_experts: int,
             return False
         with open(sidecar) as f:
             meta = json.load(f)
-        want = dict(version=_PACK_VERSION, E=n_experts,
-                    slot_bytes=slot_bytes, stride=stride)
+        want = dict(version=_PACK_VERSION, E=n_experts, n_layers=n_layers,
+                    slot_bytes=slot_bytes, stride=stride,
+                    ckpt_id=_ckpt_id(), quantizer_id=_quantizer_id())
         if any(meta.get(k) != v for k, v in want.items()):
             return False
         return int(layer_key) in {int(li) for li in meta.get("layers", [])}

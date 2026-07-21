@@ -95,8 +95,8 @@ The logical packed row uses 584 bytes for each token:
 - 8 bytes for UE8M0 scales and padding.
 
 K and V use the same 512-dimension MLA cache row.
-A 131,072-token sequence uses 73 MiB before allocator padding.
-Four such sequences use 292 MiB.
+A 262,144-token sequence uses 146 MiB before allocator padding.
+Four such sequences use 584 MiB.
 
 The allocator can add padding between pages.
 The resulting cache view can be non-contiguous.
@@ -134,10 +134,16 @@ The launcher uses these memory controls for TP2 GPU residency:
 | Control | Default | Purpose |
 |---|---:|---|
 | `UTIL` | `0.98` | Increase the vLLM GPU memory budget. |
-| `BATCHED_TOKENS` | `512` | Limit the prefill workspace. |
-| `NUM_SEQS` | `2` | Limit concurrent sequence workspaces. |
+| `BATCHED_TOKENS` | `1024` | Limit the prefill workspace. |
+| `NUM_SEQS` | `4` | Limit scheduler concurrency. This does not reserve four full contexts. |
 | `CUDAGRAPH_SIZES` | `1,2,4,8` | Limit captured graph shapes. |
-| `MTP_TOKENS` | `2` | Use the DeepSeek MTP draft head. |
+| `MTP_TOKENS` | `0` | Disable MTP for the correctness baseline. |
+| `PREFIX_CACHING` | `0` | Disable prefix reuse for the correctness baseline. |
+| `SCALE_REFIT` | `1` | Decrease a W2 block scale only when exact SSE decreases. |
+
+The measured live cache had 286,615 token slots. Thus, it can hold one full
+262,144-token request. It cannot hold four requests at that length. The
+`NUM_SEQS=4` setting permits four shorter requests that share the token slots.
 
 Smaller CUDA graph lists reduce captured buffers and workspaces.
 They do not reduce the model weight allocation.
@@ -148,6 +154,31 @@ A TP1 cache is not valid for TP2.
 A host-resident cache is not valid for GPU residency.
 Select both values before the first quantization run.
 Keep `READY_TIMEOUT_S=1800` for a new quantization run.
+
+The cache also depends on the quantizer settings. A change to `SCALE_REFIT`
+must cause a cache miss. The cache metadata includes this setting. The host
+pack probe checks the checkpoint identity before it skips checkpoint tensors.
+
+## Long-agent correctness test
+
+The FP4 recovery quality result does not apply to Ada. Ada uses the base-only
+W2 path. Start with MTP and prefix caching disabled. This configuration makes
+the first comparison easy to interpret.
+
+```bash
+RESIDENCY=gpu TP=2 GPUS='"device=0,1"' \
+  MAXLEN=262144 NUM_SEQS=4 MTP_TOKENS=0 PREFIX_CACHING=0 SCALE_REFIT=1 \
+  NETWORK=host ./docker/serve_sm89_ds4.sh
+```
+
+Use one saved long coding-agent prompt. First, compare `SCALE_REFIT=1` with
+`SCALE_REFIT=0`. Then enable `PREFIX_CACHING=1` and repeat the same prompt.
+Enable `MTP_TOKENS=1` only after the answer is correct. Keep MTP enabled only
+when the generated-token rate increases.
+
+The W2 layer selection excludes the MTP drafter. Thus, the drafter and target
+do not use the same expert path. MTP acceptance is not a direct W2 quality
+measurement.
 
 ## Build and start
 

@@ -6,11 +6,12 @@ DeepSeek-V4 / GLM-5.x MoE family.
 Opt-in via VLLM_MOE_W2=1. Replaces the stock routed-expert GEMM path:
 
   weights : checkpoint mxfp4 e2m1 codes -> {-4,-1,1,4} 2-bit planes built on
-            GPU at load (QUANT_PROBE tensor-sym K=4: acceptance 2.73 vs 2.68
-            baseline, 12/12 coherent; the sign-sym finding reproduces on
-            GLM-5.2 — internal/glm52-sweep). Block-32 UE8M0 scale bytes
-            verbatim. FP8 block-quant checkpoints (DS4-FP8, GLM-5.2-FP8) are
-            re-quantized at load via build_layer_planes_fp8.
+            GPU at load (the small QUANT_PROBE ablation reported acceptance
+            2.73 vs 2.68 and 12/12 short coherent outputs; this is not a
+            long-agent parity result). Base-only MXFP4 blocks refit their
+            UE8M0 exponent when exact SSE decreases. FP8 block-quant
+            checkpoints (DS4-FP8, GLM-5.2-FP8) are re-quantized at load via
+            build_layer_planes_fp8.
   compute : cubit `moe_w2_mm` SASS GEMM (M<=4 per pair, PRMT-LUT decode,
             QMMA.SF block-32 sfb, f32 act-scale fold per k32) for BOTH
             w13 and w2.
@@ -40,8 +41,10 @@ import torch
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (
     mxfp4_to_codes,
+    mxfp4_refit_codes_scales,
     pack_fragment_major,
     pack_scales,
+    scale_refit_enabled,
 )
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -78,6 +81,7 @@ _state = "uninit"
 _AFRAG = os.getenv("VLLM_MOE_W2_AFRAG", "1") == "1"
 _afrag_ok = False
 _sm89 = False                   # set by the (8,9) loader branch
+_scale_refit_logged = False
 # PREFILL QUALITY LEVER (default ON): prefill-sized calls consume the FP4
 # delta tier exactly like decode — pairs whose expert is FP4-resident divert
 # to moe_w4(q)_mm, the rest stay on the 2-bit planes. Before this, prefill
@@ -986,7 +990,19 @@ def build_layer_planes(layer, layer_key: int) -> None:
     _, N2, _ = w2.shape
     K13, K2 = N2, N13 // 2               # H, I (4096/2048 on DS4-Flash TP1)
     from vllm.model_executor.layers.quantization.utils import moe_w2_delta
-    _require_kernels(K13, K2, need_w4=moe_w2_delta.enabled())
+    has_fp4_delta = moe_w2_delta.enabled()
+    scale_refit = scale_refit_enabled(has_fp4_delta)
+    if scale_refit and has_fp4_delta:
+        raise RuntimeError(
+            "VLLM_MOE_W2_SCALE_REFIT=1 cannot be used with the FP4 delta "
+            "tier because the two tiers currently share scale planes")
+    global _scale_refit_logged
+    if scale_refit and not _scale_refit_logged:
+        _scale_refit_logged = True
+        logger.info(
+            "moe_w2 MXFP4 scale refit enabled: each block can decrease its "
+            "UE8M0 exponent by one when exact block SSE decreases")
+    _require_kernels(K13, K2, need_w4=has_fp4_delta)
     _log_plane_budget(E, N13, K13, N2, K2)
     if _try_skip_requant(layer, layer_key, E, N13, K13, N2, K2,
                          ("w13_weight", "w13_weight_scale", "w2_weight",
@@ -1019,16 +1035,24 @@ def build_layer_planes(layer, layer_key: int) -> None:
         sg = s13[e0:e1].to(dev, non_blocking=True)
         for i in range(e1 - e0):
             nib = mxfp4_to_nibbles(wg[i])
-            planes13[e0 + i] = pack_fragment_major(mxfp4_to_codes(wg[i]))
-            sc13[e0 + i] = pack_scales(sg[i])
+            if scale_refit:
+                codes, scales = mxfp4_refit_codes_scales(wg[i], sg[i])
+            else:
+                codes, scales = mxfp4_to_codes(wg[i]), sg[i]
+            planes13[e0 + i] = pack_fragment_major(codes)
+            sc13[e0 + i] = pack_scales(scales)
             if fp13 is not None:
                 fp13[e0 + i] = _pack_fp4_plane(nib)
         wg = w2[e0:e1].to(dev, non_blocking=True)
         sg = s2[e0:e1].to(dev, non_blocking=True)
         for i in range(e1 - e0):
             nib = mxfp4_to_nibbles(wg[i])
-            planes2[e0 + i] = pack_fragment_major(mxfp4_to_codes(wg[i]))
-            sc2[e0 + i] = pack_scales(sg[i])
+            if scale_refit:
+                codes, scales = mxfp4_refit_codes_scales(wg[i], sg[i])
+            else:
+                codes, scales = mxfp4_to_codes(wg[i]), sg[i]
+            planes2[e0 + i] = pack_fragment_major(codes)
+            sc2[e0 + i] = pack_scales(scales)
             if fp2 is not None:
                 fp2[e0 + i] = _pack_fp4_plane(nib)
 

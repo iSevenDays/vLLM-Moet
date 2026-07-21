@@ -3,16 +3,17 @@
 """2-bit tensor-sym expert planes for the 1-GPU DeepSeek-V4 plan.
 
 Load-time GPU quantizer + fragment-major plane packer for the cubit
-`moe_w2` decode kernel. The quantization is the QUANT_PROBE-validated
-K=4 sign-symmetric codebook {-4, -1, 1, 4} (acceptance 2.73 vs 2.68
-baseline): every mxfp4 e2m1 value maps to the nearest level with
+`moe_w2` decode kernel. A small QUANT_PROBE ablation selected the K=4
+sign-symmetric codebook {-4, -1, 1, 4}. This ablation is not a long-agent
+parity result. Each mxfp4 e2m1 value maps to the nearest level with
 odd-symmetric tie-breaking (zeros map sign-preservingly to +-1).
 
 Mapping (e2m1 nibble -> 2-bit code), code order {0:-4, 1:-1, 2:+1, 3:+4}:
   +vals [0, .5, 1, 1.5, 2, 3, 4, 6] -> [+1 x5, +4 x3] -> codes [2,2,2,2,2,3,3,3]
   -vals (nibble | 8)                -> [-1 x5, -4 x3] -> codes [1,1,1,1,1,0,0,0]
-Scales: the checkpoint's block-32 UE8M0 bytes are kept VERBATIM (the
-kernel feeds them straight into QMMA.SF per k32).
+Scales: base-only W2 tests the checkpoint's block-32 UE8M0 scale and the
+next smaller exponent. It uses the smaller exponent only when exact block
+SSE decreases. VLLM_MOE_W2_SCALE_REFIT=0 keeps the bytes verbatim.
 
 Plane layout (fragment-major, per expert weight matrix [N, K]):
   for each 16-row block nb (N/16), for each k64 block kb (K/64),
@@ -168,6 +169,73 @@ def mxfp4_to_codes(w_packed: torch.Tensor) -> torch.Tensor:
     lo = lut[(w_packed & 0xF).long()]
     hi = lut[(w_packed >> 4).long()]
     return torch.stack((lo, hi), dim=-1).flatten(-2)
+
+
+_E2M1_MAG_X2 = torch.tensor([0, 1, 2, 3, 4, 6, 8, 12],
+                             dtype=torch.int16)
+
+
+def scale_refit_enabled(has_fp4_delta: bool) -> bool:
+    """Select the scale-refit mode for the current precision tiers.
+
+    Base-only W2 enables refit by default. The FP4 delta tier disables it by
+    default because both tiers currently share scale planes. An explicit 0 or
+    1 overrides the default. The caller rejects an explicit incompatible 1.
+    """
+    import os
+    value = os.getenv("VLLM_MOE_W2_SCALE_REFIT", "").strip()
+    if value == "":
+        return not has_fp4_delta
+    if value not in ("0", "1"):
+        raise ValueError("VLLM_MOE_W2_SCALE_REFIT must be 0 or 1")
+    return value == "1"
+
+
+def mxfp4_refit_codes_scales(
+    w_packed: torch.Tensor,
+    scales: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Refit each MXFP4 block to the same-size 2-bit representation.
+
+    The normal conversion keeps the checkpoint UE8M0 scale and maps values
+    to {-4, -1, 1, 4}. This conversion also tests a scale that is one power
+    of two smaller. It selects the smaller scale only when that scale has a
+    lower exact block SSE. The output format and the serving kernel do not
+    change.
+
+    `w_packed` has shape [N, K/2]. `scales` has shape [N, K/32] and contains
+    raw UE8M0 bytes. Scale byte zero cannot decrease.
+    """
+    assert w_packed.dtype == torch.uint8
+    assert scales.dtype == torch.uint8
+    N, K2 = w_packed.shape
+    K = K2 * 2
+    assert K % 32 == 0
+    assert scales.shape == (N, K // 32), (scales.shape, N, K)
+
+    nib = mxfp4_to_nibbles(w_packed).view(N, K // 32, 32)
+    mag_x2 = _E2M1_MAG_X2.to(w_packed.device)[(nib & 7).long()]
+
+    # Current scale: magnitude levels 1 and 4, or 2 and 8 in x2 units.
+    current_mag_x2 = torch.where(mag_x2 <= 4, 2, 8)
+    current_err = ((current_mag_x2 - mag_x2) ** 2).sum(dim=-1)
+
+    # Scale / 2: magnitude levels 0.5 and 2, or 1 and 4 in x2 units.
+    lower_big = mag_x2 >= 3
+    lower_mag_x2 = torch.where(lower_big, 4, 1)
+    lower_err = ((lower_mag_x2 - mag_x2) ** 2).sum(dim=-1)
+    use_lower = (scales > 0) & (lower_err < current_err)
+
+    current_codes = mxfp4_to_codes(w_packed).view(N, K // 32, 32)
+    neg = nib >= 8
+    lower_codes = torch.where(
+        lower_big,
+        torch.where(neg, 0, 3),
+        torch.where(neg, 1, 2),
+    ).to(torch.uint8)
+    codes = torch.where(use_lower.unsqueeze(-1), lower_codes, current_codes)
+    refit_scales = scales.to(torch.int16) - use_lower.to(torch.int16)
+    return codes.view(N, K), refit_scales.to(torch.uint8)
 
 
 def pack_fragment_major(codes: torch.Tensor) -> torch.Tensor:

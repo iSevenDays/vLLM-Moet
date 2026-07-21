@@ -10,9 +10,12 @@
    2-bit refinement fails it on nibble 0/8: mag-0 merge).
 5. pack_quintal_fragment_major layout: every 10-bit word lands where the
    kernel doc says (P8/P2 sections, per-lane 80-bit LE record).
+6. MXFP4 scale refit never increases exact block SSE and cannot underflow.
+7. Base-only W2 enables scale refit when the environment does not override it.
 
 Run: python3 tools/test_moe_w2_planes.py  (CPU, ~seconds)
 """
+import os
 import sys
 
 import numpy as np
@@ -27,16 +30,18 @@ import importlib.util as _ilu  # noqa: E402
 
 _spec = _ilu.spec_from_file_location(
     "moe_w2_planes",
-    "vllm/model_executor/layers/quantization/utils/moe_w2_planes.py")
+    "overlay/vllm/vllm/model_executor/layers/quantization/utils/moe_w2_planes.py")
 _m = _ilu.module_from_spec(_spec)
 _spec.loader.exec_module(_m)
 _CODE_TO_NIBBLE = _m._CODE_TO_NIBBLE
 _NIBBLE_TO_CODE = _m._NIBBLE_TO_CODE
 mxfp4_to_codes = _m.mxfp4_to_codes
+mxfp4_refit_codes_scales = _m.mxfp4_refit_codes_scales
 pack_fragment_major = _m.pack_fragment_major
 pack_quintal_fragment_major = _m.pack_quintal_fragment_major
 nibbles_to_quintal_digits = _m.nibbles_to_quintal_digits
 quintal_dequant = _m.quintal_dequant
+scale_refit_enabled = _m.scale_refit_enabled
 split_fp4_dequant = _m.split_fp4_dequant
 
 # ---- 1. quantization map equals the validated tool -------------------------
@@ -167,4 +172,50 @@ for nb in range(N // 16):
                         bad += 1
 assert bad == 0, f"{bad} quintal words misplaced"
 print("6. quintal fragment-major layout exact (all words)")
+
+# ---- 7. block scale refit ---------------------------------------------------
+# Magnitude 2 is exact with the lower scale and its large code.
+nib = torch.full((16, 64), 4, dtype=torch.uint8)
+w = (nib[:, 0::2] | (nib[:, 1::2] << 4)).to(torch.uint8)
+scales = torch.full((16, 2), 100, dtype=torch.uint8)
+codes, refit_scales = mxfp4_refit_codes_scales(w, scales)
+assert torch.all(codes == 3)
+assert torch.all(refit_scales == 99)
+
+# Byte zero cannot decrease. The normal conversion must remain unchanged.
+zero_scales = torch.zeros_like(scales)
+codes, refit_scales = mxfp4_refit_codes_scales(w, zero_scales)
+assert torch.equal(codes, mxfp4_to_codes(w))
+assert torch.equal(refit_scales, zero_scales)
+
+# Test all nibble values in random block mixtures. Express the refit output
+# in units of the original checkpoint block scale.
+torch.manual_seed(1)
+nib = torch.randint(0, 16, (64, 256), dtype=torch.uint8)
+w = (nib[:, 0::2] | (nib[:, 1::2] << 4)).to(torch.uint8)
+scales = torch.randint(0, 255, (64, 8), dtype=torch.uint8)
+codes, refit_scales = mxfp4_refit_codes_scales(w, scales)
+orig = _m._E2M1_VALS[nib.long()].view(64, 8, 32)
+levels = torch.tensor([-4.0, -1.0, 1.0, 4.0], dtype=torch.float64)
+base = levels[mxfp4_to_codes(w).long()].view(64, 8, 32)
+scale_ratio = torch.exp2(
+    refit_scales.double() - scales.double()).repeat_interleave(32, dim=-1)
+refit = (levels[codes.long()] * scale_ratio).view(64, 8, 32)
+assert torch.all(
+    ((refit - orig) ** 2).sum(-1) <= ((base - orig) ** 2).sum(-1))
+print("7. MXFP4 scale refit lowers or preserves exact block SSE")
+
+# ---- 8. base-only default ---------------------------------------------------
+old_refit = os.environ.pop("VLLM_MOE_W2_SCALE_REFIT", None)
+assert scale_refit_enabled(has_fp4_delta=False)
+assert not scale_refit_enabled(has_fp4_delta=True)
+os.environ["VLLM_MOE_W2_SCALE_REFIT"] = "0"
+assert not scale_refit_enabled(has_fp4_delta=False)
+os.environ["VLLM_MOE_W2_SCALE_REFIT"] = "1"
+assert scale_refit_enabled(has_fp4_delta=False)
+if old_refit is None:
+    os.environ.pop("VLLM_MOE_W2_SCALE_REFIT")
+else:
+    os.environ["VLLM_MOE_W2_SCALE_REFIT"] = old_refit
+print("8. MXFP4 scale refit defaults on for base-only W2")
 print("ALL PASS")

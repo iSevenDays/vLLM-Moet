@@ -40,7 +40,7 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-_VERSION = "tsym4-fragmajor-v1"
+_VERSION = "tsym4-fragmajor-v2"
 _PARTS_2BIT = ("planes13", "sc13", "planes2", "sc2")
 _PARTS_FP4 = ("fp13", "fp2")
 
@@ -69,15 +69,40 @@ def _tp_ids() -> tuple[int, int]:
 
 def _ckpt_id() -> str:
     """Identity of the checkpoint the planes derive from: model path +
-    sha1 of the safetensors index (covers shard layout and tensor set)."""
+    sha1 of the safetensors index and each shard's file identity."""
     from vllm.config import get_current_vllm_config
     model = get_current_vllm_config().model_config.model
     h = hashlib.sha1(model.encode())
     idx = os.path.join(model, "model.safetensors.index.json")
     if os.path.exists(idx):
         with open(idx, "rb") as f:
-            h.update(f.read())
+            raw = f.read()
+        h.update(raw)
+        try:
+            index = json.loads(raw)
+            shards = sorted(set(index.get("weight_map", {}).values()))
+            for shard in shards:
+                stat = os.stat(os.path.join(model, shard))
+                h.update(
+                    f"{shard}\0{stat.st_size}\0{stat.st_mtime_ns}".encode())
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            # The index bytes still identify the tensor set. The normal model
+            # loader will report a missing or unreadable shard.
+            pass
     return h.hexdigest()
+
+
+def quantizer_id() -> dict:
+    """Configuration fields that change persistent 2-bit plane contents."""
+    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
+    from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (  # noqa: E501
+        scale_refit_enabled,
+    )
+    return dict(
+        version=_VERSION,
+        zero_mode=os.getenv("VLLM_MOE_W2_ZERO_MODE", "auto"),
+        scale_refit=scale_refit_enabled(moe_w2_delta.enabled()),
+    )
 
 
 def _meta() -> dict:
@@ -89,6 +114,7 @@ def _meta() -> dict:
         world=world,
         rank=rank,
         zero_mode=os.getenv("VLLM_MOE_W2_ZERO_MODE", "auto"),
+        scale_refit=quantizer_id()["scale_refit"],
         # split-FP4 stores radix-5 quintal planes in fp13/fp2 (5/8 of the
         # nibble bytes) — a cache built in another mode must MISS
         # wholesale. "w4q" also invalidates caches of the superseded

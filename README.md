@@ -94,7 +94,7 @@ the new kernel. See [docs/ada-sm89-port.md](docs/ada-sm89-port.md).
 
 ---
 
-## How it fits — 2‑bit experts at FP4 quality
+## How it fits - 2-bit experts with FP4 recovery
 
 We compress **only the routed experts** to 2 bits (the dense stack keeps the checkpoint's
 precision — FP8 on DS4, NVFP4 on GLM) and recover FP4 precision adaptively:
@@ -102,9 +102,10 @@ precision — FP8 on DS4, NVFP4 on GLM) and recover FP4 precision adaptively:
 - **2‑bit expert planes — the sign‑bias finding.** Naive 2‑bit *destroys* these models
   (degenerate loops). The cause is **sign asymmetry**, not error magnitude — the optimal‑L2
   codebook drops one sign's tail and the per‑expert bias compounds over dozens of layers.
-  Forcing a **sign‑symmetric** `{−4,−1,1,4}` codebook at the same L2 error fixes it entirely
-  (33,023 of 33,024 DS4 tensors pick it), landing MTP acceptance **at/above** the FP4 experts
-  (2.73 ≥ 2.68 in the QUANT_PROBE study). The finding reproduces on **GLM‑5.2** (180‑tensor
+  Forcing a **sign-symmetric** `{-4,-1,1,4}` codebook removes the sign bias
+  (33,023 of 33,024 DS4 tensors pick it). A small `QUANT_PROBE` study reported MTP
+  acceptance of 2.73, compared with 2.68 for the FP4 control. This result is an
+  ablation result, not a production parity result. The finding reproduces on **GLM-5.2** (180-tensor
   sweep: asym bias −0.042, 99% negative; symmetric 392× smaller at equal rel‑RMS).
 - **FP4 recovery — used surgically.** Decode is HBM‑bound and an FP4 read is 2× the bytes, so
   2‑bit is the *fast* default: a **delta cache** keeps the hot experts at FP4 (background
@@ -358,13 +359,12 @@ per step) and 14 GiB needs util 0.95 to leave room for KV.
 
 ## Quality
 
-Method: baseline is the untouched official checkpoint; our variant changes only the expert
-codes (same stack, byte‑identical dense/scales/headers), so any delta is the quantization
-alone — see [docs/quality.md](docs/quality.md). The QUANT_PROBE study (identical quant scheme
-and cubins): MTP acceptance 2.73 vs 2.68 FP4 reference, draft accept 86.3% vs 84.1%, 12/12
-coherent greedy outputs; bare 2‑bit agrees with FP4 on 89% of next‑token picks — the delta
-cache + gate close that gap. Live serving reproduces the acceptance (~2.6 tok/step on DS4,
-2.3–3.0 on GLM).
+The base-only W2 probe and the maximum-quality result are different configurations.
+The base-only probe used 12 short coherence prompts. It did not validate long coding-agent
+prompts. The maximum-quality result used a 34 GiB FP4 delta, a confidence gate, and FP4
+prefill. It matched the native control on the recorded GSM8K and GPQA runs. Ada does not
+have the FP4 delta kernels and runs the base-only path. See [docs/quality.md](docs/quality.md)
+for the results, limits, and required Ada comparison.
 
 ## The SM120 toolchain we built
 
