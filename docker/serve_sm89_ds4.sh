@@ -91,6 +91,12 @@
 #    no memory for KV blocks because the model weights use approximately
 #    43 GiB on each card.
 #
+#    The API accepts the names `deepseek-v4-flash` and `auto`. Keep both names
+#    when a client selects `auto`. The first name is the name in API responses.
+#    The DeepSeek tool-call and reasoning parsers convert model text to the
+#    structured data that Claude Code and other agents need. Keep these parser
+#    options for agent use. They are not needed for a plain text-only client.
+#
 # Every knob below has a one-line comment. The deep WHY (what broke when a
 # default was different, exact RAM math, ZFS notes) is collected in the
 # TECHNICAL NOTES block at the BOTTOM of this file - read it when something
@@ -181,10 +187,13 @@ docker run -d --name "$NAME" --restart "$RESTART" --gpus "$GPUS" --network "$NET
   -e TRITON_CACHE_DIR=/root/.cache/triton \
   -e TORCHINDUCTOR_CACHE_DIR=/root/.cache/torchinductor \
   "$IMG" \
-  --model /model --served-model-name deepseek-v4-flash --trust-remote-code \
+  --model /model --served-model-name deepseek-v4-flash auto --trust-remote-code \
   --kv-cache-dtype fp8 --block-size 256 --max-model-len "$MAXLEN" \
   --gpu-memory-utilization "$UTIL" --max-num-batched-tokens "$BATCHED_TOKENS" --max-num-seqs "$NUM_SEQS" \
   --tokenizer-mode deepseek_v4 --no-scheduler-reserve-full-isl \
+  --tool-call-parser deepseek_v4 \
+  --enable-auto-tool-choice \
+  --reasoning-parser deepseek_v4 \
   $TPARGS $PREFIXARGS $MTPARGS \
   --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"],"cudagraph_capture_sizes":['"$CUDAGRAPH_SIZES"']}' \
   --port "$PORT"
