@@ -19,6 +19,12 @@
 # 2) TWO GPUS. Select the TP size and the expert residency. These are two
 #    independent choices.
 #
+#    TP>1 uses vLLM's custom P2P all-reduce. On GeForce RTX 4090 D that needs a
+#    patched open-gpu-kernel-modules driver (stock drivers block P2P):
+#      https://github.com/Duanyll/open-gpu-kernel-modules/tree/595.71.05-p2p-48g
+#    WITHOUT that patch pass CUSTOM_ALL_REDUCE=0 (NCCL all-reduce) or TP may fail
+#    to init / silently fall back.
+#
 #      # gpu residency. Use this mode when the host has much VRAM and little RAM
 #      # (for example, 2 x 48 GB cards and 20 to 30 GB RAM). The 2-bit base shards
 #      # across the cards. The base stays on the GPUs. There is no host base cache.
@@ -68,23 +74,27 @@
 #    only after the saved long agent prompt gives the correct answer with 0.
 #    If the answer changes with 1, set it back to 0.
 #
-#    MTP_TOKENS=0 disables speculative decoding. MTP uses a small draft head to
-#    propose tokens. Accepted draft tokens can increase generation speed. A low
-#    acceptance value adds work and can reduce speed. The measured Ada run
-#    accepted approximately one half token for each step, so 0 is the default.
-#    Test MTP_TOKENS=1 only after the answer is correct. Keep 1 only when the
-#    generated-token rate increases and the answer does not change.
+#    MTP_TOKENS=1 enables speculative decoding. A small draft head proposes the
+#    next tokens. Accepted proposals increase the output speed. A benchmark on two
+#    RTX 4090 D cards (sm_89, RESIDENCY=gpu, TP=2) measured the output rate:
+#    MTP_TOKENS=1 gives 56 tokens/s in decode and 104 tokens/s with four parallel
+#    requests. With MTP_TOKENS=0, the output rate decreases to 38 tokens/s and
+#    73 tokens/s. The draft acceptance is 0.5, but MTP still increases the speed.
+#    Keep MTP_TOKENS=1.
 #
 #    NUM_SEQS=4 lets the scheduler run four requests. It does not reserve four
 #    complete 262K contexts. The measured KV pool holds approximately 286K
 #    tokens in total. Thus, it holds one 262K request or several shorter
 #    requests. Set NUM_SEQS=1 or 2 when long requests cause memory pressure.
 #
-#    BATCHED_TOKENS controls the number of prompt tokens in one prefill step.
-#    A larger value can load prompts faster but uses more workspace. Reduce it
-#    after an out-of-memory error during prompt load. CUDAGRAPH_SIZES controls
-#    the request shapes that vLLM captures. A shorter list saves some VRAM.
-#    These controls do not reduce the model weight allocation.
+#    BATCHED_TOKENS sets the number of prompt tokens in one prefill step. For this
+#    model, the prefill speed does not depend on this number. A benchmark put a
+#    55,000-token prompt at 883 tokens/s with 1024 and at 879 tokens/s with 2048.
+#    A larger value does not increase the prefill speed, but it uses more workspace.
+#    With MTP_TOKENS=1, a value above 1024 causes an out-of-memory error during
+#    startup. Keep BATCHED_TOKENS=1024. CUDAGRAPH_SIZES controls the request shapes
+#    that vLLM captures. A shorter list saves VRAM. These controls do not decrease
+#    the model weight allocation.
 #
 #    UTIL controls the vLLM VRAM budget. Keep 0.98 on the two 48 GiB cards.
 #    Reduce it only when another process needs VRAM. A smaller value can leave
@@ -112,17 +122,21 @@ UTIL=${UTIL:-0.98}           # fraction of VRAM vLLM may use (raised from 0.96; 
                              # at TP2 RESIDENCY=gpu leaves ~5 GiB/card for everything-not-
                              # weights, so every basis point matters. 0.98 + trimmed graphs
                              # + smaller batch is the working budget for 131K sparse MLA).
-BATCHED_TOKENS=${BATCHED_TOKENS:-1024}  # max-num-batched-tokens; prefill uses most workspace
+BATCHED_TOKENS=${BATCHED_TOKENS:-1024}  # max-num-batched-tokens; keep 1024 with MTP on (see section 4)
 NUM_SEQS=${NUM_SEQS:-4}      # request scheduler limit, not four full-length KV allocations
 CUDAGRAPH_SIZES=${CUDAGRAPH_SIZES:-1,2,4,8}  # cudagraph_capture_sizes, comma-sep (trimmed
                              # from [1,2,4,8,12,16,24] to reduce captured buffers and
                              # workspaces. Graph capture does not copy the model weights).
-MTP_TOKENS=${MTP_TOKENS:-0}  # speculative tokens; read header section 4 before you enable
-PREFIX_CACHING=${PREFIX_CACHING:-0}  # reuse repeated prompt KV; read header section 4
+MTP_TOKENS=${MTP_TOKENS:-1}  # speculative tokens; keep 1 (see header section 4)
+PREFIX_CACHING=${PREFIX_CACHING:-1}  # reuse repeated prompt KV; read header section 4
 SCALE_REFIT=${SCALE_REFIT:-1}  # normal W2 conversion; 0 is for comparison or rollback
 PORT=${PORT:-8001}           # API port (reachable only with NETWORK=host)
 GPUS=${GPUS:-'"device=0"'}   # which GPUs; two cards: '"device=0,1"' + TP=2
 TP=${TP:-1}                  # tensor parallelism = number of GPUs used
+CUSTOM_ALL_REDUCE=${CUSTOM_ALL_REDUCE:-0}  # 1 = keep vLLM's P2P custom all-reduce; 0 = disable
+                             # (-> --disable-custom-all-reduce, NCCL fallback). Custom all-reduce
+                             # needs the open-gpu-kernel-modules P2P patch on RTX 4090 D - see
+                             # header section 2. Set 0 if your driver lacks that patch.
 RESIDENCY=${RESIDENCY:-host} # 'host' = 2-bit base in pinned RAM + GPU pool (RAM-heavy);
                              # 'gpu'  = base sharded ONTO the GPUs, no host cache (VRAM-heavy,
                              # low RAM). TP, RESIDENCY, and SCALE_REFIT identify the quant cache.
@@ -145,7 +159,14 @@ docker rm -f "$NAME" 2>/dev/null || true
 # TP>1 needs host IPC + big /dev/shm for inter-worker tensors; TP1 must NOT
 # pay that (see TECHNICAL NOTES: the ~26 GiB shm helped sink a TP2 first run).
 if [ "$TP" -gt 1 ]; then
-  TPARGS="--tensor-parallel-size $TP --disable-custom-all-reduce"
+  TPARGS="--tensor-parallel-size $TP"
+  # vLLM's custom (P2P) all-reduce needs the open-gpu-kernel-modules P2P patch on
+  # GeForce RTX 4090 D (stock drivers block cudaDeviceCanAccessPeer). Patch:
+  #   https://github.com/Duanyll/open-gpu-kernel-modules/tree/595.71.05-p2p-48g
+  # Without that patch set CUSTOM_ALL_REDUCE=0 (-> NCCL all-reduce).
+  if [ "$CUSTOM_ALL_REDUCE" = 0 ]; then
+    TPARGS="$TPARGS --disable-custom-all-reduce"
+  fi
   IPCARGS="--ipc host --shm-size 64g"
 else
   TPARGS=""
@@ -253,7 +274,8 @@ exit 0
 # the host into a hard hang (even sshd stopped). A later base-cache TP2 run OOM-killed
 # a worker at the 30 GB container cap (OOMKilled=true, 2026-07-19). Hence: TP1 keeps
 # shm at 8g and skips --ipc host; host-residency TP2 needs more host RAM first. TP>1
-# also needs --disable-custom-all-reduce on these boards.
+# custom all-reduce is ON by default now (CUSTOM_ALL_REDUCE=1); it needs the P2P
+# driver patch linked in the header - without that patch set CUSTOM_ALL_REDUCE=0.
 #
 # EXPERT RESIDENCY. The quantization cache is specific to (TP size, residency).
 #   host (default): the 2-bit base stays in pinned host RAM. It uses an on-disk pack
@@ -293,8 +315,8 @@ exit 0
 #     BATCHED_TOKENS=1024  (prefill is the workspace spike)
 #     NUM_SEQS=4           (four short requests; full 262K requests share KV)
 #     CUDAGRAPH_SIZES=1,2,4,8  (was 1,2,4,8,12,16,24; ~80-100 MiB each)
-#     MTP_TOKENS=0         (the live draft accepted only about one half token)
-#     PREFIX_CACHING=0     (isolate long-context correctness before reuse)
+#     MTP_TOKENS=1         (speculative decoding; measured +40% decode and +30% concurrency)
+#     PREFIX_CACHING=1     (reuse repeated prompt KV; enabled by default)
 #     SCALE_REFIT=1        (same-size W2 conversion with lower block SSE)
 #   Override any of them via env to test smaller-first smoke runs (e.g.
 #   MAXLEN=8192 UTIL=0.94 ./docker/serve_sm89_ds4.sh).
