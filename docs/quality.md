@@ -1,90 +1,167 @@
-# Quality — methodology, ablation, and delta recovery
+# Quality validation
 
-The headline tables are in the [README](../README.md). This is the detailed companion.
+This document defines the quality claims for the Moet expert compression.
+It also defines the limits of those claims.
 
-## What we read and compare to
-Baseline = the **untouched official DeepSeek‑V4‑Flash checkpoint** (~149 GiB), verified from its
-safetensors headers: MoE experts are **FP4** (`I8`, e2m1 packed 2/byte) with **`F8_E8M0`**
-block‑32 scales (`layers.0..42.ffn.experts.E.{w1,w2,w3}.weight`, 33,024 tensors); dense and
-attention are **FP8** (`F8_E4M3`, block‑128, per `config.json`). This project changes **only the
-expert codes** (FP4 → 2‑bit symmetric) — scales, dense FP8, and headers stay byte‑identical — and
-runs on the *same* serving stack (only `MODEL_DIR` differs).
+## Checkpoint precision
 
-## Probe protocol (`tools/probe_quant_quality.py`)
-1. **MTP acceptance** — mean accepted draft length + avg draft‑acceptance rate over 3×512‑token
-   greedy generations (`ignore_eos`). Primary fidelity proxy (drafter+target share the model, so a
-   degraded target lowers acceptance). Noise band ≈ ±0.05.
-2. **Coherence** — 12 fixed prompts, exact‑match vs the official‑checkpoint outputs + manual verdict.
-3. **Arithmetic** — 5 multi‑step problems (the official model itself tops out at 3/5).
-4. **Long context** — passphrase needle at 100K/250K/440K depths (`tools/needle_probe.py`).
+The official DeepSeek-V4-Flash checkpoint uses MXFP4 for the routed expert
+weights. It uses one UE8M0 scale for each block of 32 weights. The dense and
+attention weights use FP8.
 
-## Bits‑vs‑quality ablation (same stack, only the expert codes change)
-| codebook | bits | MTP acc. length | draft accept % | arithmetic | coherence |
-|---|---|---|---|---|---|
-| FP4 (16‑level) — official | 4.0 | 2.68 | 84.1 | 3/5 | 12/12 |
-| K=8 (3‑bit) | 3.0 | 2.60 | 79.8 | 3/5 | 12/12 |
-| K=6 (~2.58‑bit) | 2.58 | 2.68 | 84.0 | 2/5 | 11/12 |
-| **K=4 naive 2‑bit (asymmetric)** | 2.0 | **1.00** | **0.0** | 0/5 | **0/12 — broken** |
-| **K=4 tensor‑sym `{−4,−1,1,4}` (ours)** | 2.0 | **2.73** | **86.3** | 2/5 | **12/12** |
+The W2 path changes the routed expert weights. It maps each MXFP4 value to the
+sign-symmetric codebook `{-4, -1, 1, 4}`. The normal conversion keeps the
+checkpoint block scale. The optional scale refit can decrease a block scale by
+one exponent when this change decreases the exact block SSE.
+Base-only W2 enables scale refit by default. Set `SCALE_REFIT=0` in the Ada
+launcher, or set `VLLM_MOE_W2_SCALE_REFIT=0` directly, to disable it.
+Do not combine scale refit with the FP4 delta tier. The two tiers currently
+share scale planes, and the runtime rejects this configuration.
 
-## The finding: it was sign bias, not magnitude
-Naive 2‑bit collapses to a degenerate loop (`}<?}<?…`). The optimal‑L2 2‑bit codebook goes
-**sign‑asymmetric** (drops one sign's tail, e.g. `{−3,−1,0.5,4}`); accumulated per‑expert sign
-bias over 43 layers destroys the model. Forcing a **sign‑symmetric** codebook at the *same* L2
-error restores MTP acceptance to **at/above** the official FP4 experts (2.73/86.3 vs 2.68/84.1),
-12/12 coherent. Symmetry — not granularity — is the lever (33,023/33,024 tensors pick the same
-`{−4,−1,1,4}`).
+## Two different serving configurations
 
-## Delta recovery (FP4 hot‑expert tier)
-Symmetric 2‑bit already matches the official experts on acceptance + coherence. The residual is
-**numerical precision** (multi‑step arithmetic) — the 2‑bit base is "coherent but numerically
-sloppy." Caching the hot experts at FP4 closes it:
+Do not use results from one configuration as proof for the other
+configuration.
 
-| | 2‑bit base only | **2‑bit + FP4 delta** |
+| Configuration | Main settings | Status |
 |---|---|---|
-| arithmetic, e.g. `17×23−100` | ✗ | **✓ (=291)** |
-| single‑stream decode | 151 tok/s | **143 tok/s** (≈ −0.6 ms/step) |
-| extra VRAM | 0 | **~2 GiB** (170 hot‑expert slots) |
+| Base-only W2 | `VLLM_MOE_W2_DELTA_GB=0` | The small probe found coherent short answers. It did not validate long coding-agent prompts. |
+| Maximum quality | 34 GiB FP4 delta, confidence gate, and FP4 prefill | The benchmark campaign matched the native checkpoint on GSM8K and GPQA. |
 
-Production 1‑GPU end‑to‑end A/B (warmed): MTP acceptance with the delta tier **2.725 / 2.744**
-(mean/median, σ 0.136) — at/above the same‑run two‑card FP4 control **2.546 / 2.496** (σ 0.172).
+The maximum-quality recipe is
+`bench/recipes/deepseek-v4-flash/pro6000x2-tp2-maxq.yaml`. It uses two RTX PRO
+6000 GPUs. It does not describe the Ada base-only configuration.
 
-## Studying the precision tiering
+The recorded maximum-quality results are in
+`bench/results/v2026.07.17-quality/rtx-pro6000x4/deepseek-v4-flash__pro6000x2-tp2-maxq.json`.
+The results include these values:
 
-The delta tier is a *workload‑adaptive* mixed‑precision scheme — the set of FP4 experts is
-chosen at runtime from routing. The manager is instrumented so this can be measured directly
-(default off; logging only, no effect on the serving path):
+| Probe | W2 with FP4 recovery | Native comparison |
+|---|---:|---:|
+| GSM8K, run 1 | 97.5% | 97.0% |
+| GSM8K, run 2 | 97.5% | 97.0% |
+| GPQA without thinking | 74.75% | 74.24% |
+| GPQA with high thinking | 88.38% | 86.87% |
+| Needle | Pass at 121,152 prompt tokens | Not applicable |
+
+These results validate the FP4 recovery configuration. They do not validate
+the base-only W2 configuration.
+
+## Base-only probe limits
+
+The early `QUANT_PROBE` study reported these values for the sign-symmetric
+base:
+
+- Mean accepted draft length was 2.73. The FP4 control value was 2.68.
+- The draft acceptance rate was 86.3%. The FP4 control value was 84.1%.
+- The short coherence set passed 12 of 12 prompts.
+- The arithmetic set passed 2 of 5 prompts.
+
+This study is an ablation result. It is not a production parity result. The
+set had only 12 short coherence prompts. It did not contain 50,000-token to
+100,000-token coding-agent sessions.
+
+MTP acceptance is not a direct W2 fidelity measurement in this repository.
+The W2 layer selection excludes the MTP drafter. Thus, the drafter uses the
+stock expert path and the target uses W2. A low acceptance value can show a
+target and drafter mismatch, but it cannot locate the cause of that mismatch.
+
+The historical codebook ablation used the same small probe:
+
+| Codebook | Bits | Mean accepted length | Draft acceptance | Arithmetic | Coherence |
+|---|---:|---:|---:|---:|---:|
+| Official FP4 | 4.0 | 2.68 | 84.1% | 3 of 5 | 12 of 12 |
+| Symmetric K=8 | 3.0 | 2.60 | 79.8% | 3 of 5 | 12 of 12 |
+| Symmetric K=6 | 2.58 | 2.68 | 84.0% | 2 of 5 | 11 of 12 |
+| Asymmetric K=4 | 2.0 | 1.00 | 0.0% | 0 of 5 | 0 of 12 |
+| Sign-symmetric K=4 | 2.0 | 2.73 | 86.3% | 2 of 5 | 12 of 12 |
+
+The asymmetric K=4 result produced degenerate output. The sign-symmetric
+codebook removed that failure in the small probe. This does not prove that the
+sign-symmetric base matches FP4 on long prompts.
+
+## Ada base-only audit
+
+The Ada launcher must use `VLLM_MOE_W2_DELTA_GB=0`. The FP4 delta kernels are
+not available on Ada. Therefore, the maximum-quality result does not apply to
+the current two-card Ada service.
+
+A 2026-07-21 audit used direct production-geometry tests. The tests found no
+large error in these paths:
+
+- The native SM89 block-scaled FP8 output projection had relative L2 error
+  from 0.000675 to 0.000722.
+- The packed sparse MLA cache writer passed short and 262,143-position tests.
+- The sparse MLA reader used the production page stride and had a worst row
+  relative error of 0.0078125.
+
+The same audit sampled 18 real expert matrices before model load. The current
+base-only conversion had mean relative L2 error 0.381501 and mean row cosine
+0.927426. This is a large weight error even when the kernel is bit-correct.
+
+The scale-refit candidate reduced the sample values to 0.354995 relative L2
+error and 0.935017 row cosine. It did not change storage size or the kernel.
+This is a weight-level result. A long-context model evaluation is still
+required.
+
+## Required Ada comparison
+
+Start with MTP and prefix caching disabled. Use the same long agent prompt for
+each run.
 
 ```bash
-VLLM_MOE_W2_DELTA_TRACE=1                 # coverage + churn summary + per-layer FP4 histogram
-VLLM_MOE_W2_DELTA_TRACE=2                 # + one line per promote/evict event
-VLLM_MOE_W2_DELTA_TRACE_EVERY=64          # ticks between summaries
-VLLM_MOE_W2_DELTA_DUMP=/tmp/delta.json    # atomic precision-map snapshots (tail-able)
+RESIDENCY=gpu TP=2 GPUS='"device=0,1"' \
+MAXLEN=262144 NUM_SEQS=4 MTP_TOKENS=0 PREFIX_CACHING=0 \
+SCALE_REFIT=1 ./docker/serve_sm89_ds4.sh
 ```
 
-Each summary reports filled slots, coverage (`cached / layers×experts`), per‑window and
-cumulative promote/evict counts, and FP4 experts per layer; the JSON dump is the full
-`{layer: [fp4 expert ids]}` map plus counters. `DeltaTier.precision_of(layer, expert)` and
-`precision_map()` expose the same state programmatically. `tools/delta_trace_demo.py` drives
-the real manager with synthetic Zipfian routing so you can see this output (and validate the
-instrumentation) in ~1 s without loading the model. Questions this makes answerable:
+Then run these controlled comparisons:
 
-- **Coverage vs. pool size** — sweep `VLLM_MOE_W2_DELTA_GB` and watch how coverage % and the
-  arithmetic/recall probes move; find the knee where extra VRAM stops buying quality.
-- **Working‑set stability** — cumulative evictions / promotions over a long run is a churn
-  rate; low churn means routing is concentrated and a small pool suffices.
-- **Per‑layer concentration** — the histogram shows whether some layers route to far more
-  distinct experts than others (where precision matters most).
+1. Set `SCALE_REFIT=0`. Compare answer correctness with the refit result.
+2. Keep the better W2 setting. Set `PREFIX_CACHING=1`. Repeat the exact prompt.
+3. Keep the better cache setting. Set `MTP_TOKENS=1`. Measure correctness and
+   generated tokens per second.
 
-These are open questions the design invites; the README tables are the headline, this is the
-instrumentation to push further.
+Do not enable MTP only because its acceptance counter is nonzero. Enable it
+only when the end-to-end generated-token rate increases and the answer stays
+correct.
 
-## Reproduce
+## FP4 recovery instrumentation
+
+The FP4 delta manager can report its coverage and replacement activity. These
+settings only apply on a GPU architecture that has the FP4 delta kernels.
+
 ```bash
-python3 tools/probe_quant_quality.py <port>           # acceptance + coherence + arithmetic
-python3 tools/needle_probe.py <port> 48000 0.1        # long-context retrieval
-# ablation variants are produced offline by tools/repack_expert_bits.py (quality probe only)
+VLLM_MOE_W2_DELTA_TRACE=1        # Select summary output.
+# VLLM_MOE_W2_DELTA_TRACE=2      # Or, select output for each event.
+VLLM_MOE_W2_DELTA_TRACE_EVERY=64
+VLLM_MOE_W2_DELTA_DUMP=/tmp/delta.json
 ```
-These are engineering‑grade fidelity checks, not a standardized benchmark sweep (MMLU/GSM8K‑style
-evals are a natural next step). Discipline: every surprising delta is re‑measured against a
-same‑GPU placebo control before it's believed.
+
+Trace level 1 reports coverage, promotions, replacements, and an FP4 expert
+count for each layer. Trace level 2 also reports each promote and replace
+event. `DeltaTier.precision_map()` returns the same precision map to code.
+Use `tools/delta_trace_demo.py` to test this instrumentation without a model
+load.
+
+## Cache identity
+
+Persistent expert data depends on the checkpoint, TP size, residency, and
+quantizer settings. The cache metadata now includes the checkpoint shard file
+identity and the scale-refit setting. The host-pack loader-skip probe also
+checks the checkpoint identity, layer count, and quantizer identity.
+
+Remove old caches after an unclean disk or file-system event. Cache metadata
+and file sizes cannot prove that all data bytes are free from storage errors.
+
+## Test commands
+
+```bash
+python3 tools/test_moe_w2_planes.py
+python3 tools/test_moe_w2_store_identity.py
+python3 tools/probe_quant_quality.py <port>
+python3 tools/needle_probe.py <port> 120000 0.5
+```
+
+Use a same-GPU native control for each quality claim. Record the complete
+recipe with the result.

@@ -186,30 +186,25 @@ Moet bandwidth win survives; only the tensor‑core instruction changes.
 |---|---|---|---|
 | `moe_w2_sm89.py` | `moe_w2_mm_sm89` | `("w2", K)` + `("w2mc4", K)`, K ∈ {512, 1024, 2048, 4096, 6144, 7168} | 2‑bit MoE GEMM emulation, decode AND prefill (one kernel, `m_rows` mask) |
 
-The file is the published mirror of
-`vllm/model_executor/layers/quantization/utils/moe_w2_sm89.py` on the fork
-branch (the loader imports the vllm copy; keep them byte‑identical). The
-loader branches on `cap == (8, 9)` in `moe_w2_cubit._ensure_ready`;
-`_launch` stays arch‑blind (a registered callable launches Triton, a
-`c_void_p` launches the cubin). AFRAG is a QMMA A‑fragment LDG.128
-optimization and is **not** ported (prefill falls back to `w2mc4`); the
-w4/w4q delta tiers are **not** ported — serve Ada with
-`VLLM_MOE_W2_DELTA=0`, `--kv-cache-dtype fp8`.
+The file is a published mirror of
+`overlay/vllm/vllm/model_executor/layers/quantization/utils/moe_w2_sm89.py`.
+The loader imports the overlay copy. Keep the two files byte-identical.
+The loader selects the kernel when `cap == (8, 9)`.
+The `_launch` function accepts a Triton callable or a cubin pointer.
+AFRAG is not available on Ada. Prefill uses `w2mc4`.
+The FP4 delta kernels are not available on Ada.
+Use `VLLM_MOE_W2_DELTA_GB=0` and `--kv-cache-dtype fp8`.
 
-Validation status: `gen/moe_w2_sm89_cpu_check.py` (CPU golden of the
-addressing + numerics, runs anywhere) **PASS** for every K
-{512,1024,2048,4096,6144,7168} — byte‑exact fragment‑major addressing (0
-mismatches over all rows/k), worst_rel 2.5–3.2e‑3 vs the f32 reference
-(same band as the SM120 cubins), 4‑run identical. On‑silicon op gate
-`gen/moe_w2_check_sm89.py` (same reference math and verdict as
-`moe_w2_check.py`: worst_rel < 2.5e‑2 AND 4 runs byte‑identical) and the
-e2e suites (`tools/test_moe_w2_forward.py` rel<0.06/cos>0.999) **pending
-sm_89 hardware** — this dev box has none; run them on the first Ada card
-before serving. Every engine boot additionally runs a 1‑pair startup
-self‑test on the serving silicon (`moe_w2_sm89.self_test`, gate 2.5e‑2,
-logged with device + triton version; `VLLM_MOE_W2_SM89_SELFTEST=0`
-skips) — see docs/ada‑sm89‑port.md § Observability. **First silicon
-signal (field report, RTX 4090 D / triton 3.6.0): startup self‑test
-PASS, worst_rel 2.6e‑3** — squarely in the CPU‑golden band. That is the
-1‑pair smoke, not the full gate: the per‑K op sweep and the e2e suites
-above remain the acceptance bar.
+The CPU test `gen/moe_w2_sm89_cpu_check.py` passed for every supported K.
+The supported values are 512, 1024, 2048, 4096, 6144, and 7168.
+The addressing test found zero mismatches.
+The measured `worst_rel` range was 2.5e-3 to 3.2e-3.
+Four runs produced identical results.
+
+The startup test passed on an RTX 4090 D with Triton 3.6.0.
+The measured `worst_rel` value was 2.6e-3.
+Each engine boot runs this one-pair test by default.
+Set `VLLM_MOE_W2_SM89_SELFTEST=0` only when you must skip the test.
+The one-pair test does not replace the per-K operation sweep.
+It also does not replace the end-to-end MoE tests.
+See `docs/ada-sm89-port.md` for the current Ada validation record.

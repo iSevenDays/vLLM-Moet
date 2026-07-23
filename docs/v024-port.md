@@ -1,22 +1,18 @@
-# The v0.24.0 port
+# Historical v0.24.0 port
 
-The project targets **official vLLM v0.24.0**, which ships DeepSeek‑V4 + SM120 natively
-(`vllm/models/deepseek_v4/`, FlashInfer SM120 sparse‑MLA, GLM‑5.x `GlmMoeDsaForCausalLM`).
-Our overlay is a **7.4k‑line patch** (37 files): the 2‑bit expert planes, the FP4 delta
-cache, the confidence gate, the cubit dispatch, the expert stores — plus the SM120 fixes
-below.
+This document records the retired v0.24.0 Blackwell line.
+It is not the current installation guide.
+The current Ada image uses official vLLM v0.25.1 at commit `752a3a504`.
+The current repository uses `overlay/vllm/` and generated per-file patches in `patches/`.
+The repository does not contain the old combined v0.24.0 patch.
 
-## Apply
+## Historical build method
 
-```bash
-git clone --branch v0.24.0 https://github.com/vllm-project/vllm && cd vllm
-git apply /path/to/vLLM-Moet/patch/vllm-moet-v0.24.0.patch
+The retired build cloned official vLLM v0.24.0 and applied one combined patch.
+Do not use that method with the current repository.
+Use `Dockerfile.sm89-v0251` for the current Ada image.
 
-# python-only overlay: reuse the official precompiled wheel for the C/CUDA artifacts
-VLLM_USE_PRECOMPILED=1 pip install -e . --no-deps --no-build-isolation
-```
-
-Environment pins that go with the patch (both required on SM120):
+The following dependency pins apply only to the historical SM120 image:
 
 | dep | version | why |
 |---|---|---|

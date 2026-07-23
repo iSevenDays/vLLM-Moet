@@ -1,0 +1,358 @@
+diff --git a/tests/v1/attention/test_triton_sparse_mla_dsv4.py b/tests/v1/attention/test_triton_sparse_mla_dsv4.py
+new file mode 100644
+index 0000000..31d7385 100644
+--- /dev/null
++++ b/tests/v1/attention/test_triton_sparse_mla_dsv4.py
+@@ -0,0 +1,352 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Numerics for the Triton DSv4 sparse-MLA port (Ada / pre-SM100 route).
++
++Three tiers, mirroring how the port was validated off-GPU first:
++
++1. torch-reference invariants, CPU-only: the packed fp8_ds_mla
++   encode/decode round-trips, masking/lengths/sinks behave per the
++   FlashInfer SM120 contract.
++2. Triton kernel vs. torch reference under ``TRITON_INTERPRET=1``
++   (CPU, no GPU needed - run in CI).
++3. Triton kernel vs. torch reference on CUDA (any arch; this is what the
++   init-time self-test also runs on the serving box).
++"""
++
++import math
++import os
++
++import pytest
++import torch
++
++from vllm.v1.attention.ops.triton_sparse_mla_dsv4 import (
++    _BPT_PACKED,
++    _D,
++    dequant_dsv4_packed_cache,
++    pack_dsv4_reference_cache,
++    sparse_mla_dsv4_torch_ref,
++    triton_sparse_mla_dsv4,
++)
++
++SCALE = _D**-0.5
++
++
++def _mk_case(
++    device: torch.device,
++    *,
++    t: int = 4,
++    h: int = 16,
++    pages: int = 6,
++    pbs: int = 64,
++    k_main: int = 128,
++    k_extra: int | None = 256,
++    packed_main: bool = True,
++    packed_extra: bool = True,
++    with_sinks: bool = True,
++    with_lens: bool = True,
++    padded_layout: bool = False,
++    seed: int = 0,
++):
++    torch.manual_seed(seed)
++    n_slots = pages * pbs
++
++    def mk_cache(packed: bool):
++        rows = torch.randn(n_slots, _D, device=device) * 2.0
++        if packed:
++            cache = pack_dsv4_reference_cache(rows, pbs)
++        else:
++            cache = rows.to(torch.bfloat16).view(pages, pbs, _D)
++        cache = cache.unsqueeze(-2)  # NHD: [pages, pbs, 1, w]
++        return _pad_to_alignment(cache) if padded_layout else cache
++
++    q = torch.randn(t, h, _D, device=device, dtype=torch.bfloat16)
++    idx = torch.randint(0, n_slots, (t, k_main), device=device,
++                        dtype=torch.int32)
++    idx[0, k_main // 2] = -1  # -1 padding inside the active window
++    lens = None
++    if with_lens:
++        lens = torch.randint(0, k_main + 1, (t,), device=device,
++                             dtype=torch.int32)
++        lens[min(1, t - 1)] = 0  # all-masked token
++        lens[0] = k_main
++    sinks = None
++    if with_sinks:
++        sinks = torch.full((h,), -float("inf"), device=device,
++                           dtype=torch.float32)
++        sinks[: h // 2] = torch.randn(h // 2, device=device,
++                                      dtype=torch.float32)
++
++    kwargs = dict(
++        sparse_indices=idx,
++        swa_topk_lens=lens,
++        bmm1_scale=SCALE,
++        sinks=sinks,
++        kv_layout="NHD",
++    )
++    if k_extra is not None:
++        kwargs["compressed_kv_cache"] = mk_cache(packed_extra)
++        kwargs["extra_sparse_indices"] = torch.randint(
++            0, n_slots, (t, 1, k_extra), device=device, dtype=torch.int32)
++        elens = torch.randint(0, k_extra + 1, (t,), device=device,
++                              dtype=torch.int32)
++        kwargs["extra_sparse_topk_lens"] = elens
++    return q, mk_cache(packed_main), kwargs
++
++
++def _pad_to_alignment(cache: torch.Tensor,
++                      alignment_bytes: int = 576) -> torch.Tensor:
++    """Mimic upstream's ``page_size_padded`` allocation when
++    ``alignment=576`` (DSv4 SWA + MLA specs): lay each page's data
++    contiguously into a wider flat buffer, then re-expose the original
++    ``[pages, pbs, 1, W]`` shape with the padded page stride via
++    ``as_strided``. The padding tail stays zero and is never read because
++    ``pbs`` bounds the token index inside a page.
++
++    Reproduces the 2026-07-19 Ada boot failure: a cache built this way is
++    non-contiguous by design, so the old strict ``is_contiguous()`` guard
++    in ``_normalize_kv_cache`` rejected it.
++    """
++    pages, pbs, _, w = cache.shape
++    item_bytes = cache.element_size()
++    real_page_bytes = pbs * w * item_bytes
++    padded = (math.ceil(real_page_bytes / alignment_bytes)
++              * alignment_bytes)
++    if padded == real_page_bytes:
++        return cache
++    padded_page_elems = padded // item_bytes
++    flat_per_page = pbs * w
++    buf = torch.zeros(pages * padded_page_elems, dtype=cache.dtype,
++                      device=cache.device)
++    src = cache.reshape(pages, flat_per_page)
++    for p in range(pages):
++        buf[p * padded_page_elems:(p * padded_page_elems) + flat_per_page] = \
++            src[p]
++    return buf.as_strided(cache.shape,
++                          (padded_page_elems, w, w, 1))
++
++
++def _rel_err(got: torch.Tensor, want: torch.Tensor) -> float:
++    """Worst per-row error relative to row magnitude (see
++    _worst_row_rel in the op module: per-element max-rel with a clamp
++    floor failed a CORRECT kernel on cancellation-heavy near-zero
++    elements of the shipped bf16 path - 4090 field hit, 2026-07-19)."""
++    from vllm.v1.attention.ops.triton_sparse_mla_dsv4 import _worst_row_rel
++    return _worst_row_rel(got, want)
++
++
++# --------------------------------------------------------------------------
++# Tier 1: torch reference invariants (CPU)
++# --------------------------------------------------------------------------
++
++
++def test_packed_cache_roundtrip_cpu():
++    torch.manual_seed(0)
++    pbs = 64
++    rows = torch.randn(4 * pbs, _D) * 3.0
++    packed = pack_dsv4_reference_cache(rows, pbs)
++    assert packed.shape == (4, pbs, _BPT_PACKED)
++    decoded = dequant_dsv4_packed_cache(packed.reshape(4, -1), pbs)
++    # rope is stored bf16 (exact-ish); nope is fp8 with power-of-two
++    # per-64 tile scales -> e4m3 relative quantization error.
++    rope_rel = ((decoded[:, 448:] - rows[:, 448:]).abs() /
++                rows[:, 448:].abs().clamp_min(1e-3)).max()
++    assert rope_rel <= 2.0**-8, f"rope bf16 roundtrip rel err {rope_rel}"
++    nope = rows[:, :448].reshape(-1, 7, 64)
++    dec_nope = decoded[:, :448].reshape(-1, 7, 64)
++    tile_amax = nope.abs().amax(dim=-1, keepdim=True)
++    rel = ((dec_nope - nope).abs() / tile_amax.clamp_min(1e-6)).max()
++    assert rel <= 0.13, f"fp8 tile-relative roundtrip err {rel}"
++
++
++def test_ref_all_masked_token_is_zero_cpu():
++    q, cache, kwargs = _mk_case(torch.device("cpu"), k_extra=None,
++                                with_sinks=False)
++    kwargs["swa_topk_lens"] = torch.zeros(q.shape[0], dtype=torch.int32)
++    out = sparse_mla_dsv4_torch_ref(q, cache, **kwargs)
++    assert (out == 0).all()
++
++
++def test_ref_sink_only_token_is_zero_cpu():
++    q, cache, kwargs = _mk_case(torch.device("cpu"), k_extra=None,
++                                with_sinks=True)
++    kwargs["swa_topk_lens"] = torch.zeros(q.shape[0], dtype=torch.int32)
++    out = sparse_mla_dsv4_torch_ref(q, cache, **kwargs)
++    assert (out == 0).all()
++
++
++def test_ref_sink_shrinks_output_cpu():
++    """The sink adds denominator mass only -> outputs scale down."""
++    q, cache, kwargs = _mk_case(torch.device("cpu"), k_extra=None,
++                                with_sinks=False, with_lens=False)
++    base = sparse_mla_dsv4_torch_ref(q, cache, **kwargs).to(torch.float32)
++    h = q.shape[1]
++    kwargs["sinks"] = torch.full((h,), 20.0)  # dominant sink
++    sunk = sparse_mla_dsv4_torch_ref(q, cache, **kwargs).to(torch.float32)
++    assert sunk.abs().sum() < 0.05 * base.abs().sum()
++
++
++def test_ref_matches_dense_softmax_cpu():
++    """Cross-check against a from-scratch dense computation."""
++    torch.manual_seed(3)
++    pbs, pages, t, h, k = 64, 2, 2, 16, 32
++    rows = torch.randn(pages * pbs, _D)
++    cache = rows.to(torch.bfloat16).view(pages, pbs, 1, _D)
++    q = torch.randn(t, h, _D, dtype=torch.bfloat16)
++    idx = torch.randint(0, pages * pbs, (t, k), dtype=torch.int32)
++    out = sparse_mla_dsv4_torch_ref(q, cache, idx, bmm1_scale=SCALE,
++                                    kv_layout="NHD")
++    kf = rows.to(torch.bfloat16).to(torch.float32)
++    for ti in range(t):
++        gathered = kf[idx[ti].long()]  # [k, D]
++        s = (q[ti].to(torch.float32) @ gathered.T) * SCALE
++        p = torch.softmax(s, dim=-1)
++        want = p @ gathered
++        got = out[ti].to(torch.float32)
++        assert _rel_err(got, want.to(torch.bfloat16)) < 1e-2
++
++
++# --------------------------------------------------------------------------
++# Tiers 2 + 3: Triton kernel vs. torch reference
++# --------------------------------------------------------------------------
++
++_INTERPRET = os.getenv("TRITON_INTERPRET", "0") == "1"
++
++
++def _kernel_vs_ref(device: torch.device, **case_kw) -> None:
++    q, cache, kwargs = _mk_case(device, **case_kw)
++    got = triton_sparse_mla_dsv4(q, cache, **kwargs)
++    want = sparse_mla_dsv4_torch_ref(q, cache, **kwargs)
++    err = _rel_err(got, want)
++    assert err < 5e-2, f"kernel vs ref worst_rel={err}"
++
++
++_CASE_GRID = [
++    dict(),  # packed main + packed extra, sinks, lens
++    dict(packed_main=False, packed_extra=False),
++    dict(k_extra=None),
++    dict(with_sinks=False),
++    dict(with_lens=False, with_sinks=False, k_extra=None),
++    dict(h=32, k_main=192, seed=7),
++    dict(t=1, h=16, k_main=64, k_extra=64, seed=11),
++    # Alignment-padded layouts (Ada boot bug, 2026-07-19): upstream's
++    # ``page_size_padded`` allocation makes the cache non-contiguous by
++    # design. The kernel must read ``page_stride`` from
++    # ``kv_cache.stride()[0]``; the packed and plain paths are covered
++    # separately because their gather arithmetic differs.
++    dict(packed_main=True, packed_extra=True, padded_layout=True, seed=21),
++    dict(packed_main=False, packed_extra=False, padded_layout=True, seed=22),
++]
++
++
++@pytest.mark.skipif(not _INTERPRET,
++                    reason="set TRITON_INTERPRET=1 for the CPU tier")
++@pytest.mark.parametrize("case_kw", _CASE_GRID)
++def test_kernel_matches_ref_interpreter(case_kw):
++    _kernel_vs_ref(torch.device("cpu"), **case_kw)
++
++
++@pytest.mark.skipif(not _INTERPRET,
++                    reason="set TRITON_INTERPRET=1 for the CPU tier")
++def test_boot_self_test_case_runs_on_cpu():
++    """Execute the EXACT boot-time self-test path on CPU, under the
++    loader's ambient conditions.
++
++    Regression guard for two 2026-07-19 field hits, both in code only a
++    CUDA boot used to reach:
++    1. positional kernel call - `idx` landed in `workspace_buffer` after
++       the signature grew to mirror flashinfer;
++    2. default-dtype sensitivity - at boot this runs inside the model
++       loader's set_default_dtype(bf16) context, so the sinks tensor
++       (allocated without an explicit dtype) came out bf16 and was
++       refused. Hence the bf16 ambient below.
++    """
++    from vllm.v1.attention.ops.triton_sparse_mla_dsv4 import _self_test_case
++    old = torch.get_default_dtype()
++    torch.set_default_dtype(torch.bfloat16)  # the loader's ambient at boot
++    try:
++        assert _self_test_case(torch.device("cpu")) < 5e-2
++    finally:
++        torch.set_default_dtype(old)
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
++@pytest.mark.parametrize("case_kw", _CASE_GRID)
++def test_kernel_matches_ref_cuda(case_kw):
++    _kernel_vs_ref(torch.device("cuda"), **case_kw)
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
++def test_self_test_passes_on_this_device():
++    from vllm.v1.attention.ops.triton_sparse_mla_dsv4 import (
++        dsv4_sparse_mla_self_test)
++    dsv4_sparse_mla_self_test.cache_clear()
++    dsv4_sparse_mla_self_test()
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
++def test_cuda_graph_capturable():
++    """The decode path is captured into CUDA graphs on the serving box -
++    the port must not sync with the host or allocate per step."""
++    device = torch.device("cuda")
++    q, cache, kwargs = _mk_case(device)
++    out = torch.empty(q.shape[0], q.shape[1], _D, device=device,
++                      dtype=torch.bfloat16)
++    kwargs["out"] = out
++    # warmup on a side stream, then capture
++    s = torch.cuda.Stream()
++    s.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(s):
++        triton_sparse_mla_dsv4(q, cache, **kwargs)
++    torch.cuda.current_stream().wait_stream(s)
++    g = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(g):
++        triton_sparse_mla_dsv4(q, cache, **kwargs)
++    g.replay()
++    torch.cuda.synchronize()
++    want = sparse_mla_dsv4_torch_ref(q, cache,
++                                     **{k: v for k, v in kwargs.items()
++                                        if k != "out"})
++    assert _rel_err(out, want) < 5e-2
++
++
++@pytest.mark.skipif(not _INTERPRET,
++                    reason="set TRITON_INTERPRET=1 for the CPU tier")
++def test_padded_layout_matches_ref_interpreter():
++    """Regression for the 2026-07-19 Ada boot bug: a non-contiguous,
++    alignment-padded cache used to trip ``_normalize_kv_cache``'s strict
++    guard before the kernel ran. With ``page_stride`` threaded through
++    the gather, the kernel must read the same data the torch ref reads.
++    """
++    device = torch.device("cpu")
++    q, cache, kwargs = _mk_case(device, padded_layout=True, seed=21)
++    assert not cache.is_contiguous(), "padded_layout case is contiguous"
++    got = triton_sparse_mla_dsv4(q, cache, **kwargs)
++    want = sparse_mla_dsv4_torch_ref(q, cache, **kwargs)
++    err = _rel_err(got, want)
++    assert err < 5e-2, f"padded layout kernel vs ref worst_rel={err}"
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
++def test_padded_layout_cuda_graph_capturable():
++    """The Ada boot died inside CUDA graph capture because the cache was
++    non-contiguous. The ``page_stride`` path must remain capturable."""
++    device = torch.device("cuda")
++    q, cache, kwargs = _mk_case(device, padded_layout=True, seed=21)
++    assert not cache.is_contiguous(), "padded_layout case is contiguous"
++    out = torch.empty(q.shape[0], q.shape[1], _D, device=device,
++                      dtype=torch.bfloat16)
++    kwargs["out"] = out
++    s = torch.cuda.Stream()
++    s.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(s):
++        triton_sparse_mla_dsv4(q, cache, **kwargs)
++    torch.cuda.current_stream().wait_stream(s)
++    g = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(g):
++        triton_sparse_mla_dsv4(q, cache, **kwargs)
++    g.replay()
++    torch.cuda.synchronize()
++    want = sparse_mla_dsv4_torch_ref(q, cache,
++                                     **{k: v for k, v in kwargs.items()
++                                        if k != "out"})
++    assert _rel_err(out, want) < 5e-2

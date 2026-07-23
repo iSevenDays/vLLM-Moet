@@ -1,5 +1,0 @@
-# Legacy fingerprint for patch/vllm-moet-v0.25.1.patch. The patch is now
-# edited directly under the patch-direct procedure in AGENTS.md; this file
-# is preserved for history. The SHA below names the upstream v0.25.1 tag
-# the patch is diffed against at build time.
-252002dbde1a0b8cf6285ea2ebbb6ceec28926d3

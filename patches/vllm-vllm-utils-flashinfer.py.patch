@@ -1,0 +1,100 @@
+diff --git a/vllm/utils/flashinfer.py b/vllm/utils/flashinfer.py
+index 998c3b6..00bec0b 100644
+--- a/vllm/utils/flashinfer.py
++++ b/vllm/utils/flashinfer.py
+@@ -153,11 +153,60 @@
+     "trtllm_batch_decode_with_kv_cache_mla",
+     fallback_fn=_missing_sparse_mla,
+ )
+-flashinfer_trtllm_batch_decode_sparse_mla_dsv4 = _lazy_import_wrapper(
++_flashinfer_native_trtllm_batch_decode_sparse_mla_dsv4 = _lazy_import_wrapper(
+     "flashinfer.decode",
+     "trtllm_batch_decode_sparse_mla_dsv4",
+     fallback_fn=_missing_sparse_mla,
+ )
++
++
++@functools.lru_cache(maxsize=None)
++def _dsv4_sparse_mla_route(device: torch.device) -> str:
++    """Pick ``flashinfer`` or ``triton-port`` for DSv4 sparse MLA.
++
++    Mirrors FlashInfer's DEEPEST arch gate
++    (``_resolve_dsv4_sparse_mla_backend``: SM100/103 -> trtllm-gen,
++    SM120/121 -> sparse, everything else -> ValueError). Class names and
++    import/signature probes above that resolver have lied before: Ada
++    passed both and then died at decode graph capture, 41 s into boot.
++    Everything the resolver refuses routes to vLLM's Triton port
++    (``vllm/v1/attention/ops/triton_sparse_mla_dsv4.py``).
++
++    ``VLLM_DSV4_SPARSE_MLA_FORCE_TRITON=1`` forces the port on any arch
++    (A/B numerics and perf against the native kernels).
++    """
++    if os.getenv("VLLM_DSV4_SPARSE_MLA_FORCE_TRITON",
++                 "0").lower() in ("1", "true", "yes", "on"):
++        logger.warning_once(
++            "DSv4 sparse MLA: VLLM_DSV4_SPARSE_MLA_FORCE_TRITON=1 - using "
++            "the Triton port even where FlashInfer has native kernels.")
++        return "triton-port"
++    major, minor = torch.cuda.get_device_capability(device)
++    if major in (10, 12):
++        return "flashinfer"
++    logger.warning_once(
++        "DSv4 sparse MLA: FlashInfer's resolver has no sm_%d%d kernel "
++        "(supports SM100/SM103/SM120/SM121) - decode AND prefill route to "
++        "vLLM's Triton sparse-MLA port. Correct but slower than the native "
++        "kernels; a native port is the long-term fix.", major, minor)
++    return "triton-port"
++
++
++def flashinfer_trtllm_batch_decode_sparse_mla_dsv4(*args: Any,
++                                                   **kwargs: Any) -> Any:
++    """DSv4 sparse-MLA decode/prefill entry, routed by device arch.
++
++    SM100/SM103 and SM120/SM121 call FlashInfer natively; every other
++    arch takes the Triton port with identical call surface + semantics.
++    """
++    query = kwargs["query"] if "query" in kwargs else args[0]
++    if query.is_cuda and _dsv4_sparse_mla_route(query.device) == "triton-port":
++        from vllm.v1.attention.ops.triton_sparse_mla_dsv4 import (
++            triton_sparse_mla_dsv4)
++
++        return triton_sparse_mla_dsv4(*args, **kwargs)
++    return _flashinfer_native_trtllm_batch_decode_sparse_mla_dsv4(
++        *args, **kwargs)
+ 
+ 
+ # Special case for autotune since it returns a context manager
+@@ -214,7 +263,15 @@
+ 
+ @functools.cache
+ def has_flashinfer_sparse_mla_sm120() -> bool:
+-    """Return ``True`` if FlashInfer sparse MLA decode support is available."""
++    """Return ``True`` if FlashInfer sparse MLA decode support is available.
++
++    Checks the SIGNATURE, not just the import: vllm's DSV4 sparse call
++    sites pass the SWA kwargs (``swa_topk_lens`` et al) that FlashInfer
++    grew in 0.6.14, while the requirements pin lagged at 0.6.13 - an old
++    package imports fine and then dies mid-warmup with an
++    unexpected-keyword TypeError (field-hit on Ada). Probing here turns
++    that into an init-time backend refusal that names the remedy.
++    """
+     if not has_flashinfer():
+         return False
+     try:
+@@ -224,6 +281,16 @@
+             trtllm_batch_decode_with_kv_cache_mla,
+         )
+     except ImportError:
++        return False
++    import inspect
++    if "swa_topk_lens" not in inspect.signature(
++            trtllm_batch_decode_sparse_mla_dsv4).parameters:
++        logger.warning_once(
++            "FlashInfer's trtllm_batch_decode_sparse_mla_dsv4 lacks the "
++            "swa_topk_lens API (needs flashinfer-python>=0.6.14; the "
++            "vllm requirements pin 0.6.13 predates the DSV4 SWA kwargs) "
++            "- sparse MLA decode disabled. Install flashinfer-python"
++            "==0.6.14 (+ the matching jit-cache wheel).")
+         return False
+     return (
+         callable(trtllm_batch_decode_sparse_mla_dsv4)
