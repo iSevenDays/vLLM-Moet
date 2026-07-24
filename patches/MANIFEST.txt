@@ -3,6 +3,7 @@
 # (regenerate via `python3 tools/gen_patches.py`).
 vllm-csrc-nvfp4_ds_mla-concat_and_cache_nvfp4_ds_mla.cu.patch
 vllm-tests-kernels-attention-test_triton_paged_mqa_logits_dsv4.py.patch
+vllm-tests-kernels-moe-test_dsv4_topk.py.patch
 vllm-tests-kernels-test_triton_ada_fp8_bmm.py.patch
 vllm-tests-v1-attention-test_triton_sparse_mla_dsv4.py.patch
 vllm-tools-nvfp4_flashinfer_sm120-README.md.patch
@@ -14,6 +15,8 @@ vllm-vllm-config-speculative.py.patch
 vllm-vllm-config-vllm.py.patch
 vllm-vllm-envs.py.patch
 vllm-vllm-model_executor-layers-attention-mla_attention.py.patch
+vllm-vllm-model_executor-layers-fused_moe-router-dsv4_topk.py.patch
+vllm-vllm-model_executor-layers-fused_moe-router-fused_topk_bias_router.py.patch
 vllm-vllm-model_executor-layers-quantization-fp8.py.patch
 vllm-vllm-model_executor-layers-quantization-modelopt.py.patch
 vllm-vllm-model_executor-layers-quantization-mxfp4.py.patch
@@ -53,6 +56,7 @@ vllm-vllm-v1-attention-ops-merge_attn_states.py.patch
 vllm-vllm-v1-attention-ops-triton_decode_attention.py.patch
 vllm-vllm-v1-attention-ops-triton_paged_mqa_logits_dsv4.py.patch
 vllm-vllm-v1-attention-ops-triton_sparse_mla_dsv4.py.patch
+vllm-vllm-v1-core-kv_cache_utils.py.patch
 vllm-vllm-v1-core-sched-scheduler.py.patch
 vllm-vllm-v1-engine-core.py.patch
 vllm-vllm-v1-kv_cache_interface.py.patch

@@ -8,6 +8,7 @@ __pycache__/
 .DS_Store
 *.swp
 *~
+.vscode/
 
 # Internal session logs / research harnesses (not for publication)
 internal/

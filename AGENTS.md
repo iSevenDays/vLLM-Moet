@@ -121,6 +121,16 @@ gone (the workflow it described never existed).
 Never commit: wheels (any `*.whl` is ignored), checkpoints, expert packs,
 smoke results (`bench/results/smoke/`).
 
+## Knowledge store
+
+- `docs/solutions/` — documented solutions to past problems (bugs, patterns,
+  integration learnings), organized by category with YAML frontmatter
+  (`module`, `tags`, `problem_type`). Relevant when implementing or debugging
+  in documented areas.
+- `CONCEPTS.md` — shared domain vocabulary (entities, named processes, status
+  concepts). Relevant when orienting to the codebase or discussing domain
+  concepts.
+
 ## Concurrency — several agents, one checkout
 
 - `git status` before you start. Dirty paths you did not create belong to

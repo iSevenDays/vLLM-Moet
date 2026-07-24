@@ -29,16 +29,20 @@ Design decisions (vs the SM120 cubins):
   bit-faithful to the reference math (scales are constant across the
   32-group) and keeps ALU low. 2^(sb-127) is built by exponent-field
   bitcast, not exp2 — exact for every sb.
-* Grid contract kept: ``(n_rows // 16, pairs)``, one program per
-  (16-row N-tile, pair) — the same geometry ``_launch`` always used, so
-  the dispatch stays arch-blind. BLOCK_M = 16 with an ``m < m_rows``
-  mask serves BOTH the decode tier (mblock 4) and the prefill tier
-  (mblock 16); the SAME kernel is registered under the ``w2`` and
+* The default grid contract stays ``(n_rows // 16, pairs)``, one program per
+  (16-row N-tile, pair). ``VLLM_MOE_W2_SM89_BLOCK_N=32|64`` experimentally
+  widens that tile so one program reuses its A tile across more output rows;
+  the descriptor ABI and output layout do not change. BLOCK_M = 16 with an
+  ``m < m_rows`` mask serves BOTH the decode tier (mblock 4) and the prefill
+  tier (mblock 16); the SAME kernel is registered under the ``w2`` and
   ``w2mc4`` keys (``_require_kernels`` asserts both).
 * AFRAG is NOT ported (the fragment-major-A trick is a QMMA A-fragment
   LDG.128 optimization; it does not transfer). The loader simply leaves
   ``w2mc4afrag`` unregistered and prefill falls back to ``w2mc4``.
-* w4 / w4q delta tiers are NOT ported yet: serve with
+* w4q split-FP4 has an experimental Triton port, gated by
+  ``VLLM_MOE_W2_SM89_W4Q=1``. The default remains off until it has
+  full-server quality and residency validation.
+* w4 full-FP4 delta tier is NOT ported yet: serve non-split delta with
   ``VLLM_MOE_W2_DELTA=0`` on Ada.
 
 Plane addressing (host packing unchanged — moe_w2_planes.pack_fragment_major
@@ -77,6 +81,12 @@ import triton
 import triton.language as tl
 
 _NUM_WARPS = int(os.getenv("VLLM_MOE_W2_SM89_WARPS", "2"))
+_IMPL = os.getenv("VLLM_MOE_W2_SM89_IMPL", "bf16").lower()
+_BLOCK_N = int(os.getenv("VLLM_MOE_W2_SM89_BLOCK_N", "16"))
+if _BLOCK_N not in (16, 32, 64):
+    raise ValueError(
+        "VLLM_MOE_W2_SM89_BLOCK_N must be one of 16, 32, or 64; "
+        f"got {_BLOCK_N}")
 
 
 @triton.jit
@@ -84,9 +94,10 @@ def moe_w2_mm_sm89(
     desc_ptr,                  # *i64 [pairs, 6] {a, as, b, bs, c, m_rows}
     n_rows,                    # C row stride in bf16 elements (= N)
     K: tl.constexpr,           # GEMM contraction (per-launch, like the cubins)
+    BLOCK_N: tl.constexpr,
 ):
     tl.static_assert(K % 64 == 0)
-    pid_n = tl.program_id(0)               # 16-row N tile
+    pid_n = tl.program_id(0)               # BLOCK_N-row N tile
     pid_p = tl.program_id(1)               # (expert, token-group) pair
 
     d = desc_ptr + pid_p * 6
@@ -101,9 +112,12 @@ def moe_w2_mm_sm89(
 
     offs_m = tl.arange(0, 16)
     mask_m = offs_m < m_rows
-    r = tl.arange(0, 16)                   # N-rows within the tile
+    r = tl.arange(0, BLOCK_N)              # N-rows within the tile
+    n_abs = pid_n * BLOCK_N + r
+    n_block = n_abs // 16
+    r16 = n_abs % 16
     # fragment-major in-block byte offset, row part: g*32 + tile*4
-    row_off = (r % 8) * 32 + (r // 8) * 4
+    row_off = (r16 % 8) * 32 + (r16 // 8) * 4
     # byte-column part for one 32-group: t*8 + half (k32 term added in-loop)
     b_idx = tl.arange(0, 8)
     byte_col = (b_idx // 2) * 8 + (b_idx % 2)
@@ -112,7 +126,7 @@ def moe_w2_mm_sm89(
     k_perm = ((f // 4) % 2) * 16 + (f // 8) * 4 + (f % 4)
     shift = (f % 4) * 2
 
-    acc = tl.zeros((16, 16), dtype=tl.float32)
+    acc = tl.zeros((16, BLOCK_N), dtype=tl.float32)
     for g in range(0, K // 32):
         kb = g // 2
         k32 = g % 2
@@ -124,17 +138,20 @@ def moe_w2_mm_sm89(
         a_s = tl.load(as_ptr + offs_m * (K // 32) + g,
                       mask=mask_m, other=0.0)
         # ---- B: 8 code bytes per N-row -> 32 codes -> levels {-4,-1,1,4}
-        blk = (pid_n * (K // 64) + kb) * 256
+        blk = (n_block * (K // 64) + kb) * 256
         code_bytes = tl.load(
-            b_ptr + blk + row_off[:, None] + (byte_col + k32 * 2)[None, :]
+            b_ptr + blk[:, None] + row_off[:, None]
+            + (byte_col + k32 * 2)[None, :]
         ).to(tl.int32)
         expanded = tl.reshape(
-            tl.broadcast_to(code_bytes[:, :, None], (16, 8, 4)), (16, 32))
+            tl.broadcast_to(code_bytes[:, :, None], (BLOCK_N, 8, 4)),
+            (BLOCK_N, 32))
         codes = (expanded >> shift[None, :]) & 3
         mag = tl.where((codes == 0) | (codes == 3), 4.0, 1.0)
         w = tl.where(codes < 2, -mag, mag).to(tl.bfloat16)
         # ---- B scale: UE8M0 byte -> 2^(sb-127), exact via exponent bitcast
-        sb = tl.load(bs_ptr + (pid_n * (K // 32) + g) * 16 + r).to(tl.int32)
+        sb = tl.load(
+            bs_ptr + (n_block * (K // 32) + g) * 16 + r16).to(tl.int32)
         w_s = (sb << 23).to(tl.float32, bitcast=True)      # 2^(sb-127), sb>=1
         # sb=0 -> 2^-127 is an f32 SUBNORMAL: correct per UE8M0, but an
         # FTZ multiply would flush it to 0. Real packs never carry sb=0
@@ -142,6 +159,176 @@ def moe_w2_mm_sm89(
         w_s = tl.where(sb == 0, 5.877471754111438e-39, w_s)  # sb=0 subnormal
         # ---- unscaled bf16 dot (exact products), fp32 accumulate,
         #      then fold both per-32 scales as one [M, N] outer product
+        acc += tl.dot(a, tl.trans(w)) * (a_s[:, None] * w_s[None, :])
+
+    tl.store(c_ptr + offs_m[:, None] * n_rows + n_abs[None, :],
+             acc.to(tl.bfloat16), mask=mask_m[:, None])
+
+
+@triton.jit
+def moe_w2_mm_sm89_fp8mma(
+    desc_ptr,                  # *i64 [pairs, 6] {a, as, b, bs, c, m_rows}
+    n_rows,                    # C row stride in bf16 elements (= N)
+    K: tl.constexpr,           # GEMM contraction (per-launch, like the cubins)
+    BLOCK_N: tl.constexpr,
+):
+    tl.static_assert(K % 64 == 0)
+    pid_n = tl.program_id(0)               # 16-row N tile
+    pid_p = tl.program_id(1)               # (expert, token-group) pair
+
+    d = desc_ptr + pid_p * 6
+    m_rows = tl.load(d + 5)
+    if m_rows == 0:
+        return
+    a_ptr = tl.load(d + 0).to(tl.pointer_type(tl.float8e4nv))
+    as_ptr = tl.load(d + 1).to(tl.pointer_type(tl.float32))
+    b_ptr = tl.load(d + 2).to(tl.pointer_type(tl.uint8))
+    bs_ptr = tl.load(d + 3).to(tl.pointer_type(tl.uint8))
+    c_ptr = tl.load(d + 4).to(tl.pointer_type(tl.bfloat16))
+
+    offs_m = tl.arange(0, 16)
+    mask_m = offs_m < m_rows
+    r = tl.arange(0, BLOCK_N)
+    n_abs = pid_n * BLOCK_N + r
+    n_block = n_abs // 16
+    r16 = n_abs % 16
+    row_off = (r16 % 8) * 32 + (r16 // 8) * 4
+    b_idx = tl.arange(0, 8)
+    byte_col = (b_idx // 2) * 8 + (b_idx % 2)
+    f = tl.arange(0, 32)
+    k_perm = ((f // 4) % 2) * 16 + (f // 8) * 4 + (f % 4)
+    shift = (f % 4) * 2
+
+    acc = tl.zeros((16, BLOCK_N), dtype=tl.float32)
+    for g in range(0, K // 32):
+        kb = g // 2
+        k32 = g % 2
+        k_glob = kb * 64 + k32 * 32 + k_perm
+        a = tl.load(a_ptr + offs_m[:, None] * K + k_glob[None, :],
+                    mask=mask_m[:, None], other=0.0)
+        a_s = tl.load(as_ptr + offs_m * (K // 32) + g,
+                      mask=mask_m, other=0.0)
+        blk = (n_block * (K // 64) + kb) * 256
+        code_bytes = tl.load(
+            b_ptr + blk[:, None] + row_off[:, None]
+            + (byte_col + k32 * 2)[None, :]
+        ).to(tl.int32)
+        expanded = tl.reshape(
+            tl.broadcast_to(code_bytes[:, :, None], (BLOCK_N, 8, 4)),
+            (BLOCK_N, 32))
+        codes = (expanded >> shift[None, :]) & 3
+        mag = tl.where((codes == 0) | (codes == 3), 4.0, 1.0)
+        w = tl.where(codes < 2, -mag, mag).to(tl.float8e4nv)
+        sb = tl.load(
+            bs_ptr + (n_block * (K // 32) + g) * 16 + r16).to(tl.int32)
+        w_s = (sb << 23).to(tl.float32, bitcast=True)
+        w_s = tl.where(sb == 0, 5.877471754111438e-39, w_s)
+        acc += tl.dot(a, tl.trans(w)) * (a_s[:, None] * w_s[None, :])
+
+    tl.store(c_ptr + offs_m[:, None] * n_rows + n_abs[None, :],
+             acc.to(tl.bfloat16), mask=mask_m[:, None])
+
+
+@triton.jit
+def moe_w4q_mm_sm89(
+    desc_ptr,                  # *i64 [pairs, 8] {a, as, base, ref, bs, c, m, pad}
+    n_rows,                    # C row stride in bf16 elements (= N)
+    K: tl.constexpr,           # GEMM contraction
+):
+    tl.static_assert(K % 64 == 0)
+    pid_n = tl.program_id(0)
+    pid_p = tl.program_id(1)
+
+    d = desc_ptr + pid_p * 8
+    m_rows = tl.load(d + 6)
+    if m_rows == 0:
+        return
+    a_ptr = tl.load(d + 0).to(tl.pointer_type(tl.float8e4nv))
+    as_ptr = tl.load(d + 1).to(tl.pointer_type(tl.float32))
+    b_ptr = tl.load(d + 2).to(tl.pointer_type(tl.uint8))
+    q_ptr = tl.load(d + 3).to(tl.pointer_type(tl.uint8))
+    bs_ptr = tl.load(d + 4).to(tl.pointer_type(tl.uint8))
+    c_ptr = tl.load(d + 5).to(tl.pointer_type(tl.bfloat16))
+
+    offs_m = tl.arange(0, 16)
+    mask_m = offs_m < m_rows
+    r = tl.arange(0, 16)
+    g_row = r % 8
+    tile = r // 8
+    row_off = g_row * 32 + tile * 4
+    b_idx = tl.arange(0, 8)
+    t = b_idx // 2
+    half = b_idx % 2
+    lane = g_row[:, None] * 4 + t[None, :]
+    byte_col = t * 8 + half
+    f = tl.arange(0, 32)
+    k_perm = ((f // 4) % 2) * 16 + (f // 8) * 4 + (f % 4)
+    shift = (f % 4) * 2
+
+    acc = tl.zeros((16, 16), dtype=tl.float32)
+    for kg in range(0, K // 32):
+        kb = kg // 2
+        k32 = kg % 2
+        k_glob = kb * 64 + k32 * 32 + k_perm
+        a = tl.load(a_ptr + offs_m[:, None] * K + k_glob[None, :],
+                    mask=mask_m[:, None], other=0.0).to(tl.bfloat16)
+        a_s = tl.load(as_ptr + offs_m * (K // 32) + kg,
+                      mask=mask_m, other=0.0)
+
+        bblk = (pid_n * (K // 64) + kb) * 256
+        code_bytes = tl.load(
+            b_ptr + bblk + row_off[:, None] + (byte_col + k32 * 2)[None, :]
+        ).to(tl.int32)
+        expanded = tl.reshape(
+            tl.broadcast_to(code_bytes[:, :, None], (16, 8, 4)), (16, 32))
+        codes = (expanded >> shift[None, :]) & 3
+
+        word_idx = tile[:, None] * 4 + k32 * 2 + half[None, :]
+        bit = word_idx * 10
+        byte_pos = bit // 8
+        bit_off = bit - byte_pos * 8
+        qblk = (pid_n * (K // 64) + kb) * 320
+        qbase = q_ptr + qblk
+        p8_addr = qbase + lane * 8 + byte_pos
+        p2_addr = qbase + 256 + lane * 2 + (byte_pos - 8)
+        b0 = tl.load(tl.where(byte_pos < 8, p8_addr, p2_addr)).to(tl.int32)
+        byte_pos1 = byte_pos + 1
+        p8_addr1 = qbase + lane * 8 + byte_pos1
+        p2_addr1 = qbase + 256 + lane * 2 + (byte_pos1 - 8)
+        b1 = tl.load(tl.where(byte_pos1 < 8, p8_addr1, p2_addr1)).to(tl.int32)
+        byte_pos2 = byte_pos + 2
+        p8_addr2 = qbase + lane * 8 + byte_pos2
+        p2_addr2 = qbase + 256 + lane * 2 + (byte_pos2 - 8)
+        b2 = tl.load(tl.where(byte_pos2 < 8, p8_addr2, p2_addr2),
+                     mask=byte_pos2 < 10, other=0).to(tl.int32)
+        words8 = ((b0 | (b1 << 8) | (b2 << 16)) >> bit_off) & 1023
+        words = tl.reshape(
+            tl.broadcast_to(words8[:, :, None], (16, 8, 4)), (16, 32))
+        q0 = words // 5
+        d0 = words - q0 * 5
+        q1 = q0 // 5
+        d1 = q0 - q1 * 5
+        q2 = q1 // 5
+        d2 = q1 - q2 * 5
+        q3 = q2 // 5
+        d3 = q2 - q3 * 5
+        digit = tl.where((f % 4)[None, :] == 0, d0,
+                 tl.where((f % 4)[None, :] == 1, d1,
+                 tl.where((f % 4)[None, :] == 2, d2, d3)))
+        big = (codes == 0) | (codes == 3)
+        mag_idx = digit + tl.where(big, 5, 0)
+        val = tl.where(mag_idx == 0, 0.0,
+              tl.where(mag_idx == 1, 0.5,
+              tl.where(mag_idx == 2, 1.0,
+              tl.where(mag_idx == 3, 1.5,
+              tl.where(mag_idx == 4, 2.0,
+              tl.where(mag_idx == 5, 3.0,
+              tl.where(mag_idx == 6, 4.0, 6.0)))))))
+        w = tl.where(codes < 2, -val, val).to(tl.bfloat16)
+
+        sb = tl.load(bs_ptr + (pid_n * (K // 32) + kg) * 16 + r).to(tl.int32)
+        w_s = (sb << 23).to(tl.float32, bitcast=True)
+        w_s = tl.where(sb == 0, 5.877471754111438e-39, w_s)
         acc += tl.dot(a, tl.trans(w)) * (a_s[:, None] * w_s[None, :])
 
     offs_n = pid_n * 16 + r
@@ -157,7 +344,26 @@ def make_launcher(K: int):
     epilogue is unchanged and CUDA-graph capture works as before."""
 
     def launch(desc: torch.Tensor, n_rows: int, pairs: int) -> None:
-        moe_w2_mm_sm89[(n_rows // 16, pairs)](
+        if n_rows % _BLOCK_N:
+            raise ValueError(
+                f"SM89 W2 n_rows={n_rows} is not divisible by "
+                f"BLOCK_N={_BLOCK_N}")
+        grid = (n_rows // _BLOCK_N, pairs)
+        if _IMPL == "fp8mma":
+            moe_w2_mm_sm89_fp8mma[grid](
+                desc, n_rows, K=K, BLOCK_N=_BLOCK_N,
+                num_warps=_NUM_WARPS)
+        else:
+            moe_w2_mm_sm89[grid](
+                desc, n_rows, K=K, BLOCK_N=_BLOCK_N,
+                num_warps=_NUM_WARPS)
+
+    return launch
+
+
+def make_w4q_launcher(K: int):
+    def launch(desc: torch.Tensor, n_rows: int, pairs: int) -> None:
+        moe_w4q_mm_sm89[(n_rows // 16, pairs)](
             desc, n_rows, K=K, num_warps=_NUM_WARPS)
 
     return launch
@@ -172,20 +378,19 @@ def make_launchers(ks) -> dict:
         fn = make_launcher(k)
         fns[("w2", k)] = fn
         fns[("w2mc4", k)] = fn
+        if os.getenv("VLLM_MOE_W2_SM89_W4Q", "0").lower() \
+                not in ("0", "false", "no", "off"):
+            fns[("w4q", k)] = make_w4q_launcher(k)
     return fns
 
 
-def self_test(k: int = 512, n_rows: int = 32, m_rows: int = 4) -> float:
-    """Tiny op-level GEMM vs a torch reference on the CURRENT device.
+def _op_case(k: int, n_rows: int, m_rows: int):
+    """Random one-pair op-level GEMM case on the CURRENT device.
 
-    Startup observability for the emulation path: one JIT compile plus
-    <1 ms of GPU time at engine init buys a loud, attributable verdict
-    line — a Triton codegen/driver regression fails HERE with a clear
-    message instead of surfacing as silent output corruption a deploy
-    cycle later. Reference math and the 2.5e-2 gate are verbatim
-    kernels/gen/moe_w2_check.py; per-K compiles still happen lazily at
-    first forward (a per-K compile failure raises loudly there).
-    Returns worst_rel; raises RuntimeError on failure."""
+    Returns ``(desc, bufs, ref)``: the 6-field descriptor tensor, the
+    device tensors it points into (keep them referenced while the kernel
+    runs — desc holds raw pointers), and the fp32 CPU reference. Host
+    packers verbatim moe_w2_planes/moe_w2_check.py."""
     dev = torch.device("cuda")
     g = torch.Generator().manual_seed(7)
     codes = torch.randint(0, 4, (n_rows, k), dtype=torch.uint8, generator=g)
@@ -200,7 +405,6 @@ def self_test(k: int = 512, n_rows: int = 32, m_rows: int = 4) -> float:
     w = levels[codes.long()] * torch.exp2(
         sexp.float() - 127.0).repeat_interleave(32, 1)
     ref = (a8.float() * a_s.repeat_interleave(32, 1)) @ w.T
-    # host packers, layout verbatim moe_w2_planes/moe_w2_check.py
     c = codes.view(n_rows // 16, 2, 8, k // 64, 2, 2, 4, 4)
     c = c.permute(0, 3, 2, 6, 1, 4, 5, 7).contiguous().view(-1, 4).to(
         torch.int32)
@@ -208,15 +412,32 @@ def self_test(k: int = 512, n_rows: int = 32, m_rows: int = 4) -> float:
              | (c[:, 3] << 6)).to(torch.uint8)
     sb = sexp.view(n_rows // 16, 16, k // 32).transpose(
         1, 2).contiguous().flatten()
-    d_a, d_as = a8.to(dev), a_s.float().contiguous().to(dev)
-    d_b, d_bs = plane.to(dev), sb.to(dev)
-    d_c = torch.zeros(m_rows, n_rows, dtype=torch.bfloat16, device=dev)
-    desc = torch.tensor([[d_a.data_ptr(), d_as.data_ptr(), d_b.data_ptr(),
-                          d_bs.data_ptr(), d_c.data_ptr(), m_rows]],
+    bufs = (a8.to(dev), a_s.float().contiguous().to(dev), plane.to(dev),
+            sb.to(dev),
+            torch.zeros(m_rows, n_rows, dtype=torch.bfloat16, device=dev))
+    desc = torch.tensor([[bufs[0].data_ptr(), bufs[1].data_ptr(),
+                          bufs[2].data_ptr(), bufs[3].data_ptr(),
+                          bufs[4].data_ptr(), m_rows]],
                         dtype=torch.int64, device=dev)
+    return desc, bufs, ref
+
+
+def self_test(k: int = 512, n_rows: int = 32, m_rows: int = 4) -> float:
+    """Tiny op-level GEMM vs a torch reference on the CURRENT device.
+
+    Startup observability for the emulation path: one JIT compile plus
+    <1 ms of GPU time at engine init buys a loud, attributable verdict
+    line — a Triton codegen/driver regression fails HERE with a clear
+    message instead of surfacing as silent output corruption a deploy
+    cycle later. Reference math and the 2.5e-2 gate are verbatim
+    kernels/gen/moe_w2_check.py; per-K compiles still happen lazily at
+    first forward (a per-K compile failure raises loudly there).
+    Returns worst_rel; raises RuntimeError on failure."""
+    n_rows = ((n_rows + _BLOCK_N - 1) // _BLOCK_N) * _BLOCK_N
+    desc, bufs, ref = _op_case(k, n_rows, m_rows)
     make_launcher(k)(desc, n_rows, 1)
     torch.cuda.synchronize()
-    got = d_c.float().cpu()
+    got = bufs[4].float().cpu()
     finite = bool(torch.isfinite(got).all())
     worst = (got - ref).abs().max().item() / ref.abs().max().item()
     if not finite or worst >= 2.5e-2:
@@ -226,4 +447,31 @@ def self_test(k: int = 512, n_rows: int = 32, m_rows: int = 4) -> float:
             "miscompiling on this device/driver; run "
             "kernels/gen/moe_w2_check_sm89.py for the full op gate and "
             "report triton/torch/driver versions")
+    return worst
+
+
+def native_self_test(launch, k: int, n_rows: int, m_rows: int = 4) -> float:
+    """Boot-time parity gate for the NATIVE SM89 decode cubin.
+
+    The same random op-level case and 2.5e-2 gate as ``self_test``, but
+    launched through the cubin (via the ``launch(desc, n_rows, pairs)``
+    callback moe_w2_cubit builds) at the exact production (K, N) the
+    cubin serves — so a stale/mis-built cubin fails HERE at engine init,
+    attributed, instead of corrupting decode output. Standalone full
+    gate: kernels/gen/moe_w2_sm89_native_check.py. Returns worst_rel;
+    raises RuntimeError on failure."""
+    desc, bufs, ref = _op_case(k, n_rows, m_rows)
+    launch(desc, n_rows, 1)
+    torch.cuda.synchronize()
+    got = bufs[4].float().cpu()
+    finite = bool(torch.isfinite(got).all())
+    worst = (got - ref).abs().max().item() / ref.abs().max().item()
+    if not finite or worst >= 2.5e-2:
+        raise RuntimeError(
+            f"moe_w2 sm89 NATIVE cubin parity FAILED at K={k} N={n_rows}: "
+            f"worst_rel={worst:.3e} (gate 2.5e-2), finite={finite} — "
+            "the cubin does not match the plane layout/ABI on this "
+            "device; run kernels/gen/moe_w2_sm89_native_check.py "
+            "against it and rebuild via "
+            "kernels/cuda/build_moe_w2_sm89_decode.sh")
     return worst

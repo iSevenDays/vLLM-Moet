@@ -1,9 +1,9 @@
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
-index 0000000..f3af846 100644
+index 0000000..ee9eff9 100644
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
-@@ -0,0 +1,2639 @@
+@@ -0,0 +1,2742 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Routed experts on 2-bit tensor-sym planes (cubit moe_w2) for the
@@ -87,6 +87,10 @@ index 0000000..f3af846 100644
 +_AFRAG = os.getenv("VLLM_MOE_W2_AFRAG", "1") == "1"
 +_afrag_ok = False
 +_sm89 = False                   # set by the (8,9) loader branch
++# sm_89 NATIVE decode cubin registry: {(K, N): cuFunction}. Populated
++# only on Ada by _load_sm89_native; empty everywhere else, so the
++# _launch fast-path check is a no-op on sm_120.
++_native_fns: dict = {}
 +_scale_refit_logged = False
 +# PREFILL QUALITY LEVER (default ON): prefill-sized calls consume the FP4
 +# delta tier exactly like decode — pairs whose expert is FP4-resident divert
@@ -352,6 +356,89 @@ index 0000000..f3af846 100644
 +                f" — did you mean {hint[0]}?" if hint else "")
 +
 +
++# sm_89 native decode cubin (kernels/cuda/moe_w2_sm89_decode.cu):
++# hand-written CUDA using Ada's native e4m3 tensor core
++# (mma.sync.m16n8k32 f32.e4m3.e4m3) with in-register PRMT decode of the
++# 2-bit codes to e4m3 — no BF16 weight materialization. Measured
++# 3.1-4.7x over the Triton emulation on the two decode GEMM shapes of
++# DS4-Flash @ TP2 (K=1024/N=4096 down, K=4096/N=2048 gate-up). It is
++# DECODE-TIER ONLY: every "w2"-tier desc pair has m_rows <= 4 (mblock ==
++# _BLOCK) and the kernel RETURNS WITHOUT WRITING for m_rows > 4, so it
++# must never see an mc4/afrag prefill desc — _launch keys the fast path
++# on tier == "w2" plus an exact (K, n_rows) registry hit; every other
++# shape/tier stays on the Triton emulation. Launch contract (differs
++# from the sm_120 cubins): grid (N/64, pairs), block 64, ONE pointer
++# arg (the desc table). Same driver-API launch on the same torch stream
++# as the sm_120 path, so CUDA graph capture works unchanged.
++_SM89_NATIVE_SHAPES = ((1024, 4096), (4096, 2048))
++
++
++def _launch_sm89_native(fn, desc, n_rows: int, pairs: int, stream) -> None:
++    arg = ctypes.c_uint64(desc.data_ptr())
++    argv = (ctypes.c_void_p * 1)(
++        ctypes.cast(ctypes.byref(arg), ctypes.c_void_p))
++    _ck(_driver().cuLaunchKernel(fn, n_rows // 64, pairs, 1, 64, 1, 1, 0,
++                                 stream, argv, None), "sm89 native launch")
++
++
++def _load_sm89_native() -> None:
++    """Opportunistically register the native decode cubin on Ada.
++
++    Any failure — knob off, cubin absent, driver refuses the module, a
++    symbol is missing, the boot parity gate fails — logs a clear line
++    and leaves _native_fns empty so the Triton emulation serves
++    everything. Never fatal: the cubin is an optimization, not a
++    requirement."""
++    if os.getenv("VLLM_MOE_W2_SM89_NATIVE", "1").lower() in (
++            "0", "false", "no", "off"):
++        logger.info("moe_w2_cubit: sm_89 native decode cubin disabled "
++                    "via VLLM_MOE_W2_SM89_NATIVE")
++        return
++    path = os.getenv("VLLM_MOE_W2_SM89_NATIVE_CUBIN",
++                     os.path.join(_DIR, "moe_w2_sm89_decode.cubin"))
++    if not os.path.exists(path):
++        logger.info("moe_w2_cubit: no sm_89 native decode cubin at %s; "
++                    "decode stays on the Triton emulation", path)
++        return
++    try:
++        from vllm.model_executor.layers.quantization.utils import (
++            moe_w2_sm89)
++        cu = _driver()
++        mod = ctypes.c_void_p()
++        _ck(cu.cuModuleLoad(ctypes.byref(mod), path.encode()),
++            f"cuModuleLoad {path}")
++        selftest = os.getenv("VLLM_MOE_W2_SM89_SELFTEST", "1").lower() \
++            not in ("0", "false", "no", "off")
++        loaded = {}
++        for k, n in _SM89_NATIVE_SHAPES:
++            fn = ctypes.c_void_p()
++            _ck(cu.cuModuleGetFunction(
++                ctypes.byref(fn), mod,
++                f"moe_w2_sm89_decode_k{k}_n{n}".encode()),
++                f"cuModuleGetFunction sm89 native k{k}n{n}")
++            if selftest:
++                def _lnch(desc, n_rows, pairs, _fn=fn):
++                    _launch_sm89_native(
++                        _fn, desc, n_rows, pairs,
++                        ctypes.c_void_p(
++                            torch.cuda.current_stream().cuda_stream))
++                worst = moe_w2_sm89.native_self_test(_lnch, k, n)
++                logger.info(
++                    "moe_w2_cubit: sm_89 native decode K=%d N=%d parity "
++                    "worst_rel=%.3e (gate 2.5e-2)", k, n, worst)
++            loaded[(k, n)] = fn
++        _native_fns.update(loaded)
++        logger.info(
++            "moe_w2_cubit: sm_89 NATIVE decode cubin ACTIVE for (K, N)=%s "
++            "from %s%s", sorted(_native_fns), path,
++            "" if selftest else " (parity gate SKIPPED via env)")
++    except Exception as e:  # noqa: BLE001
++        _native_fns.clear()
++        logger.warning(
++            "moe_w2_cubit: sm_89 native decode cubin unavailable (%s); "
++            "decode stays on the Triton emulation", e)
++
++
 +def _ensure_ready() -> bool:
 +    global _state
 +    if _state == "ready":
@@ -414,6 +501,9 @@ index 0000000..f3af846 100644
 +                    "moe_w2_cubit: sm_89 Triton emulation ready "
 +                    "(self-test SKIPPED via env); w2/w2mc4 for K=%s",
 +                    sorted(ks))
++            # native decode cubin on top of the (already validated)
++            # emulation: opportunistic, parity-gated, never fatal.
++            _load_sm89_native()
 +            _state = "ready"
 +            return True
 +        if cap != (12, 0):
@@ -501,14 +591,16 @@ index 0000000..f3af846 100644
 +        need += [(w4tier, K13), (w4tier, K2)]
 +    missing = [f"{t}_k{k}" for t, k in need if (t, k) not in _fns]
 +    if _sm89:
-+        # Ada: there is no cubin dir to fix — either the FP4 delta tier
-+        # is enabled (not ported to sm_89) or K13/K2 fell outside
++        # Ada: there is no cubin dir to fix — either an FP4 delta tier is
++        # enabled without its SM89 Triton port, or K13/K2 fell outside
 +        # VLLM_MOE_W2_KS. Name the actual remedy.
 +        assert not missing, (
 +            f"moe_w2 sm_89: no kernels for {missing} (K13={K13}, K2={K2})."
-+            f" The w4/w4q FP4 delta tiers are NOT ported to Ada — set "
-+            f"VLLM_MOE_W2_DELTA=0 (or VLLM_MOE_W2_DELTA_GB=0) — and make "
-+            f"sure K13/K2 are in VLLM_MOE_W2_KS. See docs/ada-sm89-port.md")
++            f" w4 full-FP4 is not ported to Ada; w4q split-FP4 is "
++            f"experimental behind VLLM_MOE_W2_SM89_W4Q=1. Set "
++            f"VLLM_MOE_W2_DELTA=0 (or VLLM_MOE_W2_DELTA_GB=0), or enable "
++            f"the w4q port for split-FP4, and make sure K13/K2 are in "
++            f"VLLM_MOE_W2_KS. See docs/ada-sm89-port.md")
 +    assert not missing, (
 +        f"moe_w2_cubit: missing cubins for K13={K13}/K2={K2}: {missing} "
 +        f"(dir {_DIR}; set VLLM_MOE_W2_CUBIT_DIR)")
@@ -2177,6 +2269,17 @@ index 0000000..f3af846 100644
 +
 +def _launch(tier: str, K: int, desc: torch.Tensor, n_rows: int, pairs: int,
 +            stream):
++    if _native_fns and tier == "w2":
++        # sm_89 native decode cubin, exact-(K, N) fast path. Decode-tier
++        # pairs always have m_rows <= 4 (mblock == _BLOCK); m_rows == 0
++        # dead pairs early-EXIT in the kernel like the emulation. Same
++        # stream, same driver-API launch class as the sm_120 cubins —
++        # CUDA graph capture works unchanged. Everything else (prefill
++        # mc4, w4/w4q tiers, other shapes) falls through below.
++        nfn = _native_fns.get((K, n_rows))
++        if nfn is not None:
++            _launch_sm89_native(nfn, desc, n_rows, pairs, stream)
++            return
 +    fn = _fns[(tier, K)]
 +    if not isinstance(fn, ctypes.c_void_p):
 +        # sm_89 path: fn is a moe_w2_sm89 Triton launcher. Same grid

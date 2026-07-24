@@ -208,3 +208,37 @@ Set `VLLM_MOE_W2_SM89_SELFTEST=0` only when you must skip the test.
 The one-pair test does not replace the per-K operation sweep.
 It also does not replace the end-to-end MoE tests.
 See `docs/ada-sm89-port.md` for the current Ada validation record.
+
+## Ada (sm_89) NATIVE decode cubin — moe_w2_sm89_decode (CUDA C++, nvcc)
+
+Ada's e4m3 tensor core (`mma.sync.m16n8k32 f32.e4m3.e4m3`, SASS
+`QMMA.16832.F32.E4M3.E4M3`) IS reachable from CUDA C++ — no cubit SASS
+needed. `cuda/moe_w2_sm89_decode.cu` decodes the 2-bit codes straight to
+e4m3 bytes in registers (one PRMT per 4 codes, LUT `0x4838b8c8`) and feeds
+the QMMA with weights as the A operand and activations as B — no BF16
+weight materialization, FP32 scale fold per 32-group, BF16 store. Decode
+only (`M <= 4`; pairs with `m_rows == 0` or `> 4` return without writing),
+two baked shapes = the DS4-Flash TP2 decode GEMMs:
+
+| kernel symbol (`cubins-sm89/moe_w2_sm89_decode.cubin`) | shape | vs Triton BLOCK_N=16 (RTX 4090 D) |
+|---|---|---|
+| `moe_w2_sm89_decode_k1024_n4096` | K=1024, N=4096 (w2/down @ TP2) | 0.0757 → 0.0161 ms, **4.7x** |
+| `moe_w2_sm89_decode_k4096_n2048` | K=4096, N=2048 (w13/gate-up @ TP2) | 0.0961 → 0.0310 ms, **3.1x** |
+
+Build: `cuda/build_moe_w2_sm89_decode.sh <out.cubin>` (nvcc `-arch=sm_89
+--cubin`; static-gates QMMA presence). 56 reg, 0 stack/spill/smem, 2 warps
+per CTA, `__launch_bounds__(64, 8)`. Launch contract (differs from the
+sm_120 cubins): grid `(N/64, pairs)`, block 64, ONE pointer arg — the same
+6-field `{a, as, b, bs, c, m_rows}` desc table.
+
+Validation: `gen/moe_w2_sm89_native_check.py` (static SASS gates + driver-API
+correctness/latency; M=4 pairs=5 both shapes PASS on RTX 4090 D, max-rel
+2.95-2.99e-3, rmse 1.7e-3; committed cubin sha256 `f7c3008b…`). The loader
+(`moe_w2_cubit._load_sm89_native`) additionally parity-gates each shape at
+every engine boot against the torch reference (`moe_w2_sm89.native_self_test`,
+gate 2.5e-2) and falls back to the Triton emulation on ANY failure. Serving:
+opportunistic decode-tier fast path in `_launch` keyed on tier `"w2"` +
+exact `(K, n_rows)`; prefill (mc4), w4/w4q tiers, and all other shapes stay
+on the Triton emulation. Ships at `/cubit-share/moe_w2_sm89_decode.cubin`
+(image COPY); `VLLM_MOE_W2_SM89_NATIVE=0` disables, and
+`VLLM_MOE_W2_SM89_NATIVE_CUBIN` overrides the path.

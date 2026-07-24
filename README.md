@@ -123,8 +123,11 @@ precision — FP8 on DS4, NVFP4 on GLM) and recover FP4 precision adaptively:
   1.3× on the GEMM, **+12% e2e prefill** on one card — default on (`VLLM_MOE_W2_AFRAG=0`
   opts out).
 
-On Ada, the 2-bit MoE kernel decodes the expert codes in registers and uses BF16 tensor
-cores. DeepSeek-V4 uses a separate native SM89 FP8 kernel for its attention output
+On Ada, the decode tier of the 2-bit MoE GEMM runs a native CUDA cubin: PRMT‑LUT decode to
+e4m3 in registers → Ada's native FP8 `mma.m16n8k32`, parity‑gated at every boot, Triton
+fallback on any failure (measured +27% single‑stream decode / +66% at concurrency 4 e2e).
+Prefill and all other shapes run the Triton emulation, which decodes the expert codes to
+BF16 in registers and uses BF16 tensor cores. DeepSeek-V4 uses a separate native SM89 FP8 kernel for its attention output
 projection. This kernel does not materialize dequantized FP32 weights. See the Ada port
 guide for the dispatch rules and validation results.
 

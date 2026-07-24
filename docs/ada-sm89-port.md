@@ -13,20 +13,28 @@ QMMA, QMMA.SF, FP4, or NVFP4 tensor-core operations.
 
 The Ada port has two separate compute paths:
 
-1. The MoE path reads 2-bit expert planes. It decodes the planes to BF16
-   values in registers. It then uses BF16 tensor-core operations.
+1. The MoE path reads 2-bit expert planes. The decode tier runs a native
+   CUDA cubin (added 2026-07-24). It decodes the planes to E4M3 bytes in
+   registers and uses native FP8 tensor-core operations. It serves only
+   the exact production (K, N) shapes and passes a parity gate at every
+   boot. Prefill, all other shapes, and any load or parity failure run
+   the Triton emulation. The emulation decodes the planes to BF16 values
+   in registers and uses BF16 tensor-core operations.
 2. The attention output projection reads FP8 activations and FP8 weights.
    It uses native FP8 tensor-core operations on SM89.
 
-Do not confuse these paths. The MoE kernel is an emulation of the SM120
-QMMA path. The output-projection kernel is a native Ada FP8 path.
+Do not confuse these paths. The MoE Triton kernel is an emulation of the
+SM120 QMMA path and is the permanent fallback. The MoE decode cubin and
+the output-projection kernel are native Ada FP8 paths.
 
 ## Components
 
 | Component | Source |
 |---|---|
-| 2-bit MoE kernel | `overlay/vllm/vllm/model_executor/layers/quantization/utils/moe_w2_sm89.py` |
+| 2-bit MoE Triton kernel (emulation) | `overlay/vllm/vllm/model_executor/layers/quantization/utils/moe_w2_sm89.py` |
 | Published MoE mirror | `kernels/triton/moe_w2_sm89.py` |
+| Native 2-bit MoE decode cubin | `kernels/cuda/moe_w2_sm89_decode.cu` → `kernels/cubins-sm89/moe_w2_sm89_decode.cubin` |
+| Native decode loader + dispatch | `overlay/vllm/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py` (`_load_sm89_native`, `_launch`) |
 | Native FP8 output-projection kernel | `overlay/vllm/vllm/models/deepseek_v4/nvidia/ops/triton_ada_fp8_bmm.py` |
 | Output-projection dispatch | `overlay/vllm/vllm/models/deepseek_v4/nvidia/ops/o_proj.py` |
 | Sparse-MLA Triton port | `overlay/vllm/vllm/v1/attention/ops/triton_sparse_mla_dsv4.py` |
@@ -35,6 +43,12 @@ QMMA path. The output-projection kernel is a native Ada FP8 path.
 | Native FP8 tests | `overlay/vllm/tests/kernels/test_triton_ada_fp8_bmm.py` |
 
 ## 2-bit MoE path
+
+This section describes the Triton emulation. It serves prefill, all
+non-production shapes, and the fallback when the native decode cubin is
+absent or fails its parity gate. The native decode cubin is documented in
+`kernels/MANIFEST.md` ("Ada (sm_89) NATIVE decode cubin") and in
+`docs/solutions/architecture-patterns/native-kernel-fast-path-with-parity-gate-and-tier-restricted-dispatch.md`.
 
 The MoE kernel uses the same packed expert planes as the SM120 kernel.
 Each plane contains 2-bit codes and block-32 UE8M0 scales.
@@ -229,10 +243,14 @@ The kernel does not change MTP acceptance.
 Check these log entries after a new image starts:
 
 1. Check for `sm_89 Triton emulation ready`.
-2. Check for `moe_w2 STREAM-BUILD armed` during a new quantization.
-3. Check for `moe_w2 planes:` and the selected residency.
-4. Check for `native SM89 block-scaled FP8 grouped matmul`.
-5. Check that `Available KV cache memory` is positive.
+2. Check for `sm_89 NATIVE decode cubin ACTIVE` after two per-shape
+   parity lines. If the cubin is absent or gated off, the log says
+   `decode stays on the Triton emulation` instead — the server is then
+   correct but slower.
+3. Check for `moe_w2 STREAM-BUILD armed` during a new quantization.
+4. Check for `moe_w2 planes:` and the selected residency.
+5. Check for `native SM89 block-scaled FP8 grouped matmul`.
+6. Check that `Available KV cache memory` is positive.
 
 Use these commands for a startup failure:
 

@@ -31,6 +31,8 @@ K = int(os.environ.get("K", "4096"))
 E = int(os.environ.get("E", "5"))
 M = int(os.environ.get("M", "4"))
 RUNS = int(os.environ.get("RUNS", "4"))
+BENCH = os.environ.get("BENCH", "0").lower() not in ("0", "false", "no", "off")
+WARMUP = int(os.environ.get("WARMUP", "5"))
 assert 1 <= M <= 16, f"M={M}: the desc ABI carries at most 16 rows/pair"
 torch.manual_seed(int(os.environ.get("SEED", "7")))
 
@@ -88,6 +90,19 @@ for e in range(E):
 d_desc = descs.to(dev)
 
 outs, worst = [], 0.0
+if BENCH:
+    for _ in range(WARMUP):
+        launch(d_desc, N, E)
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(RUNS):
+        launch(d_desc, N, E)
+    end.record()
+    torch.cuda.synchronize()
+    print(f"bench_ms_per_launch={start.elapsed_time(end) / RUNS:.4f} "
+          f"runs={RUNS} warmup={WARMUP}")
 for r in range(RUNS):
     for d_c in d_cs:
         d_c.zero_()

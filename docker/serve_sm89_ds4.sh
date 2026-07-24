@@ -8,13 +8,14 @@
 # The four things you will actually change:
 #
 # 1) PRODUCTION / make the API reachable.
-#    The default network=none is a deliberate air-gap for the first
-#    (quantizing) boot. Once boots come up warm and healthy, run:
+#    Defaults target this host: 2 x RTX 4090 D 48 GiB, the patched P2P
+#    driver, TP2 GPU residency, and the existing refit plane cache. Run:
 #
-#        NETWORK=host RESTART=unless-stopped ./docker/serve_sm89_ds4.sh
+#        ./docker/serve_sm89_ds4.sh
 #
 #    Clients then use  http://<this-host>:8001/v1  (OpenAI-compatible).
 #    Quick test:       curl http://localhost:8001/v1/models
+#    To isolate a first quantizing boot explicitly, pass NETWORK=none.
 #
 # 2) TWO GPUS. Select the TP size and the expert residency. These are two
 #    independent choices.
@@ -31,7 +32,7 @@
 #      # The RAM use is low. This mode is the fastest.
 #        RESIDENCY=gpu TP=2 GPUS='"device=0,1"' UTIL=0.98 ./docker/serve_sm89_ds4.sh
 #
-#      # host residency (default). Use this mode when the host has much RAM and
+#      # host residency. Use this mode when the host has much RAM and
 #      # little VRAM. The planes stay in pinned host RAM. The GPU streams a pool.
 #      # host residency at TP2 needs approximately 2 x the host RAM (two pinned
 #      # arenas and approximately 26 GiB of /dev/shm). Increase the host RAM or the
@@ -56,8 +57,10 @@
 #
 #        IMG=vllm-moet-sm89:v0251 ./docker/serve_sm89_ds4.sh
 #
-#    v0251 is the current vLLM 0.25.1 lineage. Build it with
-#    Dockerfile.sm89-v0251 from the repository root.
+#    v0251 is the canonical living tag (vLLM 0.25.1 lineage) and the launcher
+#    default (see the IMG line below). Build it with Dockerfile.sm89-v0251
+#    from the repository root. Roll back to the pre-native baseline with
+#    IMG=vllm-moet-sm89:v0251-pre-native.
 #
 # 4) QUALITY, SPEED, AND MEMORY CONTROLS.
 #
@@ -115,7 +118,7 @@
 set -euo pipefail
 MODEL=${MODEL:-/root/models/DeepSeek-V4-Flash}   # checkpoint dir (read-only)
 CACHE=${CACHE:-/root/models/moet-cache}          # quant caches; ~90 GB free
-NETWORK=${NETWORK:-none}     # 'none' = unreachable (first boot); 'host' = production
+NETWORK=${NETWORK:-host}     # this host serves directly; use 'none' to isolate quantization
 RESTART=${RESTART:-no}       # production: unless-stopped (survives crashes/reboots)
 MAXLEN=${MAXLEN:-262144}     # maximum context length; lower for the first boot test
 UTIL=${UTIL:-0.98}           # fraction of VRAM vLLM may use (raised from 0.96; 2x48GiB
@@ -127,20 +130,35 @@ NUM_SEQS=${NUM_SEQS:-4}      # request scheduler limit, not four full-length KV 
 CUDAGRAPH_SIZES=${CUDAGRAPH_SIZES:-1,2,4,8}  # cudagraph_capture_sizes, comma-sep (trimmed
                              # from [1,2,4,8,12,16,24] to reduce captured buffers and
                              # workspaces. Graph capture does not copy the model weights).
+BREAKABLE_CUDAGRAPH=${BREAKABLE_CUDAGRAPH:-auto}  # auto = leave vLLM default; 0 = keep
+                             # torch.compile/Inductor enabled instead of auto breakable graphs.
 MTP_TOKENS=${MTP_TOKENS:-1}  # speculative tokens; keep 1 (see header section 4)
 PREFIX_CACHING=${PREFIX_CACHING:-1}  # reuse repeated prompt KV; read header section 4
 SCALE_REFIT=${SCALE_REFIT:-1}  # normal W2 conversion; 0 is for comparison or rollback
+SM89_NATIVE=${SM89_NATIVE:-}   # native e4m3 QMMA decode cubin: empty = image
+                               # default (ON when /cubit-share has the cubin,
+                               # parity-gated at boot); 0 = force Triton-only
+# Removed experiment knobs (2026-07-24), all measured failures or unported
+# paths on Ada -- kept only in documentation: DELTA_GB / DELTA_SPLIT /
+# PREFILL_FP4 (FP4 delta tiers: not ported to Ada; w4q measured slower and
+# incompatible with SCALE_REFIT=1), TOPP / TOPP_MIN / TOPP_RENORM (adaptive
+# expert top-p: major regression), SM89_WARPS / SM89_IMPL / SM89_BLOCK_N
+# (Triton tuning: warps 1/4 and BLOCK_N 32/64 regress, fp8mma gained <=3%),
+# SM89_W4Q (rejected). Evidence: NEXT.md, kernels/MANIFEST.md,
+# docs/solutions/architecture-patterns/. The runtime env vars still exist --
+# pass them via EXTRA_DOCKER_ENV for a one-off experiment.
+EXTRA_DOCKER_ENV=${EXTRA_DOCKER_ENV:-}  # optional raw docker env args, e.g. "-e FOO=1"
 PORT=${PORT:-8001}           # API port (reachable only with NETWORK=host)
-GPUS=${GPUS:-'"device=0"'}   # which GPUs; two cards: '"device=0,1"' + TP=2
-TP=${TP:-1}                  # tensor parallelism = number of GPUs used
-CUSTOM_ALL_REDUCE=${CUSTOM_ALL_REDUCE:-0}  # 1 = keep vLLM's P2P custom all-reduce; 0 = disable
+GPUS=${GPUS:-'"device=0,1"'} # this host's two 48 GiB RTX 4090 D cards
+TP=${TP:-2}                  # tensor parallelism = number of GPUs used
+CUSTOM_ALL_REDUCE=${CUSTOM_ALL_REDUCE:-1}  # 1 = keep vLLM's P2P custom all-reduce; 0 = disable
                              # (-> --disable-custom-all-reduce, NCCL fallback). Custom all-reduce
                              # needs the open-gpu-kernel-modules P2P patch on RTX 4090 D - see
                              # header section 2. Set 0 if your driver lacks that patch.
-RESIDENCY=${RESIDENCY:-host} # 'host' = 2-bit base in pinned RAM + GPU pool (RAM-heavy);
+RESIDENCY=${RESIDENCY:-gpu}  # 'host' = 2-bit base in pinned RAM + GPU pool (RAM-heavy);
                              # 'gpu'  = base sharded ONTO the GPUs, no host cache (VRAM-heavy,
                              # low RAM). TP, RESIDENCY, and SCALE_REFIT identify the quant cache.
-FORCE_RESIDENT=${FORCE_RESIDENT:-0}  # gpu residency: set 1 to bypass the boot-guard VRAM-budget
+FORCE_RESIDENT=${FORCE_RESIDENT:-1}  # gpu residency: set 1 to bypass the boot-guard VRAM-budget
                              # check (VLLM_MOE_W2_FORCE_RESIDENT). The guard refuses knife-edge
                              # configs that DO serve on >=48 GiB cards; set 1 to consent past the
                              # refusal. No effect under RESIDENCY=host.
@@ -150,9 +168,16 @@ BASE_GB=${BASE_GB:-20}       # host residency: GPU expert-pool GiB/rank (THE spe
                              # gpu residency forces BASE_CACHE_GB=0 (base lives on the GPUs).
 STORE=${STORE:-$CACHE/packs} # host residency only: on-disk quant pack (real fs, NOT overlayfs)
 ARENA_GB=${ARENA_GB:-14}     # host residency only: pinned host-RAM cache over the pack, per rank
-MEM_GB=${MEM_GB:-30}         # HARD container RAM cap - protects the host
+MEM_GB=${MEM_GB:-428}        # current host's HARD container RAM cap
 NAME=${NAME:-moet}
-IMG=${IMG:-vllm-moet-sm89:v0251}
+IMG=${IMG:-vllm-moet-sm89:v0251}  # canonical living tag (vLLM 0.25.1 lineage),
+                             # rebuilt in place by:
+                             #   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm89-v0251 \
+                             #     -t vllm-moet-sm89:v0251 .
+                             # current content adds the native SM89 W2 decode cubin, packed
+                             # KV-group allocator, and DSv4 specialized router (validated
+                             # 2026-07-24: +27% short decode, +66% c4 aggregate). Pre-native
+                             # rollback image: IMG=vllm-moet-sm89:v0251-pre-native.
 
 mkdir -p "$CACHE/planes" "$CACHE/jit" "$STORE"
 docker rm -f "$NAME" 2>/dev/null || true
@@ -194,6 +219,19 @@ else
   RESVOL="-v $STORE:/packs"
   RESENV="-e VLLM_MOE_W2_BASE_CACHE_GB=$BASE_GB -e VLLM_MOE_W2_PLANES_CACHE=/plane-cache -e VLLM_MOE_W2_STORE_DIR=/packs -e VLLM_MOE_W2_BASE_RAM_GB=$ARENA_GB"
 fi
+if [ "$BREAKABLE_CUDAGRAPH" = auto ]; then
+  BREAKABLE_ENV=""
+else
+  BREAKABLE_ENV="-e VLLM_USE_BREAKABLE_CUDAGRAPH=$BREAKABLE_CUDAGRAPH"
+fi
+if [ -n "$SM89_NATIVE" ]; then
+  SM89_ENV="-e VLLM_MOE_W2_SM89_NATIVE=$SM89_NATIVE"
+else
+  SM89_ENV=""
+fi
+# FP4 delta tiers are not ported to Ada -- pinned off explicitly so a stray
+# inherited env can never enable them (see the removed-knobs note above).
+DELTA_ENV="-e VLLM_MOE_W2_DELTA_GB=0 -e VLLM_MOE_W2_DELTA_SPLIT=0"
 docker run -d --name "$NAME" --restart "$RESTART" --gpus "$GPUS" --network "$NETWORK" $IPCARGS \
   --memory "${MEM_GB}g" --memory-swap "$((MEM_GB + 2))g" \
   -v "$MODEL":/model:ro \
@@ -201,10 +239,13 @@ docker run -d --name "$NAME" --restart "$RESTART" --gpus "$GPUS" --network "$NET
   -v "$CACHE/jit":/root/.cache \
   $RESVOL \
   -e VLLM_MOE_W2=1 \
-  -e VLLM_MOE_W2_DELTA_GB=0 \
+  $DELTA_ENV \
   -e VLLM_MOE_W2_SCALE_REFIT="$SCALE_REFIT" \
   $RESENV \
   -e VLLM_ENGINE_READY_TIMEOUT_S="$READY_TIMEOUT_S" \
+  $BREAKABLE_ENV \
+  $SM89_ENV \
+  $EXTRA_DOCKER_ENV \
   -e TRITON_CACHE_DIR=/root/.cache/triton \
   -e TORCHINDUCTOR_CACHE_DIR=/root/.cache/torchinductor \
   "$IMG" \
@@ -219,7 +260,7 @@ docker run -d --name "$NAME" --restart "$RESTART" --gpus "$GPUS" --network "$NET
   --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"],"cudagraph_capture_sizes":['"$CUDAGRAPH_SIZES"']}' \
   --port "$PORT"
 BUILD=$(docker exec "$NAME" cat /opt/moet-checks/SOURCE.txt 2>/dev/null | grep -v '^#' | head -1 || true)
-echo "started $NAME (sm_89, gpus=${GPUS} tp=${TP} residency=${RESIDENCY}, memcap=${MEM_GB}g, ready-timeout=${READY_TIMEOUT_S}s, port ${PORT}, network=$NETWORK, restart=$RESTART, max-model-len=$MAXLEN, util=$UTIL, batched=$BATCHED_TOKENS, seqs=$NUM_SEQS, mtp=$MTP_TOKENS, prefix-cache=$PREFIX_CACHING, scale-refit=$SCALE_REFIT, graphs=[$CUDAGRAPH_SIZES])"
+echo "started $NAME (sm_89, gpus=${GPUS} tp=${TP} residency=${RESIDENCY}, memcap=${MEM_GB}g, ready-timeout=${READY_TIMEOUT_S}s, port ${PORT}, network=$NETWORK, restart=$RESTART, max-model-len=$MAXLEN, util=$UTIL, batched=$BATCHED_TOKENS, seqs=$NUM_SEQS, mtp=$MTP_TOKENS, prefix-cache=$PREFIX_CACHING, scale-refit=$SCALE_REFIT, sm89-native=${SM89_NATIVE:-default-on}, graphs=[$CUDAGRAPH_SIZES], breakable-cudagraph=$BREAKABLE_CUDAGRAPH)"
 if [ "$RESIDENCY" = gpu ]; then
   echo "  residency=gpu: 2-bit base GPU-RESIDENT (BASE_CACHE_GB=0), sharded across ${TP} rank(s); no host pack/arena. FORCE_RESIDENT=${FORCE_RESIDENT} (1 = bypass the boot-guard VRAM-budget refusal on >=48 GiB cards). Watch for: 'moe_w2 planes: ... GPU-RESIDENT' and ~37 GiB/card VRAM."
 else
@@ -229,6 +270,7 @@ echo "image build (upstream v0.25.1 SHA): ${BUILD:-UNKNOWN - pre-observability i
 echo "healthy-boot markers:  docker logs -f $NAME 2>&1 | grep -E 'moe_w2|o_proj'"
 echo "  1) 'moe_w2: env ... does NOTHING — did you mean ...' (only if you typoed a knob)"
 echo "  2) 'sm_89 Triton emulation ready on <GPU> ... self-test worst_rel=...'"
+echo "  2b) 'sm_89 NATIVE decode cubin ACTIVE for (K, N)=...' after two per-shape parity lines (absent cubin / SM89_NATIVE=0 logs 'decode stays on the Triton emulation' instead - emulation-only, still correct)"
 echo "  3) 'moe_w2 planes: ... -> GPU-RESIDENT' or '-> PINNED HOST RAM'"
 echo "  4) 'DeepSeek V4 o_proj: using native SM89 block-scaled FP8 grouped matmul'"
 echo "on failure:            docker logs $NAME 2>&1 | grep -B2 -A30 -E 'EngineCore.*(Error|Traceback|CRITICAL)|moe_w2|o_proj'"
@@ -265,9 +307,8 @@ exit 0
 # rank. STORE needs a REAL filesystem (bind mount, NOT overlayfs) and ~80 GB
 # free.
 #
-# NETWORK=none default: the first boot writes the pack; a half-quantized
-# server should not be reachable. It also means PORT is unreachable until
-# a NETWORK=host relaunch - that is the point.
+# NETWORK=host is the production default on this dedicated host. Pass
+# NETWORK=none explicitly when a first quantizing boot must be isolated.
 #
 # TP2 ON A SMALL HOST (host residency): two pinned arenas + ~26 GiB /dev/shm for
 # inter-worker tensor passing did not fit 38 GiB - the first TP2 attempt swap-stormed
@@ -278,7 +319,7 @@ exit 0
 # driver patch linked in the header - without that patch set CUSTOM_ALL_REDUCE=0.
 #
 # EXPERT RESIDENCY. The quantization cache is specific to (TP size, residency).
-#   host (default): the 2-bit base stays in pinned host RAM. It uses an on-disk pack
+#   host: the 2-bit base stays in pinned host RAM. It uses an on-disk pack
 #     and an MRU arena. The GPU keeps a BASE_GB pool. Use this mode for a host with much
 #     RAM and little VRAM. host residency at TP2 uses much RAM (see above).
 #   gpu (BASE_CACHE_GB=0): the base shards onto the GPUs. TP splits approximately 73 GiB
@@ -297,11 +338,8 @@ exit 0
 # ... Failed core proc(s): {}". This launcher sets 1800 seconds. The quantization can
 # then complete.
 #
-# MEM_GB HARD CAP: belt-and-suspenders against the above. If a load
-# overshoots, the cgroup OOM-killer takes the CONTAINER (fast, contained)
-# instead of the host swap-storming slow USB swap into a hang. Sized for
-# TP1 (RSS ~20-26 GiB) + margin; only +2 GiB swap so it cannot lean on USB
-# swap. Also cap the LXC itself: pct set 100 -memory 32000 -swap 4000.
+# MEM_GB HARD CAP: belt-and-suspenders against a failed load. This host's
+# container cap is 428 GiB; the launcher permits only another 2 GiB of swap.
 #
 # VRAM-BUDGET TUNING (UTIL / BATCHED_TOKENS / NUM_SEQS / CUDAGRAPH_SIZES /
 #   MTP_TOKENS): at TP=2 RESIDENCY=gpu on 2x48 GiB cards, the 2-bit base

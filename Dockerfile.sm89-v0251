@@ -85,5 +85,16 @@ RUN cd "$(python3 -c 'import vllm, os; print(os.path.dirname(os.path.dirname(vll
 # op-level check scripts + image identity (same contract as the v024 image:
 # run the full gate on new silicon BEFORE serving; SOURCE names the upstream
 # v0.25.1 SHA the patches/ set was diffed against)
-COPY kernels/gen/moe_w2_check_sm89.py kernels/gen/moe_w2_sm89_cpu_check.py /opt/moet-checks/
+COPY kernels/gen/moe_w2_check_sm89.py kernels/gen/moe_w2_sm89_cpu_check.py kernels/gen/moe_w4q_check_sm89.py kernels/gen/moe_w2_sm89_native_check.py /opt/moet-checks/
 COPY patches/SOURCE.txt /opt/moet-checks/SOURCE.txt
+
+# sm_89 NATIVE decode cubin (kernels/cuda/moe_w2_sm89_decode.cu, built by
+# kernels/cuda/build_moe_w2_sm89_decode.sh, validated by
+# kernels/gen/moe_w2_sm89_native_check.py): Ada-native e4m3 QMMA for the two
+# DS4-Flash TP2 decode GEMM shapes (K=1024/N=4096, K=4096/N=2048), measured
+# 3.1-4.7x over the Triton emulation at the op level. The loader
+# (moe_w2_cubit._load_sm89_native) picks it up from /cubit-share (the
+# VLLM_MOE_W2_CUBIT_DIR default), parity-gates each shape at boot, and falls
+# back to the Triton emulation on any failure. VLLM_MOE_W2_SM89_NATIVE=0
+# disables it outright.
+COPY kernels/cubins-sm89/moe_w2_sm89_decode.cubin /cubit-share/
