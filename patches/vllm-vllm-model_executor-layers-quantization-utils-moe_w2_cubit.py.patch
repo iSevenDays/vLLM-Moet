@@ -1,9 +1,9 @@
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
-index 0000000..98c719c 100644
+index 0000000..58f73a8 100644
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
-@@ -0,0 +1,2847 @@
+@@ -0,0 +1,3080 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Routed experts on 2-bit tensor-sym planes (cubit moe_w2) for the
@@ -92,6 +92,13 @@ index 0000000..98c719c 100644
 +# _launch fast-path check is a no-op on sm_120.
 +_native_fns: dict = {}
 +_scale_refit_logged = False
++# One-shot latch for the w8 POOL parity gate (w8_pool_self_test). Set the
++# first time the gate runs successfully (or is skipped because the tier has
++# no pool yet); prevents re-running it on every subsequent layer build.
++_w8_pool_gate_done = False
++# One-shot latch for the w8 POOL gate SKIP warning (FP8 enabled but the gate
++# could not run): the per-layer _w8_pool_gate wrapper emits the WARNING once.
++_w8_pool_gate_skip_logged = False
 +# PREFILL QUALITY LEVER (default ON): prefill-sized calls consume the FP4
 +# delta tier exactly like decode — pairs whose expert is FP4-resident divert
 +# to moe_w4(q)_mm, the rest stay on the 2-bit planes. Before this, prefill
@@ -600,6 +607,133 @@ index 0000000..98c719c 100644
 +# Load-time plane building
 +# --------------------------------------------------------------------------
 +
++
++def w8_pool_self_test(tier, k13: int, n13: int) -> float:
++    """End-to-end FP8 gate THROUGH a pool slot: catches slot/stride/staging
++    sizing bugs that the standalone w8_self_test / _op_case_fp8 cannot (e.g.
++    a tier built with FP4-sized slots — the singleton-poisoning IMA root
++    cause). Run at boot after the FP8 tier has its first staged expert plane.
++
++    Mirrors _op_case_fp8 + _launch but rewrites the W pointer to land inside
++    the tier's actual pool (TAIL slot — overruns fault here first), then
++    syncs and compares against the torch fp32 reference. Raises on any
++    non-finite output or relative error >= 2.5e-2 (the standard w8 gate)."""
++    from vllm.model_executor.layers.quantization.utils import (
++        moe_w2_sm89 as _w8m)
++    desc, bufs, ref = _w8m._op_case_fp8(k13, n13, m_rows=16)
++    plane = bufs[2]                                   # the w_fp8 plane
++    if plane.numel() != tier.w13_bytes:
++        raise RuntimeError(
++            f"w8 pool gate: plane {plane.numel()} B != tier.w13_bytes "
++            f"{tier.w13_bytes} B — tier sized for a different format")
++    slot = tier.n_slots - 1                           # TAIL slot: overruns
++                                                     # fault here first
++    tier.pool[slot, :tier.w13_bytes].copy_(
++        plane.view(-1)[:tier.w13_bytes])
++    desc[0, 2] = tier.pool[slot].data_ptr()           # W ptr now inside the
++                                                     # pool
++    _launch("w8", k13, desc[0], n13, 1, torch.cuda.current_stream())
++    torch.cuda.synchronize()
++    got = bufs[4].float().cpu()
++    worst = (got - ref).abs().max().item() / ref.abs().max().clamp_min(
++        1e-12).item()
++    if not torch.isfinite(got).all() or worst >= 2.5e-2:
++        raise RuntimeError(
++            f"w8 POOL parity FAILED: worst_rel={worst:.3e} "
++            f"(gate 2.5e-2) — slot/stride/staging sizing bug")
++    return worst
++
++
++def _w8_pool_gate(fp8_tier, k13: int, n13: int) -> None:
++    """One-shot wrapper around w8_pool_self_test: runs the gate the first
++    time an FP8 tier with a non-empty pool has a staged expert plane, then
++    latches. Failures are raised loudly (boot attribution)."""
++    global _w8_pool_gate_done, _w8_pool_gate_skip_logged
++    if _w8_pool_gate_done:
++        return
++    if fp8_tier is None or fp8_tier.n_slots <= 0:
++        # Tier not built yet, or auto-deferred / zero-slot: try again on a
++        # later layer (the latch is NOT set). Do NOT stay silent -- emit a
++        # one-shot WARNING so the inactive condition is attributable in the
++        # boot log (the build-path call sites gate on fp8_tier is not None,
++        # so in practice this branch is the AUTO-DEFERRED cold pool; a
++        # genuinely never-staged tier is caught HARD by _fp8_boot_guard at
++        # first forward).
++        from vllm.model_executor.layers.quantization.utils import moe_w2_delta
++        if (not _w8_pool_gate_skip_logged) and moe_w2_delta.fp8_enabled():
++            _w8_pool_gate_skip_logged = True
++            logger.warning(
++                "moe_w2_cubit: VLLM_MOE_W2_FP8_DELTA=1 but the w8 POOL "
++                "parity gate could NOT run at build (fp8_tier=%s, "
++                "n_slots=%s) -- end-to-end pool slot/stride sizing is "
++                "UNVERIFIED (auto-deferred cold pool, or a build path "
++                "skipped the gate). _fp8_boot_guard reports at first "
++                "forward.",
++                "None" if fp8_tier is None else "built",
++                "n/a" if fp8_tier is None else fp8_tier.n_slots)
++        return
++    worst = w8_pool_self_test(fp8_tier, k13, n13)
++    _w8_pool_gate_done = True
++    logger.info(
++        "moe_w2_cubit: sm_89 FP8 POOL parity OK: worst_rel=%.3e "
++        "(gate 2.5e-2); w8 slot/stride sizing verified end-to-end through "
++        "pool slot %d", worst, fp8_tier.n_slots - 1)
++
++
++# One-shot latch for the post-load FP8 boot guard. Runs at the FIRST forward
++# (after model load / finalize_auto, before real serving traffic -- vLLM
++# warmup exercises it, so a raise aborts the boot, attributed).
++_fp8_boot_guard_done = False
++
++
++def _fp8_boot_guard() -> None:
++    """LOUD boot guard: ``VLLM_MOE_W2_FP8_DELTA=1`` but the FP8 delta tier
++    was never created/staged -> the build path did not wire FP8, prefill
++    silently runs on bare 2-bit, and a test cycle burns against an
++    FP8-OFF baseline. Fail loudly instead of silently skipping.
++
++    Decisive signal: ``moe_w2_delta._TIER`` (the FP8 singleton) must EXIST
++    and have at least one staged layer (``add_layer_host_planes`` ran). This
++    is exactly what the DS4-Flash mxfp4 path missed before build_layer_planes
++    wired the FP8 tier -- _TIER stayed None, the standalone w8 self-test
++    passed (it validates the kernel in isolation), and the resident tier/pool
++    was never built. Tolerates a legit auto-deferred cold pool (n_slots == 0
++    pending finalize_auto): the tier EXISTS and is staged, so the guard
++    passes; the POOL parity gate is reported separately (info/warn).
++    """
++    global _fp8_boot_guard_done, _w8_pool_gate_done
++    if _fp8_boot_guard_done:
++        return
++    _fp8_boot_guard_done = True
++    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
++    if not moe_w2_delta.fp8_enabled():
++        return
++    tier = moe_w2_delta._TIER
++    staged = 0 if tier is None else len(tier._store)
++    if tier is None or staged == 0:
++        raise RuntimeError(
++            "moe_w2: VLLM_MOE_W2_FP8_DELTA=1 but the FP8 delta tier was "
++            "never created/staged -- FP8 prefill is INACTIVE (the build "
++            "path did not wire FP8). Set VLLM_MOE_W2_FP8_DELTA=0 or fix "
++            "the build path (build_layer_planes / build_layer_planes_fp8 / "
++            "build_layer_planes_nvfp4 must call _fp8_tier_for_build + "
++            "add_layer_host_planes for the mxfp4/fp8/nvfp4 checkpoint "
++            "formats respectively).")
++    if _w8_pool_gate_done:
++        logger.info(
++            "moe_w2: FP8 BOOT GUARD PASSED -- delta tier active (%d layers "
++            "staged, %d slots, POOL parity verified); FP8 prefill is LIVE",
++            staged, tier.n_slots)
++    else:
++        logger.warning(
++            "moe_w2: FP8 BOOT GUARD: delta tier active (%d layers staged, "
++            "%d slots) but the w8 POOL parity gate did NOT run "
++            "(auto-deferred pool, or a build path skipped the gate) -- "
++            "end-to-end slot/stride sizing is UNVERIFIED; a sizing "
++            "regression would not be caught until prefill", staged,
++            tier.n_slots)
++
++
 +def _require_kernels(K13: int, K2: int, need_w4: bool) -> None:
 +    """Fail loudly at weight load when the cubins this model's shapes need are
 +    missing from _DIR (they are loaded opportunistically in _ensure_ready)."""
@@ -663,8 +797,12 @@ index 0000000..98c719c 100644
 +    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
 +    if not moe_w2_delta.fp8_enabled():
 +        return None
++    # fp8=True: this is the ONLY call site permitted to construct/receive
++    # the FP8 singleton tier (see the poisoning guard in get_tier). The FP4
++    # call site _fp4_tier_for_build runs BEFORE this one and would otherwise
++    # poison _TIER with FP4 half-sizes.
 +    return moe_w2_delta.get_tier(n_experts=E, dev=dev,
-+                                 w13_bytes=n13k13, w2_bytes=n2k2)
++                                 w13_bytes=n13k13, w2_bytes=n2k2, fp8=True)
 +
 +
 +def _stage_fp4_host(tier, layer_key: int, fp13, sc13, fp2, sc2) -> None:
@@ -697,6 +835,40 @@ index 0000000..98c719c 100644
 +    (n*k/2) or the split quintal plane (n*k*5/16)."""
 +    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
 +    return n * k * 5 // 16 if moe_w2_delta.split_enabled() else n * k // 2
++
++
++def _mxfp4_fp8_unit_bytes(nib, ck_scale_bytes, serving_scale_bytes):
++    """UNIT-SPACE e4m3 bytes [N, K] u8 for one mxfp4 expert, for the FP8
++    delta tier's slot content.
++
++    The moe_w8 kernel folds the SHARED resident base scale -- the same
++    UE8M0 block-32 plane (``sc13``/``sc2``) the 2-bit tier reads -- so the
++    slot's e4m3 bytes must be the true weight DIVIDED by that serving
++    scale. For mxfp4 the true weight is ``e2m1_val(nib) * 2^(ck-127)``;
++    dividing by the serving scale (the checkpoint scale, or the
++    refit-decremented scale when SCALE_REFIT is active) yields the
++    unit-space ``u = e2m1_val * 2^(ck - serving)``.
++
++    This is the EXACT ``want_fp8=True`` math of ``_f64_to_codes_scales``
++    (``u = wb / 2^exp; fp8 = u.clamp(-448, 448).to(e4m3)``), using the
++    tier's serving scale instead of recomputing ``exp`` so the shared
++    UE8M0 plane still reconstructs the weight (the mxfp4 2-bit path keeps
++    the checkpoint scale, unlike the fp8-checkpoint path which recomputes
++    it -- so we must NOT call ``_f64_to_codes_scales`` here). f32 math is
++    exact for the e2m1 grid and the +/-1 exponent deltas. Because ``u`` is
++    derived from the same requant as the 2-bit codes (incl. any refit),
++    the FP8 tier has NO scale-refit conflict (per
++    ``pack_fp8_fragment_major``'s contract).
++    """
++    from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (
++        _E2M1_VALS)
++    N, K = nib.shape
++    w = _E2M1_VALS.to(nib.device)[nib.long()].view(N, K // 32, 32)
++    ck = ck_scale_bytes.to(torch.float32).view(N, K // 32, 1)
++    sv = serving_scale_bytes.to(torch.float32).view(N, K // 32, 1)
++    u = w.to(torch.float32) * torch.exp2(ck - sv)
++    return (u.reshape(N, K).clamp(-448.0, 448.0)
++            .to(torch.float8_e4m3fn).view(torch.uint8))
 +
 +
 +# Loader-level skip (the planes-cache/pack "v1.5 follow-up"): layers the
@@ -1158,11 +1330,19 @@ index 0000000..98c719c 100644
 +    sc2 = torch.empty(E, N2 * K2 // 32, dtype=torch.uint8, device=dev)
 +
 +    from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (
-+        mxfp4_to_nibbles, pack_fp4_fragment_major)
++        mxfp4_to_nibbles, pack_fp4_fragment_major, pack_fp8_fragment_major)
 +    # Pass the PER-RANK FP4 plane sizes (N*K//2 bytes/expert) so the delta tier's
 +    # slots, host store, and pool indexing match the (TP-sharded) planes. On TP1
 +    # these equal the module constants -> the single-GPU path is unchanged.
 +    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
++    # FP8-e4m3 delta PREFILL tier (Ada native FP8 MMA; mutually exclusive with
++    # FP4 -- when FP8 is active the FP4 ``tier`` above is None). Mirrors
++    # build_layer_planes_fp8: create the tier, build the unit-space e4m3 byte
++    # planes, stage them, and run the one-shot POOL parity gate. Without this
++    # block DS4-Flash (mxfp4) booted with FP8 ENABLED but INACTIVE -- the tier
++    # stayed None, prefill ran on bare 2-bit, and the w8 launcher's standalone
++    # parity gate passed but the resident tier/pool was never built.
++    fp8_tier = _fp8_tier_for_build(E, dev, N13 * K13, N2 * K2)
 +    fp13 = fp2 = None
 +    if tier is not None:
 +        # full nibble planes (w4) or quintal planes (w4q, split)
@@ -1170,6 +1350,18 @@ index 0000000..98c719c 100644
 +                           dtype=torch.uint8, device=dev)
 +        fp2 = torch.empty(E, _fp4_plane_nbytes(N2, K2),
 +                          dtype=torch.uint8, device=dev)
++    fp8_13 = fp8_2 = None
++    if fp8_tier is not None:
++        # 1 byte/elem fragment-major e4m3 planes (the moe_w8 layout).
++        # CPU-resident: these planes are staged into the HOST arena and only
++        # promoted into the GPU pool on demand, so the build transients must
++        # NEVER consume VRAM. Building them on GPU piled ~3 GiB/layer of FP8
++        # transients on top of the resident 2-bit base planes + the 1.5 GiB
++        # GPU delta pool and OOM'd the base mxfp4_refit_codes_scales at
++        # layer ~41 (62 MiB free, 64 MiB alloc). The derivation is pure
++        # element-wise/permutation math -> CPU-correct.
++        fp8_13 = torch.empty(E, N13 * K13, dtype=torch.uint8, device="cpu")
++        fp8_2 = torch.empty(E, N2 * K2, dtype=torch.uint8, device="cpu")
 +
 +    chunk = 32
 +    for e0 in range(0, E, chunk):
@@ -1186,6 +1378,20 @@ index 0000000..98c719c 100644
 +            sc13[e0 + i] = pack_scales(scales)
 +            if fp13 is not None:
 +                fp13[e0 + i] = _pack_fp4_plane(nib)
++            if fp8_13 is not None:
++                # sg[i] is the original checkpoint scale; `scales` is the
++                # SERVING scale (== sg[i] unless refit decremented it). The
++                # unit-space e4m3 is derived from both so the shared base
++                # scale plane reconstructs the weight (see
++                # _mxfp4_fp8_unit_bytes). Run on CPU: the per-expert inputs
++                # are moved to CPU just for this derivation so the ~3 GiB/layer
++                # FP8 build transients never hit VRAM (fp8_13 is CPU; the
++                # output stays CPU and flows into the host arena via
++                # add_layer_host_planes below). Pure element-wise math ->
++                # CPU-correct, byte-identical to the old GPU result.
++                fp8_13[e0 + i] = pack_fp8_fragment_major(
++                    _mxfp4_fp8_unit_bytes(
++                        nib.cpu(), sg[i].cpu(), scales.cpu()))
 +        wg = w2[e0:e1].to(dev, non_blocking=True)
 +        sg = s2[e0:e1].to(dev, non_blocking=True)
 +        for i in range(e1 - e0):
@@ -1198,6 +1404,13 @@ index 0000000..98c719c 100644
 +            sc2[e0 + i] = pack_scales(scales)
 +            if fp2 is not None:
 +                fp2[e0 + i] = _pack_fp4_plane(nib)
++            if fp8_2 is not None:
++                # CPU-side derivation, same rationale as the w13 FP8 block
++                # above: keep the FP8 build transients off the GPU. Per-expert
++                # slices moved to CPU; output stays CPU for host-arena staging.
++                fp8_2[e0 + i] = pack_fp8_fragment_major(
++                    _mxfp4_fp8_unit_bytes(
++                        nib.cpu(), sg[i].cpu(), scales.cpu()))
 +
 +    if tier is not None:
 +        _stage_fp4_host(tier, layer_key, fp13, sc13, fp2, sc2)
@@ -1205,6 +1418,14 @@ index 0000000..98c719c 100644
 +        # (the background manager is started by get_tier when the tier is
 +        # created; the old "start on layer NUM_LAYERS-1" trigger never fired
 +        # under PP, where layer_keys are local per rank and never reach 42)
++    if fp8_tier is not None:
++        # FP8 delta: stage the e4m3 byte planes (no scale sections -- the
++        # shared resident base scales serve both tiers), then the one-shot
++        # end-to-end POOL parity gate (catches a tier sized for the wrong
++        # format through a real pool slot, loudly at the first staged layer).
++        fp8_tier.add_layer_host_planes(layer_key, fp8_13, fp8_2)
++        del fp8_13, fp8_2
++        _w8_pool_gate(fp8_tier, K13, N13)
 +
 +    _finish_layer(layer, layer_key, dev, planes13, sc13, planes2, sc2,
 +                  N13, K13, N2, K2, E,
@@ -1309,6 +1530,10 @@ index 0000000..98c719c 100644
 +        # shared resident base scales serve both tiers).
 +        fp8_tier.add_layer_host_planes(layer_key, fp8_13, fp8_2)
 +        del fp8_13, fp8_2
++        # One-shot end-to-end POOL parity gate (boot hook): catches a tier
++        # sized for the wrong format (the singleton-poisoning IMA root cause)
++        # through a real pool slot, loudly at the first staged layer.
++        _w8_pool_gate(fp8_tier, K13, N13)
 +
 +    _finish_layer(layer, layer_key, dev, planes13, sc13, planes2, sc2,
 +                  N13, K13, N2, K2, E,
@@ -1501,6 +1726,8 @@ index 0000000..98c719c 100644
 +    if fp8_tier is not None:
 +        fp8_tier.add_layer_host_planes(layer_key, fp8_13, fp8_2)
 +        del fp8_13, fp8_2
++        # One-shot end-to-end POOL parity gate (boot hook).
++        _w8_pool_gate(fp8_tier, K13, N13)
 +
 +    _finish_layer(layer, layer_key, dev, planes13, sc13, planes2, sc2,
 +                  N13, K13, N2, K2, E,
@@ -2408,6 +2635,12 @@ index 0000000..98c719c 100644
 +        moe_align_block_size,
 +    )
 +    global _pf4_ensure_logged
++    # One-shot post-load FP8 boot guard (Fix B): runs on the FIRST forward
++    # (after model load + finalize_auto, before serving). vLLM warmup hits
++    # it, so a raise aborts the boot, attributed -- exactly the loud, early
++    # failure that catches "FP8 enabled but inactive" instead of burning a
++    # test cycle. No-op after the first call and when FP8 is off.
++    _fp8_boot_guard()
 +
 +    st = _LAYERS[layer_key]
 +    T, H = x.shape

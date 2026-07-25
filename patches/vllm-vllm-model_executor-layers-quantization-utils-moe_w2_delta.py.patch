@@ -1,9 +1,9 @@
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
 new file mode 100644
-index 0000000..93022c3 100644
+index 0000000..b5c32b8 100644
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
-@@ -0,0 +1,2150 @@
+@@ -0,0 +1,2186 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""FP4 delta tier for the 1-GPU 2-bit MoE path (quality restoration).
@@ -535,6 +535,19 @@ index 0000000..93022c3 100644
 +        multi-GiB planes is exactly the transient that OOMs a 32 GB card
 +        during load. With the pack-file store a layer already on disk is
 +        skipped entirely (persistent quantization cache)."""
++        # Staging-size invariant: total staged bytes per expert must equal
++        # slot_bytes. Turns any future tier/format drift (e.g. an FP8 tier
++        # sized for FP4 half-sizes — the w8 IMA root cause) into a LOUD boot
++        # error at the first layer build instead of a silent overread later.
++        # All callers pass 2D [E, section_bytes] tensors (the store's
++        # contract — see moe_w2_store.add_layer).
++        total = sum(t.shape[1] for t in parts13) + sum(t.shape[1]
++                                                       for t in parts2)
++        if total != self.slot_bytes:
++            raise RuntimeError(
++                f"moe_w2 [{self._tag}] staging {total} B/expert into "
++                f"{self.slot_bytes} B slots — tier sized for a different "
++                f"plane format")
 +        self._store.add_layer(layer_key, (*parts13, *parts2))
 +
 +    def start(self):
@@ -588,6 +601,13 @@ index 0000000..93022c3 100644
 +        self._last_capture = time.monotonic()
 +
 +    def _tick_once(self):
++        if self._tag == "w8" and not self._free:
++            # Frozen once full: the prefill working set (256 experts) >> pool,
++            # so adaptivity only churns slots and adds an eviction race
++            # surface against the desc kernel's pool reads. Slots fill once
++            # (from preload heat + live routing on a cold boot) and then NO
++            # eviction path ever runs.
++            return
 +        if time.monotonic() - self._last_capture < 5.0:
 +            return
 +        self._tick += 1
@@ -858,6 +878,10 @@ index 0000000..93022c3 100644
 +        Without this, an uncapped gate fire at a full pool bulk-evicted
 +        the accumulated high-need core for once-routed candidates
 +        (wholesale churn; the old MAX_PROMOTE cap merely masked it)."""
++        if self._tag == "w8" and not self._free:
++            # Frozen w8 pool: no eviction (covers force_promote /
++            # ensure_resident callers too). See _tick_once for rationale.
++            return []
 +        out: list[int] = []
 +        while self._free and len(out) < k:
 +            out.append(self._free.pop())
@@ -2091,9 +2115,21 @@ index 0000000..93022c3 100644
 +
 +
 +def get_tier(n_layers=None, n_experts=256, dev=None,
-+             w13_bytes=None, w2_bytes=None) -> DeltaTier | None:
++             w13_bytes=None, w2_bytes=None,
++             fp8: bool = False) -> DeltaTier | None:
 +    global _TIER
 +    is_fp8 = fp8_enabled()
++    # Singleton-poisoning guard (root cause of the w8 IMA at plane-build):
++    # _fp4_tier_for_build runs BEFORE _fp8_tier_for_build and calls this fn
++    # passing FP4 half-sizes (w13_bytes=n13k13//2). When FP8 is enabled, the
++    # plain `enabled()` gate is False but is_fp8 is True, so without this
++    # guard the FP4 call site would construct/receive the singleton FP8 tier
++    # sized for the WRONG (FP4) plane format -> slots 6 MiB instead of 12 MiB
++    # -> the w8 GEMM overreads each slot -> illegal memory access at the
++    # tick's sync. Only the FP8 call site (fp8=True) may build/receive the
++    # FP8 tier; FP4/split call sites are inert in FP8 mode.
++    if is_fp8 and not fp8:
++        return None
 +    if not enabled() and not is_fp8:
 +        return None
 +    if _TIER is None:

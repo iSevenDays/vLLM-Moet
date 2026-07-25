@@ -494,8 +494,12 @@ def make_launchers(ks) -> dict:
     # FP8-e4m3 delta prefill tier (Ada native FP8 MMA). Mutually exclusive
     # with the FP4 delta tiers; registered only when its env is set, so the
     # 2-bit base + native decode paths are untouched when FP8 is off.
-    if os.getenv("VLLM_MOE_W2_FP8_DELTA", "0").lower() \
-            not in ("0", "", "false", "no", "off"):
+    # Use fp8_enabled() (env AND GB>0) so registration agrees with the
+    # dispatch site (_launch / _op_case_fp8 wire-up), which also keys off
+    # fp8_enabled() — the raw env gate alone would register w8 launchers
+    # even when GB=0, diverging from dispatch.
+    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
+    if moe_w2_delta.fp8_enabled():
         for k in ks:
             fns[("w8", k)] = make_w8_launcher(k)
     return fns

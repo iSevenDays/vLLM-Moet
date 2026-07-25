@@ -239,8 +239,13 @@ fi
 # inherited env can never enable them (see the removed-knobs note above).
 # When FP8_DELTA_GB>0, the FP8-e4m3 delta prefill tier is enabled instead
 # (mutually exclusive with FP4; SCALE_REFIT stays on — FP8 has no refit conflict).
-if [ "$FP8_DELTA_GB" -gt 0 ] 2>/dev/null; then
+# Float-safe (awk, not integer `[ -gt ]` — the old test silently treated
+# "0.5" as non-numeric and fell through to the FP8-off branch, invalidating
+# the 0.5 GiB test) and LOUD on garbage.
+if awk -v g="$FP8_DELTA_GB" 'BEGIN { if (g+0 != g) exit 2; exit !(g+0 > 0) }'; then
   DELTA_ENV="-e VLLM_MOE_W2_FP8_DELTA=1 -e VLLM_MOE_W2_FP8_DELTA_GB=$FP8_DELTA_GB -e VLLM_MOE_W2_DELTA_GB=0 -e VLLM_MOE_W2_DELTA_SPLIT=0"
+elif [ $? -eq 2 ]; then
+  echo "FATAL: FP8_DELTA_GB='$FP8_DELTA_GB' is not numeric" >&2; exit 1
 else
   DELTA_ENV="-e VLLM_MOE_W2_DELTA_GB=0 -e VLLM_MOE_W2_DELTA_SPLIT=0"
 fi
