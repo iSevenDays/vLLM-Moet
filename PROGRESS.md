@@ -154,3 +154,91 @@ durable, encode in `create_nginx_config`.
 - [ ] If DeepSeek-V4-Flash is viable here, route the moet/deepseek mode into
       `vllm-qwen27b-dflash.sh` (extend `setup_router_runtime_env` for the TP2
       single-backend layout) and remove the interim `ROUTER_LAYOUT=moet` override.
+
+---
+
+## Streamed full-precision prefill quality mode (2026-07-25)
+
+Implementation of pieces 1–6 of `internal/STREAMED_PREFILL_PLAN.md` on branch
+`feat/moe-w2-sm89-native-decode`. Key changes (overlay files; not committed):
+
+### Piece 1 — Deferred pool allocation (build-time OOM fix, single boot)
+
+`DeltaTier.__init__` gains `defer_pool=True` kwarg: when set, `_auto_pending=True`
+regardless of `pool_gb`, and `_explicit_gb` records the cap for `finalize_auto`.
+`get_tier`'s FP8 branch passes `defer_pool=True`; the pool is allocated post-KV by
+the existing `finalize_auto` hook in `gpu_worker.py` (line ~769), never during
+`build_layer_planes`. A deferred parity gate (`w8_pool_gate_deferred` in
+`moe_w2_cubit.py`) runs right after `finalize_auto` to fill the gap the build-time
+gate had to skip (n_slots was 0). **The two-boot cache workaround is obsolete**:
+a single boot now builds (or cache-loads) planes and then sizes the pool post-KV.
+
+### Piece 2 — Surgical ensure-mode (frozen w8 background tick + emergency-only eviction)
+
+`_tick_once` re-gains the `w8` freeze guard (removed in f85fbdf): when the w8 free
+list is empty the background manager returns immediately. `_take_slots_batch` gains
+the complementary `emergency=False` guard so the background's lazy-promote path
+respects the freeze, while `force_promote` and `ensure_resident` (both pass
+`emergency=True`) continue to evict-and-pin. This eliminates the background-race
+surface without losing per-chunk prefill coverage.
+
+### Piece 3 — FP4-storage kernel + tier (`VLLM_MOE_W2_FP8_STORE=fp4`)
+
+New `moe_w8fp4_mm_sm89` Triton kernel: stores the checkpoint e2m1 nibble plane
+(6 MiB/slot at TP2 vs 12 MiB for fp8-store) and decodes each nibble to its exact
+e4m3 bit pattern in registers before the native fp8 `tl.dot`. Halves pool slot,
+pinned host arena (~65 GiB/rank vs ~129 GiB/rank for fp8-store), and per-chunk H2D
+traffic. `SCALE_REFIT=0` is required and enforced at build (a refit-decremented
+scale needs u = 2×e2m1, off the e2m1 grid). `PLANES_SUBDIR=planes-qp` keeps the
+refit=0 plane cache separate so toggling the mode does not wipe the refit=1 cache.
+
+### Piece 4 — Per-chunk H2D promotion: verification (no code changes)
+
+The streamed ensure-mode path already exists on this branch. Verified assertions:
+
+1. **Dispatch** (`moe_w2_cubit.py:3029–3043`): when `use_w8` and
+   `_PREFILL_FP4_ENSURE` (env `VLLM_MOE_W2_PREFILL_FP4=ensure`) and not capturing,
+   `tier.ensure_resident(layer_key, topk_ids.view(-1))` is called at line 3042
+   BEFORE `slot_row = tier.slot_table[layer_key]` at line 3043 — the pool is
+   populated before the desc build reads it.
+
+2. **Stream ordering** (`moe_w2_delta.py::ensure_resident`, lines 1400–1461):
+   line 1415 does `self._stream.wait_stream(main)` ordering all pool `copy_`s
+   after every GEMM already enqueued on the forward stream; line 1419 `ev.synchronize()`
+   blocks the host until bytes land; `slot_table[li, ei] = slot` at line 1458 is
+   written on the forward thread after synchronize, before the desc build launches.
+   `rows_for` at line 1447 passes `scan=True` (protects the store's decode hot set).
+
+3. **CUDA-graph safety** (`moe_w2_cubit.py:3008–3009`): `use_w8` requires
+   `prefill` (T > `_PREFILL_T`=96, defined at line 145 — never a captured shape);
+   the capturing branch at line 3031 calls `tier.notify_capture()` instead of
+   ensure. Quality mode chunk is 4096 ≫ 96, confirming no graph capture overlap.
+
+4. **Layer-pin rotation** (`moe_w2_delta.py:1423`): `_layer_pins.clear()` at the
+   top of each `ensure_resident` call releases the previous layer's pins; with
+   piece 2's emergency bypass, pass 3 of `_take_slots_batch` rotates the whole
+   pool every layer.
+
+### Piece 5 — Chunk size + H2D cost management (numbers, no code)
+
+- `BATCHED_TOKENS=4096` (chunk); MTP must be off (>1024 OOMs at startup with MTP).
+- Pool: `FP8_DELTA_GB=1.5` = 256 × 6 MiB FP4-store slots = one full layer union @ TP2.
+  Deferred allocation clips to post-KV free VRAM minus 3 GiB reserve.
+- `UTIL=0.90`: post-KV free ≈ total×(1−UTIL) ≈ 4.8 GiB/card; must cover pool
+  1.5 GiB + 3 GiB reserve. At UTIL=0.98 only ~1 GiB remains and pool clips to ~0.
+- H2D cost: 43 MoE layers × 256 × 6 MiB ≈ 64.5 GiB/chunk ÷ ~20 GB/s ≈ 3.2 s/chunk;
+  131K/4096 = 32 chunks → ~1.5–3 min/prefill. fp4-store is the perf and RAM choice
+  (fp8-store ~368 GiB/rank would not fit the 428 GiB container cap).
+- Pinned host arena: ~65 GiB/rank at TP2 fp4-store (~129 GiB total).
+
+### Piece 6 — Serve config (`docker/serve_sm89_ds4.sh`)
+
+`QUALITY_PREFILL=1` preset block inserted after `set -euo pipefail`, before all
+default variable assignments (load order: preset uses `${VAR:-...}` so explicit
+user env wins; later defaults also use `${VAR:-...}` so they keep preset values).
+Wire-up: `mkdir -p "$CACHE/$PLANES_SUBDIR"`, `-v "$CACHE/$PLANES_SUBDIR":/plane-cache`,
+`$QP_ENV \` added to docker run env args next to `$DELTA_ENV`, start banner extended
+with `quality-prefill=$QUALITY_PREFILL`, and quality-mode healthy-boot markers
+added. FP8_DELTA_GB comment notes the deferred post-KV allocation. TECHNICAL NOTES
+section gains a STREAMED QUALITY PREFILL paragraph with UTIL rationale, H2D cost,
+arena sizing, planes-qp cache isolation, and the obsolescence of the two-boot flow.

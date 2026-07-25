@@ -116,6 +116,29 @@
 # misbehaves, not to launch. Healthy-boot log markers are echoed at start.
 # ============================================================================
 set -euo pipefail
+# QUALITY_PREFILL=1: streamed full-precision prefill (long-context quality mode).
+# Per-chunk ensure-mode: each prefill chunk's routed experts are promoted from
+# the pinned host arena into a deferred GPU pool and the w13/w2 GEMMs run at
+# FP8 precision from FP4-STORAGE slots (exact e2m1->e4m3 decode); decode stays
+# on the 2-bit base + native cubin. Costs: ~1.5-2.5 min per 131K prefill (H2D-
+# bound), MTP off, ~65 GiB/rank pinned host arena, SCALE_REFIT=0 (a DIFFERENT
+# plane cache -> first boot re-quantizes into planes-qp, 15-20 min).
+QUALITY_PREFILL=${QUALITY_PREFILL:-0}
+if [ "$QUALITY_PREFILL" = 1 ]; then
+  MAXLEN=${MAXLEN:-131072}       # KV floor scales with max-model-len
+  UTIL=${UTIL:-0.90}             # leave ~4.8 GiB/card post-KV: the deferred
+                                 # pool (1.5) + workspace reserve (3.0) live there
+  BATCHED_TOKENS=${BATCHED_TOKENS:-4096}  # chunk size = the H2D amortizer
+  MTP_TOKENS=${MTP_TOKENS:-0}    # quality mode is prefill-bound; >1024 OOMs with MTP
+  SCALE_REFIT=${SCALE_REFIT:-0}  # REQUIRED by fp4-storage (build enforces)
+  FP8_DELTA_GB=${FP8_DELTA_GB:-1.5}  # 256 x 6 MiB = one full layer union @ TP2
+  QP_ENV="-e VLLM_MOE_W2_FP8_STORE=fp4 -e VLLM_MOE_W2_PREFILL_FP4=ensure"
+  PLANES_SUBDIR=planes-qp        # refit=0 changes plane bytes; a shared dir
+                                 # would WIPE the refit=1 cache on every flip
+else
+  QP_ENV=""
+  PLANES_SUBDIR=planes
+fi
 MODEL=${MODEL:-/root/models/DeepSeek-V4-Flash}   # checkpoint dir (read-only)
 CACHE=${CACHE:-/root/models/moet-cache}          # quant caches; ~90 GB free
 NETWORK=${NETWORK:-host}     # this host serves directly; use 'none' to isolate quantization
@@ -141,6 +164,9 @@ FP8_DELTA_GB=${FP8_DELTA_GB:-0}  # FP8-e4m3 delta PREFILL tier (Ada native FP8 M
                                  # 2-bit prefill + native fast MMA + no SCALE_REFIT
                                  # conflict). FP4 delta tiers are mutually exclusive and
                                  # pinned OFF. 0 (default) = inert (2-bit base only).
+                                 # QUALITY_PREFILL=1 sets this to 1.5; the pool is
+                                 # allocated POST-KV (deferred; VLLM_MOE_W2_FP8_DELTA_GB
+                                 # caps it) — no build-time OOM, single boot.
 SM89_NATIVE=${SM89_NATIVE:-}   # native e4m3 QMMA decode cubin: empty = image
                                # default (ON when /cubit-share has the cubin,
                                # parity-gated at boot); 0 = force Triton-only
@@ -185,7 +211,7 @@ IMG=${IMG:-vllm-moet-sm89:v0251}  # canonical living tag (vLLM 0.25.1 lineage),
                              # 2026-07-24: +27% short decode, +66% c4 aggregate). Pre-native
                              # rollback image: IMG=vllm-moet-sm89:v0251-pre-native.
 
-mkdir -p "$CACHE/planes" "$CACHE/jit" "$STORE"
+mkdir -p "$CACHE/$PLANES_SUBDIR" "$CACHE/jit" "$STORE"
 docker rm -f "$NAME" 2>/dev/null || true
 # TP>1 needs host IPC + big /dev/shm for inter-worker tensors; TP1 must NOT
 # pay that (see TECHNICAL NOTES: the ~26 GiB shm helped sink a TP2 first run).
@@ -252,11 +278,12 @@ fi
 docker run -d --name "$NAME" --restart "$RESTART" --gpus "$GPUS" --network "$NETWORK" $IPCARGS \
   --memory "${MEM_GB}g" --memory-swap "$((MEM_GB + 2))g" \
   -v "$MODEL":/model:ro \
-  -v "$CACHE/planes":/plane-cache \
+  -v "$CACHE/$PLANES_SUBDIR":/plane-cache \
   -v "$CACHE/jit":/root/.cache \
   $RESVOL \
   -e VLLM_MOE_W2=1 \
   $DELTA_ENV \
+  $QP_ENV \
   -e VLLM_MOE_W2_SCALE_REFIT="$SCALE_REFIT" \
   $RESENV \
   -e VLLM_ENGINE_READY_TIMEOUT_S="$READY_TIMEOUT_S" \
@@ -277,7 +304,7 @@ docker run -d --name "$NAME" --restart "$RESTART" --gpus "$GPUS" --network "$NET
   --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"],"cudagraph_capture_sizes":['"$CUDAGRAPH_SIZES"']}' \
   --port "$PORT"
 BUILD=$(docker exec "$NAME" cat /opt/moet-checks/SOURCE.txt 2>/dev/null | grep -v '^#' | head -1 || true)
-echo "started $NAME (sm_89, gpus=${GPUS} tp=${TP} residency=${RESIDENCY}, memcap=${MEM_GB}g, ready-timeout=${READY_TIMEOUT_S}s, port ${PORT}, network=$NETWORK, restart=$RESTART, max-model-len=$MAXLEN, util=$UTIL, batched=$BATCHED_TOKENS, seqs=$NUM_SEQS, mtp=$MTP_TOKENS, prefix-cache=$PREFIX_CACHING, scale-refit=$SCALE_REFIT, sm89-native=${SM89_NATIVE:-default-on}, graphs=[$CUDAGRAPH_SIZES], breakable-cudagraph=$BREAKABLE_CUDAGRAPH)"
+echo "started $NAME (sm_89, gpus=${GPUS} tp=${TP} residency=${RESIDENCY}, memcap=${MEM_GB}g, ready-timeout=${READY_TIMEOUT_S}s, port ${PORT}, network=$NETWORK, restart=$RESTART, max-model-len=$MAXLEN, util=$UTIL, batched=$BATCHED_TOKENS, seqs=$NUM_SEQS, mtp=$MTP_TOKENS, prefix-cache=$PREFIX_CACHING, scale-refit=$SCALE_REFIT, sm89-native=${SM89_NATIVE:-default-on}, graphs=[$CUDAGRAPH_SIZES], breakable-cudagraph=$BREAKABLE_CUDAGRAPH, quality-prefill=$QUALITY_PREFILL)"
 if [ "$RESIDENCY" = gpu ]; then
   echo "  residency=gpu: 2-bit base GPU-RESIDENT (BASE_CACHE_GB=0), sharded across ${TP} rank(s); no host pack/arena. FORCE_RESIDENT=${FORCE_RESIDENT} (1 = bypass the boot-guard VRAM-budget refusal on >=48 GiB cards). Watch for: 'moe_w2 planes: ... GPU-RESIDENT' and ~37 GiB/card VRAM."
 else
@@ -290,6 +317,13 @@ echo "  2) 'sm_89 Triton emulation ready on <GPU> ... self-test worst_rel=...'"
 echo "  2b) 'sm_89 NATIVE decode cubin ACTIVE for (K, N)=...' after two per-shape parity lines (absent cubin / SM89_NATIVE=0 logs 'decode stays on the Triton emulation' instead - emulation-only, still correct)"
 echo "  3) 'moe_w2 planes: ... -> GPU-RESIDENT' or '-> PINNED HOST RAM'"
 echo "  4) 'DeepSeek V4 o_proj: using native SM89 block-scaled FP8 grouped matmul'"
+if [ "$QUALITY_PREFILL" = 1 ]; then
+  echo "quality-prefill boot markers (in addition to the above):"
+  echo "  1) 'moe_w2 delta tier: auto-sizing deferred until after KV-cache allocation' (w8, at build)"
+  echo "  5) 'moe_w2 delta tier AUTO: 256 slots x 6.0 MiB (1.50 GiB pool; ...)' (post-KV pool alloc)"
+  echo "  6) 'moe_w2_cubit: sm_89 FP8 POOL parity OK ... through pool slot 255' (deferred gate)"
+  echo "  7) first prefill: 'moe_w2 prefill-FP4/FP8 ensure mode: eager chunk working sets fetched...'"
+fi
 echo "on failure:            docker logs $NAME 2>&1 | grep -B2 -A30 -E 'EngineCore.*(Error|Traceback|CRITICAL)|moe_w2|o_proj'"
 echo "                       docker inspect $NAME --format '{{.State.ExitCode}} {{.State.OOMKilled}}'"
 echo "  'Failed core proc(s): {}' (empty set) = EngineCore died with NO Python exception:"
@@ -375,6 +409,34 @@ exit 0
 #     SCALE_REFIT=1        (same-size W2 conversion with lower block SSE)
 #   Override any of them via env to test smaller-first smoke runs (e.g.
 #   MAXLEN=8192 UTIL=0.94 ./docker/serve_sm89_ds4.sh).
+#
+# STREAMED QUALITY PREFILL (QUALITY_PREFILL=1): enables per-chunk ensure-mode
+# FP8-delta prefill. Each prefill chunk's routed experts are synchronously
+# promoted from the pinned host arena into a deferred GPU pool (FP4-storage
+# slots, 6 MiB each @ TP2) before the descriptor-kernel GEMM reads slot_table.
+# Key parameters (piece-5 arithmetic):
+#   BATCHED_TOKENS=4096  chunk size; MTP must be OFF (>1024 OOMs with MTP on;
+#                        quality mode is H2D-bound anyway)
+#   UTIL=0.90            post-KV free VRAM ≈ total×(1−UTIL) ≈ 4.8 GiB/card;
+#                        must cover pool 1.5 GiB + 3 GiB workspace reserve —
+#                        at UTIL=0.98 only ~1 GiB remains and the pool clips to ~0
+#   FP8_DELTA_GB=1.5     256 × 6 MiB FP4-store slots = one full layer union @ TP2
+#                        (deferred: allocated post-KV by finalize_auto, never at build)
+#   SCALE_REFIT=0        REQUIRED: fp4-storage slots hold checkpoint e2m1 nibbles
+#                        verbatim; a refit-decremented serving scale would need
+#                        u = 2×e2m1 (off the e2m1 grid) — build enforces this
+#   PLANES_SUBDIR=planes-qp  separate cache dir: SCALE_REFIT=0 changes plane
+#                        bytes; sharing a dir with refit=1 would wipe that cache
+# Cost: ~1.5-2.5 min per 131K prefill (43 MoE layers × 256 × 6 MiB ≈ 64.5 GiB
+#   worst-case H2D/chunk ÷ ~20 GB/s pinned bandwidth ≈ 3.2 s + GEMMs);
+#   131K/4096 = 32 chunks. fp4-store halves H2D vs fp8-store and keeps the
+#   pinned host arena at ~65 GiB/rank (~129 GiB total TP2 — comfortable under
+#   the 428 GiB cap; fp8-store's ~129 GiB/rank ≈ 258 GiB total fits too but
+#   doubles the per-chunk H2D time — fp4-store is the perf choice, not just RAM).
+# Two-boot cache workaround: OBSOLETE. With deferred pool allocation the build
+#   allocates no GPU pool, so a single boot builds (or cache-loads) the planes
+#   and then sizes the pool post-KV. Any prior two-boot operational notes are
+#   superseded.
 #
 # IMAGE IDENTITY + TRIAGE: the start banner prints the upstream v0.25.1 SHA
 # the patches/ set was diffed against (/opt/moet-checks/SOURCE.txt;
