@@ -1,0 +1,34 @@
+id: needle_sweep
+# Mid-context needle retrieval vs prompt length. Pure client-side probe against
+# an ALREADY-RUNNING vLLM server (the live moet container). bench.py boots its
+# own server, so the intended path is the standalone CLI:
+#
+#   # smoke (proof of wiring, ~1 min):
+#   python3 bench/runner/probes.py --probe needle_sweep --lengths 2048,16384 --runs 1
+#
+#   # full "before" baseline (~15 min; caps at 131072):
+#   python3 bench/runner/probes.py --probe needle_sweep --out /tmp/needle_before.json
+#
+#   # opt-in the slow ~262K prefill:
+#   python3 bench/runner/probes.py --probe needle_sweep \
+#       --lengths 2048,16384,32768,65536,131072,262144
+#
+# A unique access code (WORD-DDDD, deterministic per length) is placed at
+# mid-context (depth 0.5) inside REALISTIC filler (concatenated repo text —
+# random-WORDS filler did NOT reproduce the failure; realistic text does), then
+# the model is asked to return ONLY the code. ALL metrics come from
+# /v1/chat/completions (the model is chat-tuned; raw /v1/completions
+# confabulates), with thinking:false so the tight max_tokens budget lands on the
+# answer. Confirmed failure to reproduce: CORRECT at 2K, WRONG/GARBLED at 131K.
+#
+# Lengths are TARGET prompt_tokens (the probe calibrates bytes/token on a
+# realistic-filler sample and sizes the filler accordingly); the real
+# usage.prompt_tokens is recorded per request. This is the before/after metric
+# for the FP8-delta kernel fix. See probes.needle_sweep for detail.
+probes:
+  - kind: needle_sweep
+    lengths: [2048, 16384, 32768, 65536, 131072]
+    runs: 1
+    depth: 0.5
+    max_tokens: 24
+    timeout: 900
