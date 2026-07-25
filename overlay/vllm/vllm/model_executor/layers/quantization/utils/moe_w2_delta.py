@@ -595,13 +595,12 @@ class DeltaTier:
         self._last_capture = time.monotonic()
 
     def _tick_once(self):
-        if self._tag == "w8" and not self._free:
-            # Frozen once full: the prefill working set (256 experts) >> pool,
-            # so adaptivity only churns slots and adds an eviction race
-            # surface against the desc kernel's pool reads. Slots fill once
-            # (from preload heat + live routing on a cold boot) and then NO
-            # eviction path ever runs.
-            return
+        # The w8 tier uses the SAME dynamic promotion + eviction machinery as
+        # the FP4 delta tier (the sm120-proven path). An earlier commit froze
+        # the pool once full (`if self._tag == "w8" and not self._free: return`);
+        # that disablement left the hot-expert subset uncovered during long
+        # prefills (the prefill working set >> pool, so the pool MUST evict-and-
+        # repromote to track routing skew). Guard removed to restore coverage.
         if time.monotonic() - self._last_capture < 5.0:
             return
         self._tick += 1
@@ -872,10 +871,10 @@ class DeltaTier:
         Without this, an uncapped gate fire at a full pool bulk-evicted
         the accumulated high-need core for once-routed candidates
         (wholesale churn; the old MAX_PROMOTE cap merely masked it)."""
-        if self._tag == "w8" and not self._free:
-            # Frozen w8 pool: no eviction (covers force_promote /
-            # ensure_resident callers too). See _tick_once for rationale.
-            return []
+        # No w8 freeze: ensure_resident / force_promote must be able to evict-
+        # and-pin the current chunk's hot experts for w8 (same dynamic path as
+        # FP4). An earlier `if self._tag == "w8" and not self._free: return []`
+        # guard disabled this and froze the pool; removed to restore coverage.
         out: list[int] = []
         while self._free and len(out) < k:
             out.append(self._free.pop())

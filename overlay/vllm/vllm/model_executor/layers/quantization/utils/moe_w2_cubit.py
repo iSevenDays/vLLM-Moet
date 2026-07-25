@@ -125,6 +125,10 @@ _PF4_ENV = os.getenv("VLLM_MOE_W2_PREFILL_FP4", "1")
 _PREFILL_FP4 = _PF4_ENV not in ("0", "")
 _PREFILL_FP4_ENSURE = _PF4_ENV == "ensure"
 _pf4_ensure_logged = False
+# One-shot w8 coverage trace (gated by VLLM_MOE_W2_FP8_TRACE): logs pool
+# residency for the first few w8 prefills so we can confirm the dynamic pool
+# is covering the hot-expert subset during the prefill. Zero-overhead off.
+_w8_cov_logged = 0
 # Decode/prefill routing threshold: calls with T > this take the prefill
 # path (MC4/AFRAG kernels + prefill-FP4). The default 96 is the LARGEST
 # CUDAGRAPH CAPTURE SIZE of the standing multi-seq configs — a captured
@@ -2682,7 +2686,7 @@ def _moe_w2_forward_timed(
     from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
         moe_align_block_size,
     )
-    global _pf4_ensure_logged
+    global _pf4_ensure_logged, _w8_cov_logged
     # One-shot post-load FP8 boot guard (Fix B): runs on the FIRST forward
     # (after model load + finalize_auto, before serving). vLLM warmup hits
     # it, so a raise aborts the boot, attributed -- exactly the loud, early
@@ -2956,6 +2960,23 @@ def _moe_w2_forward_timed(
                     tier.ensure_resident(layer_key, topk_ids.view(-1))
                 slot_row = tier.slot_table[layer_key]
                 pool_ptr = tier.pool.data_ptr()
+                if use_w8 and os.getenv(
+                        "VLLM_MOE_W2_FP8_TRACE", "0") not in (
+                        "0", "false", "no", "off"):
+                    # One-shot w8 coverage probe: confirm the (now-dynamic) w8
+                    # pool is actually covering the hot-expert subset during
+                    # the prefill. Fires for the first N w8 prefills only.
+                    if _w8_cov_logged < 8:
+                        _w8_cov_logged += 1
+                        _row = tier.slot_table[layer_key]
+                        _n_res = int((_row >= 0).sum())
+                        _n_free = len(tier._free) if hasattr(
+                            tier, "_free") else 0
+                        logger.info(
+                            "moe_w2 w8 prefill: layer %d use_w8=True "
+                            "pool_slots=%d resident_this_layer=%d "
+                            "free=%d T=%d",
+                            layer_key, tier.n_slots, _n_res, _n_free, T)
             else:
                 slot_row = ws["no_slots"]
                 pool_ptr = ws["a1"].data_ptr()  # never dereferenced (m4=0)
