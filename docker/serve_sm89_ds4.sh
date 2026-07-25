@@ -294,7 +294,7 @@ docker run -d --name "$NAME" --restart "$RESTART" --gpus "$GPUS" --network "$NET
   -e TORCHINDUCTOR_CACHE_DIR=/root/.cache/torchinductor \
   "$IMG" \
   --model /model --served-model-name deepseek-v4-flash auto --trust-remote-code \
-  --kv-cache-dtype fp8 --block-size 256 --max-model-len "$MAXLEN" \
+  --kv-cache-dtype "${KV_CACHE_DTYPE:-fp8}" --block-size 256 --max-model-len "$MAXLEN" \
   --gpu-memory-utilization "$UTIL" --max-num-batched-tokens "$BATCHED_TOKENS" --max-num-seqs "$NUM_SEQS" \
   --tokenizer-mode deepseek_v4 --no-scheduler-reserve-full-isl \
   --tool-call-parser deepseek_v4 \
