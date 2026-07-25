@@ -14,7 +14,9 @@ Opt-in via VLLM_MOE_W2_PLANES_CACHE=<dir>. Layout:
   <dir>/tp{W}-rank{R}/layer{L}.<part>.bin  # raw u8 tensors
 
 Parts per layer: planes13, sc13, planes2, sc2 and, when the FP4 delta tier
-was enabled at build time, fp13, fp2. A layer HITS when meta matches and
+was enabled at build time, fp13, fp2; when the FP8 delta tier was enabled,
+fp8u13, fp8u2 (the mxfp4/nvfp4/fp8-block paths all stage the FP8 planes
+through the same cache). A layer HITS when meta matches and
 every required part exists with the exact expected size (computed from the
 layer's weight shapes); anything else is a MISS for that layer and it
 rebuilds (and rewrites) from the checkpoint as before. Writes go through a
@@ -130,7 +132,7 @@ def _rank_dir() -> str:
 
 
 def expected_sizes(E: int, N13: int, K13: int, N2: int, K2: int,
-                   want_fp4: bool) -> dict[str, int]:
+                   want_fp4: bool, want_fp8: bool = False) -> dict[str, int]:
     from vllm.model_executor.layers.quantization.utils import moe_w2_delta
     exp = {
         "planes13": E * N13 * K13 // 4,
@@ -145,6 +147,15 @@ def expected_sizes(E: int, N13: int, K13: int, N2: int, K2: int,
         else:
             exp["fp13"] = E * N13 * K13 // 2
             exp["fp2"] = E * N2 * K2 // 2
+    if want_fp8:
+        # FP8 delta tier planes: 1 byte/elem fragment-major e4m3 (no scale
+        # section -- the shared resident base scale serves both tiers). The
+        # meta needs no FP8 field: part PRESENCE + exact size is the validity
+        # contract, and zero_mode/scale_refit/ckpt_id already key every input
+        # of the fp8 derivation. A cache written WITHOUT fp8 parts simply
+        # MISSes when want_fp8 and rebuilds.
+        exp["fp8u13"] = E * N13 * K13
+        exp["fp8u2"] = E * N2 * K2
     return exp
 
 

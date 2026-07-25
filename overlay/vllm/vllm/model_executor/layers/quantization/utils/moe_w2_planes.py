@@ -308,6 +308,66 @@ def pack_fp8_fragment_major(w_fp8: torch.Tensor) -> torch.Tensor:
     return c.flatten().to(torch.uint8)
 
 
+# --- batched twins (whole-chunk pack/derivation) ---------------------------
+# Batched versions of pack_fp4_fragment_major / pack_fp8_fragment_major /
+# the mxfp4 FP8 unit-space derivation, over a leading EXPERT dim E. The
+# chunk loop in build_layer_planes (mxfp4 path) uses these to derive one
+# chunk's FP8/FP4 planes in two batched torch ops instead of ~E per-expert
+# iterations with ~E D2H syncs (minutes -> seconds). The permute is the
+# unbatched permute (0,3,2,6,1,4,5,7) SHIFTED by a leading E dim:
+# (E,nb,tile,g,kb,k32,half,t,j) -> (E,nb,kb,g,t,tile,k32,half,j) =
+# (0,1,4,3,7,2,5,6,8). Byte-identical to the single-expert golden path
+# (kernels/gen/moe_w8_sm89_batch_check.py proves batch[i] == single(i)).
+def pack_fp4_fragment_major_batch(nib: torch.Tensor) -> torch.Tensor:
+    """[E, N, K] u8 e2m1 nibbles -> [E, N*K/2] u8 fragment-major FP4 plane.
+
+    Batched twin of ``pack_fp4_fragment_major``: the same nibble-pair pack
+    (c[:,:,0] | c[:,:,1]<<4) over the E-shifted permutation. Nibble values
+    are <= 15 -> the shift+or stays u8-safe (no int16 promote needed)."""
+    E, N, K = nib.shape
+    assert N % 16 == 0 and K % 64 == 0
+    c = nib.view(E, N // 16, 2, 8, K // 64, 2, 2, 4, 4)
+    c = c.permute(0, 1, 4, 3, 7, 2, 5, 6, 8).contiguous().view(E, -1, 2)
+    return (c[:, :, 0] | (c[:, :, 1] << 4)).to(torch.uint8)
+
+
+def pack_fp8_fragment_major_batch(w_fp8: torch.Tensor) -> torch.Tensor:
+    """[E, N, K] u8 e4m3 bytes -> [E, N*K] u8 fragment-major FP8 plane.
+
+    Batched twin of ``pack_fp8_fragment_major``: the same 1 byte/elem
+    permutation (no k4 packing), E-shifted."""
+    E, N, K = w_fp8.shape
+    assert N % 16 == 0 and K % 64 == 0
+    c = w_fp8.view(E, N // 16, 2, 8, K // 64, 2, 2, 4, 4)
+    return c.permute(0, 1, 4, 3, 7, 2, 5, 6, 8).contiguous().view(E, N * K)
+
+
+def mxfp4_fp8_unit_bytes_batch(
+    w_packed: torch.Tensor,
+    ck_bytes: torch.Tensor,
+    sv_bytes: torch.Tensor,
+) -> torch.Tensor:
+    """[E,N,K/2] u8 packed e2m1 + [E,N,K/32] u8 ck + [E,N,K/32] u8 serving
+    UE8M0 -> [E, N, K] u8 UNIT-SPACE e4m3 bytes.
+
+    Batched twin of ``_mxfp4_fp8_unit_bytes`` (moe_w2_cubit): the same
+    ``u = e2m1_val * 2^(ck - serving)`` math, clamped to e4m3 and cast.
+    The ck-serving delta is computed in int16 (exact for UE8M0 bytes
+    0..255) then viewed as f32, matching the single-expert f32 subtraction
+    bit-for-bit (integers in [-255,255] are exactly representable in f32).
+    f32 math is exact for the e2m1 grid and the +/-1 exponent deltas. The
+    FP8 tier folds the SAME shared resident base scale, so the unit-space
+    e4m3 reconstructs the true weight."""
+    E, N, K2 = w_packed.shape
+    K = K2 * 2
+    nib = mxfp4_to_nibbles(w_packed)                       # [E, N, K] u8
+    w = _E2M1_VALS.to(torch.float32).to(w_packed.device)[nib.int()]
+    d = (ck_bytes.to(torch.int16) - sv_bytes.to(torch.int16)).to(torch.float32)
+    u = w.view(E, N, K // 32, 32) * torch.exp2(d).unsqueeze(-1)
+    return (u.view(E, N, K).clamp_(-448.0, 448.0)
+            .to(torch.float8_e4m3fn).view(torch.uint8))
+
+
 # e2m1 magnitude grid and the midpoints between adjacent magnitudes.
 # Bucketizing |u| against the midpoints (right=False: first midpoint >= |u|)
 # reproduces tools/repack_expert_bits.py's nearest-with-lo-tie-break snap,

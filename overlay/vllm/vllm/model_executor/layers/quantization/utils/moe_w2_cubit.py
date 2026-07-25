@@ -933,18 +933,20 @@ def plan_pack_skip(layer) -> bool:
     else:
         # GPU-resident: the planes cache is the only source that can
         # replace the checkpoint requant — probe it (keyed by transformer
-        # layer index, sized exactly like process-time try_load).
-        if moe_w2_delta.fp8_enabled():
-            # FP8 delta planes are NOT in the planes cache yet (they are built
-            # fresh from the checkpoint by build_layer_planes_fp8). Skipping
-            # the checkpoint load would leave the FP8 tier empty -> silent
-            # quality degradation. Force a fresh quant so the FP8 planes are
-            # built alongside the base planes.
-            return False
+        # layer index, sized exactly like process-time try_load). The probe
+        # MUST include the FP8 delta parts (fp8u13/fp8u2) when the FP8 tier
+        # is armed: an old cache written without them is a MISS (rebuilds),
+        # but a cache that has them lets an FP8-enabled boot skip the
+        # checkpoint staging too -- the build path serves FP8 from the cache
+        # via _consume_planes_cache. (mxfp4/DS4 never reaches plan_pack_skip
+        # -- it streams via arm_stream_build -- so this only lifts the
+        # nvfp4/fp8-block GPU-resident loader skip under FP8.)
         lidx = _pc.layer_idx_from_name(getattr(layer, "layer_name", ""))
         if lidx is None or not _pc.cache_has_layer(
                 lidx, _pc.expected_sizes(
-                    E, N13, K13, N2, K2, want_fp4=moe_w2_delta.enabled())):
+                    E, N13, K13, N2, K2,
+                    want_fp4=moe_w2_delta.enabled(),
+                    want_fp8=moe_w2_delta.fp8_enabled())):
             return False
     for pname in ("w13_weight", "w13_weight_scale",
                   "w2_weight", "w2_weight_scale"):
@@ -1317,6 +1319,18 @@ def build_layer_planes(layer, layer_key: int) -> None:
                          ("w13_weight", "w13_weight_scale", "w2_weight",
                           "w2_weight_scale")):
         return
+    # Planes cache (VLLM_MOE_W2_PLANES_CACHE): the mxfp4 requant + FP8
+    # derivation below is deterministic given (checkpoint, TP layout, zero
+    # mode, scale refit), so cached planes (2-bit base + FP4 + FP8 delta)
+    # stream back instead of rebuilding -- the FP8 derivation was the slow
+    # step this path re-ran every boot. Mirrors build_layer_planes_nvfp4.
+    from vllm.model_executor.layers.quantization.utils import (
+        moe_w2_planes_cache as _pc)
+    planes_cache_enabled = _pc.enabled()
+    lidx = _pc.layer_idx_from_name(getattr(layer, "layer_name", ""))
+    planes_cache_store = _pc.store
+    if _consume_planes_cache(layer, layer_key, dev, E, N13, K13, N2, K2):
+        return
 
     planes13 = torch.empty(E, N13 * K13 // 4, dtype=torch.uint8, device=dev)
     sc13 = torch.empty(E, N13 * K13 // 32, dtype=torch.uint8, device=dev)
@@ -1357,54 +1371,78 @@ def build_layer_planes(layer, layer_key: int) -> None:
         fp8_13 = torch.empty(E, N13 * K13, dtype=torch.uint8, device="cpu")
         fp8_2 = torch.empty(E, N2 * K2, dtype=torch.uint8, device="cpu")
 
+    from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (
+        mxfp4_fp8_unit_bytes_batch, pack_fp8_fragment_major_batch)
     chunk = 32
     for e0 in range(0, E, chunk):
         e1 = min(e0 + chunk, E)
         wg = w13[e0:e1].to(dev, non_blocking=True)
         sg = s13[e0:e1].to(dev, non_blocking=True)
+        # Refit / codes-once-per-chunk: mxfp4_refit_codes_scales and
+        # mxfp4_to_codes are ROW/BLOCK-LOCAL (independent per [N, K] row), so
+        # flattening the chunk's experts into the N dim is EXACT -> cb[i] ==
+        # the per-expert codes, sb_[i] == the per-expert serving scales. The
+        # 2-bit base pack below (planes13/sc13) is therefore byte-identical to
+        # the old per-expert loop; only the FP8 derivation moved from
+        # per-expert to one batched call per chunk.
+        if scale_refit:
+            cb, sb_ = mxfp4_refit_codes_scales(
+                wg.reshape(-1, wg.shape[-1]),
+                sg.reshape(-1, sg.shape[-1]))
+            cb = cb.view(e1 - e0, N13, K13)
+            sb_ = sb_.view(e1 - e0, N13, K13 // 32)
+        else:
+            cb, sb_ = mxfp4_to_codes(wg), sg
         for i in range(e1 - e0):
             nib = mxfp4_to_nibbles(wg[i])
-            if scale_refit:
-                codes, scales = mxfp4_refit_codes_scales(wg[i], sg[i])
-            else:
-                codes, scales = mxfp4_to_codes(wg[i]), sg[i]
-            planes13[e0 + i] = pack_fragment_major(codes)
-            sc13[e0 + i] = pack_scales(scales)
+            planes13[e0 + i] = pack_fragment_major(cb[i])
+            sc13[e0 + i] = pack_scales(sb_[i])
             if fp13 is not None:
                 fp13[e0 + i] = _pack_fp4_plane(nib)
-            if fp8_13 is not None:
-                # sg[i] is the original checkpoint scale; `scales` is the
-                # SERVING scale (== sg[i] unless refit decremented it). The
-                # unit-space e4m3 is derived from both so the shared base
-                # scale plane reconstructs the weight (see
-                # _mxfp4_fp8_unit_bytes). Run on CPU: the per-expert inputs
-                # are moved to CPU just for this derivation so the ~3 GiB/layer
-                # FP8 build transients never hit VRAM (fp8_13 is CPU; the
-                # output stays CPU and flows into the host arena via
-                # add_layer_host_planes below). Pure element-wise math ->
-                # CPU-correct, byte-identical to the old GPU result.
-                fp8_13[e0 + i] = pack_fp8_fragment_major(
-                    _mxfp4_fp8_unit_bytes(
-                        nib.cpu(), sg[i].cpu(), scales.cpu()))
+        if fp8_13 is not None:
+            # ONE batched derivation per chunk (kills ~E per-expert nib D2H
+            # syncs). Reads the CPU checkpoint bytes directly (w13/s13 = ck)
+            # and the chunk's serving scales (sb_ = s13 unless refit
+            # decremented it); the ONE D2H is sb_.to("cpu"). CPU math ->
+            # byte-identical to the old per-expert path (validated by
+            # kernels/gen/moe_w8_sm89_batch_check.py: batch[i] == single(i)).
+            # fp8_13 is CPU-resident: the derivation stays off-VRAM (the ~3
+            # GiB/layer FP8 build transients must never hit the GPU, see the
+            # fp8_13 alloc comment above).
+            fp8_13[e0:e1] = pack_fp8_fragment_major_batch(
+                mxfp4_fp8_unit_bytes_batch(
+                    w13[e0:e1], s13[e0:e1], sb_.to("cpu")))
         wg = w2[e0:e1].to(dev, non_blocking=True)
         sg = s2[e0:e1].to(dev, non_blocking=True)
+        if scale_refit:
+            cb, sb_ = mxfp4_refit_codes_scales(
+                wg.reshape(-1, wg.shape[-1]),
+                sg.reshape(-1, sg.shape[-1]))
+            cb = cb.view(e1 - e0, N2, K2)
+            sb_ = sb_.view(e1 - e0, N2, K2 // 32)
+        else:
+            cb, sb_ = mxfp4_to_codes(wg), sg
         for i in range(e1 - e0):
             nib = mxfp4_to_nibbles(wg[i])
-            if scale_refit:
-                codes, scales = mxfp4_refit_codes_scales(wg[i], sg[i])
-            else:
-                codes, scales = mxfp4_to_codes(wg[i]), sg[i]
-            planes2[e0 + i] = pack_fragment_major(codes)
-            sc2[e0 + i] = pack_scales(scales)
+            planes2[e0 + i] = pack_fragment_major(cb[i])
+            sc2[e0 + i] = pack_scales(sb_[i])
             if fp2 is not None:
                 fp2[e0 + i] = _pack_fp4_plane(nib)
-            if fp8_2 is not None:
-                # CPU-side derivation, same rationale as the w13 FP8 block
-                # above: keep the FP8 build transients off the GPU. Per-expert
-                # slices moved to CPU; output stays CPU for host-arena staging.
-                fp8_2[e0 + i] = pack_fp8_fragment_major(
-                    _mxfp4_fp8_unit_bytes(
-                        nib.cpu(), sg[i].cpu(), scales.cpu()))
+        if fp8_2 is not None:
+            # w2 mirror of the w13 batched FP8 block above.
+            fp8_2[e0:e1] = pack_fp8_fragment_major_batch(
+                mxfp4_fp8_unit_bytes_batch(
+                    w2[e0:e1], s2[e0:e1], sb_.to("cpu")))
+
+    # Persist the built planes (2-bit base + FP4 + FP8 delta) for later boots:
+    # the cache turns the FP8 derivation (the slow step) into an NVMe read on
+    # every restart after the first. store() skips None parts and never fails
+    # the load. Mirrors build_layer_planes_nvfp4 (which also carries the FP8
+    # parts in its store below).
+    if planes_cache_enabled and lidx is not None:
+        planes_cache_store(lidx, dict(
+            planes13=planes13, sc13=sc13, planes2=planes2, sc2=sc2,
+            fp13=fp13, fp2=fp2, fp8u13=fp8_13, fp8u2=fp8_2))
 
     if tier is not None:
         _stage_fp4_host(tier, layer_key, fp13, sc13, fp2, sc2)
@@ -1543,20 +1581,24 @@ def _consume_planes_cache(layer, layer_key: int, dev,
     _finish_layer sinks as a fresh requant (their copy_ calls are
     device-agnostic). Shared by the staged path (cache hit replaces the
     requant) and the loader-skip path (stubs; the cache is the ONLY
-    source). Returns True on a hit."""
+    source). Returns True on a hit.
+
+    Serves BOTH delta tiers when present: the FP4 tier (cached fp13/fp2)
+    and the FP8 tier (cached fp8u13/fp8u2). A cache written without the
+    FP8 parts simply MISSes when the FP8 tier is requested (and rebuilds);
+    a cache written WITH them skips the per-expert FP8 derivation too."""
     from vllm.model_executor.layers.quantization.utils import (
         moe_w2_planes_cache as planes_cache)
-    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
     lidx = planes_cache.layer_idx_from_name(getattr(layer, "layer_name", ""))
     if not planes_cache.enabled() or lidx is None:
         return False
-    if moe_w2_delta.fp8_enabled():
-        # The planes cache does not store FP8 delta planes yet; serving from
-        # it would leave the FP8 tier empty. Force a fresh quant.
-        return False
     tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
-    cached = planes_cache.try_load(lidx, planes_cache.expected_sizes(
-        E, N13, K13, N2, K2, want_fp4=tier is not None))
+    fp8_tier = _fp8_tier_for_build(E, dev, N13 * K13, N2 * K2)
+    cached = planes_cache.try_load(
+        lidx, planes_cache.expected_sizes(
+            E, N13, K13, N2, K2,
+            want_fp4=(tier is not None),
+            want_fp8=(fp8_tier is not None)))
     if cached is None:
         return False
     planes13 = cached["planes13"].view(E, -1).to(dev)
@@ -1566,6 +1608,14 @@ def _consume_planes_cache(layer, layer_key: int, dev,
     if tier is not None:
         _stage_fp4_host(tier, layer_key, cached["fp13"].view(E, -1),
                         sc13, cached["fp2"].view(E, -1), sc2)
+    if fp8_tier is not None:
+        # FP8 delta: the cached e4m3 byte planes are CPU (the cache stores
+        # CPU u8), matching the mxfp4 build path's CPU-resident fp8_13/fp8_2.
+        # add_layer_host_planes accepts CPU input (it hosts them).
+        fp8_tier.add_layer_host_planes(
+            layer_key, cached["fp8u13"].view(E, -1),
+            cached["fp8u2"].view(E, -1))
+        _w8_pool_gate(fp8_tier, K13, N13)
     _finish_layer(layer, layer_key, dev, planes13, sc13, planes2,
                   sc2, N13, K13, N2, K2, E,
                   ("w13_weight", "w13_weight_scale", "w2_weight",
@@ -1710,9 +1760,13 @@ def build_layer_planes_nvfp4(layer, layer_key: int) -> None:
                 fp8_2[e0 + i] = pack_fp8_fragment_major(fp8u)
 
     if planes_cache.enabled() and lidx is not None:
+        # Persist the FP8 delta planes alongside the 2-bit/FP4 parts so an
+        # FP8-enabled boot can loader-skip (plan_pack_skip probes
+        # want_fp8) and _consume_planes_cache can serve both tiers.
         planes_cache.store(lidx, dict(planes13=planes13, sc13=sc13,
                                       planes2=planes2, sc2=sc2,
-                                      fp13=fp13, fp2=fp2))
+                                      fp13=fp13, fp2=fp2,
+                                      fp8u13=fp8_13, fp8u2=fp8_2))
 
     if tier is not None:
         _stage_fp4_host(tier, layer_key, fp13, sc13, fp2, sc2)
