@@ -1,9 +1,9 @@
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
-index 0000000..ee9eff9 100644
+index 0000000..98c719c 100644
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
-@@ -0,0 +1,2742 @@
+@@ -0,0 +1,2847 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Routed experts on 2-bit tensor-sym planes (cubit moe_w2) for the
@@ -504,6 +504,25 @@ index 0000000..ee9eff9 100644
 +            # native decode cubin on top of the (already validated)
 +            # emulation: opportunistic, parity-gated, never fatal.
 +            _load_sm89_native()
++            # FP8-e4m3 delta tier parity gate: when the w8 launchers are
++            # registered (VLLM_MOE_W2_FP8_DELTA=1), a tiny op-level GEMM
++            # validates the FP8 fragment-major byte layout + the native fp8
++            # tl.dot at engine init. A wrong w8 kernel fails HERE, attributed,
++            # instead of as silent prefill corruption. The addressing half is
++            # also CPU-validated (kernels/gen/moe_w8_sm89_cpu_check.py).
++            if ("w8", ks[0]) in _fns:
++                try:
++                    from vllm.model_executor.layers.quantization.utils import (
++                        moe_w2_sm89 as _w8m)
++                    worst8 = _w8m.w8_self_test()
++                    logger.info(
++                        "moe_w2_cubit: sm_89 FP8 delta tier ready: w8 "
++                        "self-test worst_rel=%.3e (gate 2.5e-2); w8 "
++                        "registered for K=%s", worst8, sorted(ks))
++                except Exception as e:  # noqa: BLE001 - attribution, not silent
++                    raise RuntimeError(
++                        f"moe_w2_cubit: sm_89 FP8 delta tier PARITY GATE "
++                        f"failed at engine init: {e}") from e
 +            _state = "ready"
 +            return True
 +        if cap != (12, 0):
@@ -589,6 +608,10 @@ index 0000000..ee9eff9 100644
 +    if need_w4:
 +        w4tier = "w4q" if moe_w2_delta.split_enabled() else "w4"
 +        need += [(w4tier, K13), (w4tier, K2)]
++    if moe_w2_delta.fp8_enabled():
++        # FP8-e4m3 delta tier (mutually exclusive with FP4; the w8 Triton
++        # launchers are registered by make_launchers under VLLM_MOE_W2_FP8_DELTA).
++        need += [("w8", K13), ("w8", K2)]
 +    missing = [f"{t}_k{k}" for t, k in need if (t, k) not in _fns]
 +    if _sm89:
 +        # Ada: there is no cubin dir to fix — either an FP4 delta tier is
@@ -627,6 +650,21 @@ index 0000000..ee9eff9 100644
 +    return moe_w2_delta.get_tier(n_experts=E, dev=dev,
 +                                 w13_bytes=n13k13 // 2 + sc13,
 +                                 w2_bytes=n2k2 // 2 + sc2)
++
++
++def _fp8_tier_for_build(E: int, dev, n13k13: int, n2k2: int):
++    """FP8-e4m3 delta tier sized for this model's PER-RANK shapes (n13k13 =
++    N13*K13, n2k2 = N2*K2 elements). Slots carry ONLY the fragment-major
++    e4m3 byte plane (1 byte/elem = 2x the FP4-full footprint): w13_bytes =
++    n13k13, w2_bytes = n2k2. NO scale sections — the UE8M0 block-32 scale
++    plane is the SHARED resident base scale (the desc-build points `bs` at
++    the same resident scale plane the 2-bit tier reads). Returns None when
++    the FP8 delta tier is disabled (the common case)."""
++    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
++    if not moe_w2_delta.fp8_enabled():
++        return None
++    return moe_w2_delta.get_tier(n_experts=E, dev=dev,
++                                 w13_bytes=n13k13, w2_bytes=n2k2)
 +
 +
 +def _stage_fp4_host(tier, layer_key: int, fp13, sc13, fp2, sc2) -> None:
@@ -730,6 +768,13 @@ index 0000000..ee9eff9 100644
 +        # GPU-resident: the planes cache is the only source that can
 +        # replace the checkpoint requant — probe it (keyed by transformer
 +        # layer index, sized exactly like process-time try_load).
++        if moe_w2_delta.fp8_enabled():
++            # FP8 delta planes are NOT in the planes cache yet (they are built
++            # fresh from the checkpoint by build_layer_planes_fp8). Skipping
++            # the checkpoint load would leave the FP8 tier empty -> silent
++            # quality degradation. Force a fresh quant so the FP8 planes are
++            # built alongside the base planes.
++            return False
 +        lidx = _pc.layer_idx_from_name(getattr(layer, "layer_name", ""))
 +        if lidx is None or not _pc.cache_has_layer(
 +                lidx, _pc.expected_sizes(
@@ -1181,7 +1226,8 @@ index 0000000..ee9eff9 100644
 +    """
 +    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
 +    from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (
-+        fp8_block_to_codes_scales, pack_fp4_fragment_major)
++        fp8_block_to_codes_scales, pack_fp4_fragment_major,
++        pack_fp8_fragment_major)
 +
 +    assert _ensure_ready(), (
 +        "moe_w2 kernels unavailable — the root cause was logged at "
@@ -1207,7 +1253,17 @@ index 0000000..ee9eff9 100644
 +    sc2 = torch.empty(E, N2 * K2 // 32, dtype=torch.uint8, device=dev)
 +
 +    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
++    # FP8-e4m3 delta tier (Ada native FP8 MMA; mutually exclusive with FP4).
++    # Slots carry only the fragment-major e4m3 byte plane (1 byte/elem); the
++    # UE8M0 scale plane is the shared resident base scale (no slot scale
++    # section). The unit-space e4m3 is derived from the same requant pipeline
++    # as the 2-bit codes, so no SCALE_REFIT conflict.
++    fp8_tier = _fp8_tier_for_build(E, dev, N13 * K13, N2 * K2)
 +    fp13 = fp2 = None
++    fp8_13 = fp8_2 = None
++    if fp8_tier is not None:
++        fp8_13 = torch.empty(E, N13 * K13, dtype=torch.uint8, device=dev)
++        fp8_2 = torch.empty(E, N2 * K2, dtype=torch.uint8, device=dev)
 +    if tier is not None:
 +        # full nibble planes (w4) or quintal planes (w4q, split)
 +        fp13 = torch.empty(E, _fp4_plane_nbytes(N13, K13),
@@ -1223,25 +1279,36 @@ index 0000000..ee9eff9 100644
 +        wg = w13[e0:e1].to(dev, non_blocking=True)
 +        sg = s13[e0:e1].to(dev, non_blocking=True)
 +        for i in range(e1 - e0):
-+            codes, sbytes, nib = fp8_block_to_codes_scales(
-+                wg[i], sg[i], want_nibbles=fp13 is not None)
++            codes, sbytes, nib, fp8u = fp8_block_to_codes_scales(
++                wg[i], sg[i], want_nibbles=fp13 is not None,
++                want_fp8=fp8_13 is not None)
 +            planes13[e0 + i] = pack_fragment_major(codes)
 +            sc13[e0 + i] = pack_scales(sbytes)
 +            if fp13 is not None:
 +                fp13[e0 + i] = _pack_fp4_plane(nib)
++            if fp8_13 is not None:
++                fp8_13[e0 + i] = pack_fp8_fragment_major(fp8u)
 +        wg = w2[e0:e1].to(dev, non_blocking=True)
 +        sg = s2[e0:e1].to(dev, non_blocking=True)
 +        for i in range(e1 - e0):
-+            codes, sbytes, nib = fp8_block_to_codes_scales(
-+                wg[i], sg[i], want_nibbles=fp2 is not None)
++            codes, sbytes, nib, fp8u = fp8_block_to_codes_scales(
++                wg[i], sg[i], want_nibbles=fp2 is not None,
++                want_fp8=fp8_2 is not None)
 +            planes2[e0 + i] = pack_fragment_major(codes)
 +            sc2[e0 + i] = pack_scales(sbytes)
 +            if fp2 is not None:
 +                fp2[e0 + i] = _pack_fp4_plane(nib)
++            if fp8_2 is not None:
++                fp8_2[e0 + i] = pack_fp8_fragment_major(fp8u)
 +
 +    if tier is not None:
 +        _stage_fp4_host(tier, layer_key, fp13, sc13, fp2, sc2)
 +        del fp13, fp2
++    if fp8_tier is not None:
++        # FP8 delta: stage the e4m3 byte planes (no scale sections — the
++        # shared resident base scales serve both tiers).
++        fp8_tier.add_layer_host_planes(layer_key, fp8_13, fp8_2)
++        del fp8_13, fp8_2
 +
 +    _finish_layer(layer, layer_key, dev, planes13, sc13, planes2, sc2,
 +                  N13, K13, N2, K2, E,
@@ -1260,8 +1327,13 @@ index 0000000..ee9eff9 100644
 +    source). Returns True on a hit."""
 +    from vllm.model_executor.layers.quantization.utils import (
 +        moe_w2_planes_cache as planes_cache)
++    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
 +    lidx = planes_cache.layer_idx_from_name(getattr(layer, "layer_name", ""))
 +    if not planes_cache.enabled() or lidx is None:
++        return False
++    if moe_w2_delta.fp8_enabled():
++        # The planes cache does not store FP8 delta planes yet; serving from
++        # it would leave the FP8 tier empty. Force a fresh quant.
 +        return False
 +    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
 +    cached = planes_cache.try_load(lidx, planes_cache.expected_sizes(
@@ -1369,7 +1441,12 @@ index 0000000..ee9eff9 100644
 +    planes2 = torch.empty(E, N2 * K2 // 4, dtype=torch.uint8, device=dev)
 +    sc2 = torch.empty(E, N2 * K2 // 32, dtype=torch.uint8, device=dev)
 +
++    fp8_tier = _fp8_tier_for_build(E, dev, N13 * K13, N2 * K2)
 +    fp13 = fp2 = None
++    fp8_13 = fp8_2 = None
++    if fp8_tier is not None:
++        fp8_13 = torch.empty(E, N13 * K13, dtype=torch.uint8, device=dev)
++        fp8_2 = torch.empty(E, N2 * K2, dtype=torch.uint8, device=dev)
 +    if tier is not None:
 +        # full nibble planes (w4) or quintal planes (w4q, split)
 +        fp13 = torch.empty(E, _fp4_plane_nbytes(N13, K13),
@@ -1388,24 +1465,30 @@ index 0000000..ee9eff9 100644
 +        half = N13 // 2                          # rows [0:I]=w1, [I:2I]=w3
 +        for i in range(e1 - e0):
 +            s2_row = torch.cat((s2g[i, 0].expand(half), s2g[i, 1].expand(half)))
-+            codes, sbytes, nib = nvfp4_to_codes_scales(
++            codes, sbytes, nib, fp8u = nvfp4_to_codes_scales(
 +                wg[i], sg[i], s2_row, group=group,
-+                want_nibbles=fp13 is not None)
++                want_nibbles=fp13 is not None,
++                want_fp8=fp8_13 is not None)
 +            planes13[e0 + i] = pack_fragment_major(codes)
 +            sc13[e0 + i] = pack_scales(sbytes)
 +            if fp13 is not None:
 +                fp13[e0 + i] = _pack_fp4_plane(nib)
++            if fp8_13 is not None:
++                fp8_13[e0 + i] = pack_fp8_fragment_major(fp8u)
 +        wg = w2[e0:e1].to(dev, non_blocking=True)
 +        sg = s2[e0:e1].to(dev, non_blocking=True)
 +        s2g = s2_2[e0:e1].to(dev, non_blocking=True)
 +        for i in range(e1 - e0):
-+            codes, sbytes, nib = nvfp4_to_codes_scales(
++            codes, sbytes, nib, fp8u = nvfp4_to_codes_scales(
 +                wg[i], sg[i], s2g[i], group=group,
-+                want_nibbles=fp2 is not None)
++                want_nibbles=fp2 is not None,
++                want_fp8=fp8_2 is not None)
 +            planes2[e0 + i] = pack_fragment_major(codes)
 +            sc2[e0 + i] = pack_scales(sbytes)
 +            if fp2 is not None:
 +                fp2[e0 + i] = _pack_fp4_plane(nib)
++            if fp8_2 is not None:
++                fp8_2[e0 + i] = pack_fp8_fragment_major(fp8u)
 +
 +    if planes_cache.enabled() and lidx is not None:
 +        planes_cache.store(lidx, dict(planes13=planes13, sc13=sc13,
@@ -1415,6 +1498,9 @@ index 0000000..ee9eff9 100644
 +    if tier is not None:
 +        _stage_fp4_host(tier, layer_key, fp13, sc13, fp2, sc2)
 +        del fp13, fp2
++    if fp8_tier is not None:
++        fp8_tier.add_layer_host_planes(layer_key, fp8_13, fp8_2)
++        del fp8_13, fp8_2
 +
 +    _finish_layer(layer, layer_key, dev, planes13, sc13, planes2, sc2,
 +                  N13, K13, N2, K2, E,
@@ -2369,6 +2455,13 @@ index 0000000..ee9eff9 100644
 +    # ---- desc tables in ONE triton launch
 +    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
 +    base_mode = st.get("base", False)
++    # FP8-delta is a PREFILL-only quality lever on sm89: only "w8" is
++    # registered for FP8, the FP4 decode tiers ("w4"/"w4q") are not. When
++    # FP8 is active, decode must stay on the base 2-bit path (the native
++    # decode cubin / "w2" tier) -- exactly like FP8-off. This predicate
++    # gates every decode-delta branch below so FP8 decode skips all FP4
++    # tier machinery (slot/pool setup, FP4 desc build, w4/w4q launches).
++    fp8_prefill_only = moe_w2_delta.fp8_enabled()
 +    # AFRAG (prefill): the GEMM reads fragment-major activations from the
 +    # dedicated a1f/a2f buffers (filled by the single-pass triton repack
 +    # below); point the w2 desc 'a' fields there. The w4 tier never reads
@@ -2445,7 +2538,7 @@ index 0000000..ee9eff9 100644
 +            # per-step counter reset, in-graph (layer 0 runs first each step)
 +            btier.miss_count.zero_()
 +        slot_row = btier.slot_table[layer_key]
-+        use_fp4 = tier is not None and not prefill
++        use_fp4 = tier is not None and not prefill and not fp8_prefill_only
 +        use_w4s_base = use_fp4 and moe_w2_delta.split_enabled()
 +        if use_pf4 and moe_w2_delta.split_enabled():
 +            # prefill-FP4 over the base cache, SPLIT: w2 pair entries from
@@ -2541,10 +2634,16 @@ index 0000000..ee9eff9 100644
 +            tier = None      # downstream w4 launches key off `tier`
 +    else:
 +        tier = moe_w2_delta._TIER       # peek only; created by the plane builder
++        # FP8-e4m3 delta PREFILL tier (Ada native FP8 MMA; mutually exclusive
++        # with FP4 — when FP8 is active, use_w8 wins and use_pf4 stays False).
++        # w8 takes M<=16 in one shot (BLOCK_M=16 masked by m_rows), so prefill
++        # pairs dispatch at PAIR granularity (no sub-entry split like w4).
++        use_w8 = (prefill and moe_w2_delta.fp8_enabled()
++                  and tier is not None and tier.n_slots > 0)
 +        # prefill consumes the FP4 tier too (quality lever, see _PREFILL_FP4)
 +        use_pf4 = (_PREFILL_FP4 and prefill and tier is not None
-+                   and tier.n_slots > 0)
-+        if tier is not None and not prefill:
++                   and tier.n_slots > 0 and not use_w8)
++        if tier is not None and not prefill and not fp8_prefill_only:
 +            if torch.cuda.is_current_stream_capturing():
 +                tier.notify_capture()
 +            slot_row = tier.slot_table[layer_key]
@@ -2560,7 +2659,7 @@ index 0000000..ee9eff9 100644
 +                # class as decode's step-scoped windows).
 +                moe_w2_delta.mark_seen(tier.seen[layer_key],
 +                                       topk_ids.view(-1).long())
-+            if use_pf4:
++            if use_pf4 or use_w8:
 +                if torch.cuda.is_current_stream_capturing():
 +                    tier.notify_capture()
 +                elif _PREFILL_FP4_ENSURE:
@@ -2569,10 +2668,10 @@ index 0000000..ee9eff9 100644
 +                    # (base-cache prefill idiom; layer pins rotate).
 +                    if not _pf4_ensure_logged:
 +                        _pf4_ensure_logged = True
-+                        logger.info("moe_w2 prefill-FP4 ensure mode: eager "
-+                                    "chunk working sets fetched to the FP4 "
-+                                    "tier (first call: layer %d, T=%d)",
-+                                    layer_key, T)
++                        logger.info("moe_w2 prefill-FP4/FP8 ensure mode: "
++                                    "eager chunk working sets fetched to "
++                                    "the delta tier (first call: layer %d, "
++                                    "T=%d)", layer_key, T)
 +                    tier.ensure_resident(layer_key, topk_ids.view(-1))
 +                slot_row = tier.slot_table[layer_key]
 +                pool_ptr = tier.pool.data_ptr()
@@ -2664,12 +2763,16 @@ index 0000000..ee9eff9 100644
 +    # 16-token pair -> grid pairs*4), see _desc_build_kernel_prefill4.
 +    use_w4s = (tier is not None and not prefill
 +               and moe_w2_delta.split_enabled())
-+    if tier is not None and not prefill:
++    if tier is not None and not prefill and not fp8_prefill_only:
 +        if use_w4s:
 +            _launch("w4q", st["K13"], ws["desc4s"][0], st["N13"], pairs,
 +                    stream)
 +        else:
 +            _launch("w4", st["K13"], d[2], st["N13"], pairs, stream)
++    elif use_w8:
++        # FP8 delta prefill: 6-field desc at PAIR granularity (w8 takes M<=16,
++        # no sub-entry split). d[2] was built by _desc_build_kernel above.
++        _launch("w8", st["K13"], d[2], st["N13"], pairs, stream)
 +    elif use_pf4:
 +        if moe_w2_delta.split_enabled():
 +            _launch("w4q", st["K13"], ws["desc4s"][0], st["N13"], pairs * 4,
@@ -2684,11 +2787,13 @@ index 0000000..ee9eff9 100644
 +    if use_afrag:
 +        _afrag_repack(ws["a2"], ws["a2f"], pairs, st["K2"])
 +    _launch(w2tier, st["K2"], d[1], st["N2"], pairs, stream)
-+    if tier is not None and not prefill:
++    if tier is not None and not prefill and not fp8_prefill_only:
 +        if use_w4s:
 +            _launch("w4q", st["K2"], ws["desc4s"][1], st["N2"], pairs, stream)
 +        else:
 +            _launch("w4", st["K2"], d[3], st["N2"], pairs, stream)
++    elif use_w8:
++        _launch("w8", st["K2"], d[3], st["N2"], pairs, stream)
 +    elif use_pf4:
 +        if moe_w2_delta.split_enabled():
 +            _launch("w4q", st["K2"], ws["desc4s"][1], st["N2"], pairs * 4,

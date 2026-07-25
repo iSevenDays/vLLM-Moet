@@ -102,7 +102,7 @@ def nibble_hist(src, prefix, layer, expert, proj, device):
     s = tensors["weight_scale"].to(device)            # [N, K/16] e4m3
     s2 = tensors["weight_scale_2"].to(device)         # scalar f32
     group = w.shape[1] * 2 // s.shape[1]
-    _, _, nib = _planes.nvfp4_to_codes_scales(
+    _, _, nib, _ = _planes.nvfp4_to_codes_scales(
         w, s, s2, group=group, want_nibbles=True)
     return torch.bincount(nib.flatten().long(), minlength=16).cpu().numpy()
 

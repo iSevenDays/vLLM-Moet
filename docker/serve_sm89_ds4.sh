@@ -135,6 +135,12 @@ BREAKABLE_CUDAGRAPH=${BREAKABLE_CUDAGRAPH:-auto}  # auto = leave vLLM default; 0
 MTP_TOKENS=${MTP_TOKENS:-1}  # speculative tokens; keep 1 (see header section 4)
 PREFIX_CACHING=${PREFIX_CACHING:-1}  # reuse repeated prompt KV; read header section 4
 SCALE_REFIT=${SCALE_REFIT:-1}  # normal W2 conversion; 0 is for comparison or rollback
+FP8_DELTA_GB=${FP8_DELTA_GB:-0}  # FP8-e4m3 delta PREFILL tier (Ada native FP8 MMA).
+                                 # >0 enables it: FP8-resident prefill pairs divert to
+                                 # the w8 Triton kernel (higher precision than the bare
+                                 # 2-bit prefill + native fast MMA + no SCALE_REFIT
+                                 # conflict). FP4 delta tiers are mutually exclusive and
+                                 # pinned OFF. 0 (default) = inert (2-bit base only).
 SM89_NATIVE=${SM89_NATIVE:-}   # native e4m3 QMMA decode cubin: empty = image
                                # default (ON when /cubit-share has the cubin,
                                # parity-gated at boot); 0 = force Triton-only
@@ -231,7 +237,13 @@ else
 fi
 # FP4 delta tiers are not ported to Ada -- pinned off explicitly so a stray
 # inherited env can never enable them (see the removed-knobs note above).
-DELTA_ENV="-e VLLM_MOE_W2_DELTA_GB=0 -e VLLM_MOE_W2_DELTA_SPLIT=0"
+# When FP8_DELTA_GB>0, the FP8-e4m3 delta prefill tier is enabled instead
+# (mutually exclusive with FP4; SCALE_REFIT stays on — FP8 has no refit conflict).
+if [ "$FP8_DELTA_GB" -gt 0 ] 2>/dev/null; then
+  DELTA_ENV="-e VLLM_MOE_W2_FP8_DELTA=1 -e VLLM_MOE_W2_FP8_DELTA_GB=$FP8_DELTA_GB -e VLLM_MOE_W2_DELTA_GB=0 -e VLLM_MOE_W2_DELTA_SPLIT=0"
+else
+  DELTA_ENV="-e VLLM_MOE_W2_DELTA_GB=0 -e VLLM_MOE_W2_DELTA_SPLIT=0"
+fi
 docker run -d --name "$NAME" --restart "$RESTART" --gpus "$GPUS" --network "$NETWORK" $IPCARGS \
   --memory "${MEM_GB}g" --memory-swap "$((MEM_GB + 2))g" \
   -v "$MODEL":/model:ro \

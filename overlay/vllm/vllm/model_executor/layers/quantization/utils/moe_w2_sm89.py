@@ -230,6 +230,94 @@ def moe_w2_mm_sm89_fp8mma(
 
 
 @triton.jit
+def moe_w8_mm_sm89(
+    desc_ptr,                  # *i64 [pairs, 6] {a, as, w_fp8, bs, c, m_rows}
+    n_rows,                    # C row stride in bf16 elements (= N)
+    K: tl.constexpr,           # GEMM contraction (per-launch, like the cubins)
+    BLOCK_N: tl.constexpr,
+):
+    """FP8-e4m3 delta tier GEMM for Ada (sm_89). Same 6-field descriptor ABI
+    {a, as, b, bs, c, m_rows} and grid contract as moe_w2_mm_sm89, but field 2
+    (b) is a fragment-major e4m3 BYTE plane (1 byte/elem) instead of 2-bit
+    codes. Both operands entering ``tl.dot`` are float8e4nv, so Ada's NATIVE
+    FP8 MMA runs the contraction and accumulates fp32 — the precision + speed
+    motivation for this tier (prefill today runs bare 2-bit and collapses on
+    long context; FP8-e4m3 is higher precision than FP4 and has native fast
+    MMA with no SCALE_REFIT conflict). The activation (field 0) is fp8 e4m3
+    (the a32 format); the weight (field 2) is fp8 e4m3 (loaded directly as
+    e4m3 — each byte IS the weight). Both per-32 scales fold as one [M, N]
+    outer product exactly as the w2 kernel: a_s (f32, field 1) and w_s
+    (UE8M0, field 3 -> 2^(sb-127) via exponent bitcast). The scale plane is
+    the SHARED resident base UE8M0 plane — FP8 carries no separate scale
+    section. Output BF16 rows land where the w2 kernel writes them; pairs
+    with m_rows == 0 early-EXIT. BLOCK_M=16 masked by m_rows serves prefill
+    (mblock 16) AND decode; grid (n_rows//BLOCK_N, pairs)."""
+    tl.static_assert(K % 64 == 0)
+    pid_n = tl.program_id(0)               # BLOCK_N-row N tile
+    pid_p = tl.program_id(1)               # (expert, token-group) pair
+
+    d = desc_ptr + pid_p * 6
+    m_rows = tl.load(d + 5)
+    if m_rows == 0:                        # dead pair: early EXIT
+        return
+    a_ptr = tl.load(d + 0).to(tl.pointer_type(tl.float8e4nv))
+    as_ptr = tl.load(d + 1).to(tl.pointer_type(tl.float32))
+    # field 2: fragment-major e4m3 byte plane (loaded AS e4m3, not uint8)
+    b_ptr = tl.load(d + 2).to(tl.pointer_type(tl.float8e4nv))
+    bs_ptr = tl.load(d + 3).to(tl.pointer_type(tl.uint8))
+    c_ptr = tl.load(d + 4).to(tl.pointer_type(tl.bfloat16))
+
+    offs_m = tl.arange(0, 16)
+    mask_m = offs_m < m_rows
+    r = tl.arange(0, BLOCK_N)              # N-rows within the tile
+    n_abs = pid_n * BLOCK_N + r
+    n_block = n_abs // 16
+    r16 = n_abs % 16
+    # fragment-major in-block byte offset for FP8 (1 byte/elem), row part:
+    #   g*128 + tile*16   (g=row&7, tile=row>>3)
+    # vs the 2-bit kernel's g*32 + tile*4 — the 4x stride is because FP8 has
+    # 32 bytes/32-group/row (one byte per element) where 2-bit had 8 bytes.
+    row_off = (r16 % 8) * 128 + (r16 // 8) * 16
+    # column part for one 32-group, gathered in byte-major order f=0..31 so
+    # the SAME k_perm (below) pairs the K-axes. For 2-bit this was an 8-byte
+    # gather (t*8+half); for FP8 it is a 32-byte gather: t*32 + half*4 + k4.
+    f = tl.arange(0, 32)
+    byte_col = (f // 8) * 32 + ((f // 4) % 2) * 4 + (f % 4)
+    # identical K permutation to the w2 kernel: byte-major f -> k-in-group
+    k_perm = ((f // 4) % 2) * 16 + (f // 8) * 4 + (f % 4)
+
+    acc = tl.zeros((16, BLOCK_N), dtype=tl.float32)
+    for g in range(0, K // 32):
+        kb = g // 2
+        k32 = g % 2
+        # ---- A: fp8 e4m3 [16, 32], gathered through k_perm (kept fp8 — NOT
+        #      cast to bf16; Ada's native FP8 MMA consumes it directly)
+        k_glob = kb * 64 + k32 * 32 + k_perm
+        a = tl.load(a_ptr + offs_m[:, None] * K + k_glob[None, :],
+                    mask=mask_m[:, None], other=0.0)
+        # ---- A scale: f32, one per (row, 32-group)
+        a_s = tl.load(as_ptr + offs_m * (K // 32) + g,
+                      mask=mask_m, other=0.0)
+        # ---- W: 32 e4m3 bytes per N-row of one 32-group (fragment-major).
+        #      Each (nb,kb) block is 16*64 = 1024 bytes (vs 256 for 2-bit);
+        #      the 4x is the 4 codes/byte the 2-bit layout packed, unpacked.
+        blk = (n_block * (K // 64) + kb) * 1024
+        w = tl.load(
+            b_ptr + blk[:, None] + row_off[:, None]
+            + (byte_col + k32 * 8)[None, :])
+        # ---- B scale: UE8M0 byte -> 2^(sb-127), exact via exponent bitcast
+        sb = tl.load(
+            bs_ptr + (n_block * (K // 32) + g) * 16 + r16).to(tl.int32)
+        w_s = (sb << 23).to(tl.float32, bitcast=True)      # 2^(sb-127), sb>=1
+        w_s = tl.where(sb == 0, 5.877471754111438e-39, w_s)  # sb=0 subnormal
+        # ---- native fp8 dot, fp32 accumulate, then fold both per-32 scales
+        acc += tl.dot(a, tl.trans(w)) * (a_s[:, None] * w_s[None, :])
+
+    tl.store(c_ptr + offs_m[:, None] * n_rows + n_abs[None, :],
+             acc.to(tl.bfloat16), mask=mask_m[:, None])
+
+
+@triton.jit
 def moe_w4q_mm_sm89(
     desc_ptr,                  # *i64 [pairs, 8] {a, as, base, ref, bs, c, m, pad}
     n_rows,                    # C row stride in bf16 elements (= N)
@@ -369,6 +457,28 @@ def make_w4q_launcher(K: int):
     return launch
 
 
+def make_w8_launcher(K: int):
+    """Launcher for the FP8-e4m3 delta tier (moe_w8_mm_sm89). Same
+    ``fn(desc, n_rows, pairs)`` call shape as ``make_launcher`` and the same
+    grid = ``(n_rows // _BLOCK_N, pairs)`` — the cubit geometry contract. One
+    kernel serves prefill (mblock 16) and decode via the m_rows mask, so a
+    single registration per K covers both. Flows through ``_launch``'s
+    Triton-launcher branch unchanged (the launcher is a Python callable, not
+    a ctypes.c_void_p cubin handle)."""
+
+    def launch(desc: torch.Tensor, n_rows: int, pairs: int) -> None:
+        if n_rows % _BLOCK_N:
+            raise ValueError(
+                f"SM89 W8 n_rows={n_rows} is not divisible by "
+                f"BLOCK_N={_BLOCK_N}")
+        grid = (n_rows // _BLOCK_N, pairs)
+        moe_w8_mm_sm89[grid](
+            desc, n_rows, K=K, BLOCK_N=_BLOCK_N,
+            num_warps=_NUM_WARPS)
+
+    return launch
+
+
 def make_launchers(ks) -> dict:
     """{(tier, K): launcher} for every K, for the two mandatory tiers.
     One kernel serves both: decode (mblock 4) and prefill MC4 (mblock 16)
@@ -381,6 +491,13 @@ def make_launchers(ks) -> dict:
         if os.getenv("VLLM_MOE_W2_SM89_W4Q", "0").lower() \
                 not in ("0", "false", "no", "off"):
             fns[("w4q", k)] = make_w4q_launcher(k)
+    # FP8-e4m3 delta prefill tier (Ada native FP8 MMA). Mutually exclusive
+    # with the FP4 delta tiers; registered only when its env is set, so the
+    # 2-bit base + native decode paths are untouched when FP8 is off.
+    if os.getenv("VLLM_MOE_W2_FP8_DELTA", "0").lower() \
+            not in ("0", "", "false", "no", "off"):
+        for k in ks:
+            fns[("w8", k)] = make_w8_launcher(k)
     return fns
 
 
@@ -474,4 +591,75 @@ def native_self_test(launch, k: int, n_rows: int, m_rows: int = 4) -> float:
             "device; run kernels/gen/moe_w2_sm89_native_check.py "
             "against it and rebuild via "
             "kernels/cuda/build_moe_w2_sm89_decode.sh")
+    return worst
+
+
+def _op_case_fp8(k: int, n_rows: int, m_rows: int):
+    """Random one-pair FP8 op-level GEMM case on the CURRENT device.
+
+    Mirrors ``_op_case`` but the weight plane is fragment-major e4m3 bytes
+    (``pack_fp8_fragment_major``) and the scale plane is the shared UE8M0
+    block-32 base scale (``pack_scales`` — unchanged). Returns ``(desc,
+    bufs, ref)`` for the 6-field w8 descriptor ``{a, as, w_fp8, bs, c,
+    m_rows}``. Reference math: dequant both operands to f32 (e4m3 is exact
+    in f32) and matmul — the kernel's fp8 dot computes the SAME products
+    (fp8×fp8 is exact in the fp32 accumulator), so the gate validates
+    addressing + scale fold, not fp8 rounding."""
+    from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (
+        pack_fp8_fragment_major, pack_scales)
+    dev = torch.device("cuda")
+    g = torch.Generator().manual_seed(9)
+    # random e4m3 weights [n_rows, k] (distinct from the 2-bit seed)
+    w_fp8 = (torch.randn(n_rows, k, generator=g) * 0.5).clamp(-448, 448).to(
+        torch.float8_e4m3fn)
+    sexp = torch.randint(120, 132, (n_rows, k // 32), dtype=torch.uint8,
+                         generator=g)
+    a = torch.randn(m_rows, k, generator=g) * 0.5
+    ab = a.view(m_rows, k // 32, 32)
+    a_s = ab.abs().amax(-1).clamp_min(1e-10) / 448.0
+    a8 = (ab / a_s[..., None]).clamp(-448, 448).to(
+        torch.float8_e4m3fn).view(m_rows, k)
+    # reference: dequant both to f32 (e4m3 -> exact in f32), matmul
+    w_deq = w_fp8.float() * torch.exp2(
+        sexp.float() - 127.0).repeat_interleave(32, 1)
+    ref = (a8.float() * a_s.repeat_interleave(32, 1)) @ w_deq.T
+    plane = pack_fp8_fragment_major(w_fp8.view(torch.uint8))
+    sb = pack_scales(sexp)
+    bufs = (a8.to(dev), a_s.float().contiguous().to(dev), plane.to(dev),
+            sb.to(dev),
+            torch.zeros(m_rows, n_rows, dtype=torch.bfloat16, device=dev))
+    desc = torch.tensor([[bufs[0].data_ptr(), bufs[1].data_ptr(),
+                          bufs[2].data_ptr(), bufs[3].data_ptr(),
+                          bufs[4].data_ptr(), m_rows]],
+                        dtype=torch.int64, device=dev)
+    return desc, bufs, ref
+
+
+def w8_self_test(k: int = 512, n_rows: int = 32, m_rows: int = 16) -> float:
+    """Boot-time parity gate for the FP8-e4m3 delta tier kernel.
+
+    Same shape as ``self_test`` (one random op-level GEMM vs a torch
+    reference, 2.5e-2 gate) but exercises the FP8 fragment-major byte layout
+    + the native fp8 ``tl.dot`` path. A layout/addressing bug or a Triton
+    fp8-codegen regression on Ada fails HERE at engine init, attributed,
+    instead of as silent prefill corruption a deploy cycle later. The
+    addressing half is also CPU-validated by
+    kernels/gen/moe_w8_sm89_cpu_check.py (runs anywhere, no GPU); this gate
+    adds the GPU codegen + launch verification. Returns worst_rel; raises
+    RuntimeError on failure."""
+    n_rows = ((n_rows + _BLOCK_N - 1) // _BLOCK_N) * _BLOCK_N
+    desc, bufs, ref = _op_case_fp8(k, n_rows, m_rows)
+    make_w8_launcher(k)(desc, n_rows, 1)
+    torch.cuda.synchronize()
+    got = bufs[4].float().cpu()
+    finite = bool(torch.isfinite(got).all())
+    worst = (got - ref).abs().max().item() / ref.abs().max().item()
+    if not finite or worst >= 2.5e-2:
+        raise RuntimeError(
+            f"moe_w8_sm89 self-test FAILED: worst_rel={worst:.3e} "
+            f"(gate 2.5e-2), finite={finite} — the FP8 delta kernel is "
+            "miscompiling on this device/driver; check the fragment-major "
+            "byte addressing (pack_fp8_fragment_major), the fp8 tl.dot "
+            "path, and report triton/torch/driver versions. CPU golden: "
+            "kernels/gen/moe_w8_sm89_cpu_check.py")
     return worst

@@ -1,0 +1,30 @@
+id: derailment
+# Output-degeneration vs prompt-context-length sweep. Pure client-side probe
+# against an ALREADY-RUNNING vLLM server (the live moet container). bench.py
+# boots its own server, so the intended path is the standalone CLI:
+#
+#   # smoke (proof of wiring, <1 min):
+#   python3 bench/runner/probes.py --lengths 1024,4096 --runs 1
+#
+#   # full "before" baseline (~22 min; caps at 131072):
+#   python3 bench/runner/probes.py --out /tmp/derailment_before.json
+#
+#   # opt-in the 262K prefill (adds one slow ~262K prefill per mode/run):
+#   python3 bench/runner/probes.py \
+#       --lengths 1024,4096,8192,16384,32768,65536,131072,262144
+#
+# ALL metrics come from /v1/chat/completions (the PRIMARY and ONLY generation
+# path). The model is chat-tuned: RAW /v1/completions confabulates on it even
+# with no filler, and chat also returns the full top_logprobs=20 (completions
+# caps at ~2), so chat is strictly better. Lengths are TARGET prompt_tokens;
+# the probe records the real usage.prompt_tokens per request. modes: overgen
+# (max_tokens=512; finish_reason=="length"+large out_tokens = won't-stop) and
+# stop (max_tokens=64). See probes.derailment for the D-score gating rationale
+# (a clean confident "OK" has near-collapsed entropy, so the collapse terms
+# are gated on output length >= 16).
+probes:
+  - kind: derailment
+    lengths: [1024, 4096, 8192, 16384, 32768, 65536, 131072]
+    runs: 3
+    modes: [overgen, stop]
+    timeout: 900

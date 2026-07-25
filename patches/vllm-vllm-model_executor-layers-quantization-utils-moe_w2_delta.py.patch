@@ -1,9 +1,9 @@
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
 new file mode 100644
-index 0000000..efbe506 100644
+index 0000000..93022c3 100644
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
-@@ -0,0 +1,2106 @@
+@@ -0,0 +1,2150 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""FP4 delta tier for the 1-GPU 2-bit MoE path (quality restoration).
@@ -202,6 +202,35 @@ index 0000000..efbe506 100644
 +W13_BYTES = 4096 * 4096 // 2          # 8.0 MiB (TP1)
 +W2_BYTES = 4096 * 2048 // 2           # 4.0 MiB (TP1)
 +SLOT_BYTES = W13_BYTES + W2_BYTES     # 12.0 MiB per expert (TP1)
++
++# FP8-e4m3 delta tier (Ada native FP8 MMA): 1 byte/elem = 2x the FP4-full
++# footprint (N*K//2). Slots carry ONLY the fragment-major e4m3 byte plane —
++# no scale section (the UE8M0 block-32 scale plane is the SHARED resident
++# base scale). The unit-space e4m3 is derived from the same requant pipeline
++# as the 2-bit codes, so no SCALE_REFIT conflict (unlike FP4).
++W8_13_BYTES = 4096 * 4096             # 16.0 MiB (TP1)
++W8_2_BYTES = 4096 * 2048              # 8.0 MiB (TP1)
++
++# FP8-e4m3 delta tier env (default OFF — mutually exclusive with the FP4
++# delta tiers). When enabled, serve sets VLLM_MOE_W2_DELTA_GB=0 (FP4 off).
++_FP8_DELTA_ON = os.getenv("VLLM_MOE_W2_FP8_DELTA", "0").lower() not in (
++    "0", "", "false", "no", "off")
++_FP8_GB_RAW = os.getenv("VLLM_MOE_W2_FP8_DELTA_GB", "2.0").strip().lower()
++_FP8_GB = 0.0 if _FP8_GB_RAW in ("auto", "-1", "-1.0") else float(_FP8_GB_RAW)
++
++
++def fp8_enabled() -> bool:
++    """FP8-e4m3 delta PREFILL tier (Ada native FP8 MMA).
++
++    Mutually exclusive with the FP4 delta tiers (``enabled``): when FP8 is
++    active, the serve script pins VLLM_MOE_W2_DELTA_GB=0 so the FP4 tier is
++    inert. Because the FP8 unit-space e4m3 is derived from the SAME requant
++    pipeline as the 2-bit codes (including any scale refit), enabling FP8
++    does NOT force ``VLLM_MOE_W2_SCALE_REFIT=0`` (the FP4 tier does, via
++    ``scale_refit_enabled``, because FP4 reuses the original checkpoint
++    nibbles instead of the requant pipeline)."""
++    return _FP8_DELTA_ON and (_FP8_GB > 0 or _FP8_GB_RAW in (
++        "auto", "-1", "-1.0"))
 +
 +
 +class DeltaTier:
@@ -2064,7 +2093,8 @@ index 0000000..efbe506 100644
 +def get_tier(n_layers=None, n_experts=256, dev=None,
 +             w13_bytes=None, w2_bytes=None) -> DeltaTier | None:
 +    global _TIER
-+    if not enabled():
++    is_fp8 = fp8_enabled()
++    if not enabled() and not is_fp8:
 +        return None
 +    if _TIER is None:
 +        if n_layers is None:
@@ -2082,19 +2112,33 @@ index 0000000..efbe506 100644
 +        policy = None
 +        if base_enabled():
 +            policy = os.getenv("VLLM_MOE_W2_DELTA_POLICY", "need")
-+        # Split quintal slots have a DIFFERENT geometry than full-FP4
-+        # slots; a distinct pack tag ("fp4q"; the superseded 2-bit
-+        # refinement used "fp4s") keeps the modes' pack files apart — a
-+        # shared pack dir otherwise ping-pong-rebuilds one file under the
-+        # other config's feet (the page-cache store reads it live at
-+        # serve time -> garbage FP4 rows on BOTH; measured).
-+        fp4_tag = "fp4q" if split_enabled() else "fp4"
-+        _TIER = DeltaTier(
-+            n_layers, n_experts, dev or torch.device("cuda"),
-+            w13_bytes=W13_BYTES if w13_bytes is None else w13_bytes,
-+            w2_bytes=W2_BYTES if w2_bytes is None else w2_bytes,
-+            policy=policy, tag=fp4_tag if base_enabled() else "delta",
-+            host_pinned=not base_enabled())
++        if is_fp8:
++            # FP8-e4m3 delta tier (Ada native FP8 MMA). Slots carry only the
++            # e4m3 byte plane (w13_bytes = N13*K13, w2_bytes = N2*K2, passed
++            # by the plane builder); the UE8M0 scale plane is the shared
++            # resident base scale (no slot scale section). tag "w8" keeps the
++            # pack store separate from the FP4 tiers. Pool sized by the FP8
++            # env (VLLM_MOE_W2_FP8_DELTA_GB). Mutually exclusive with FP4.
++            _TIER = DeltaTier(
++                n_layers, n_experts, dev or torch.device("cuda"),
++                w13_bytes=W8_13_BYTES if w13_bytes is None else w13_bytes,
++                w2_bytes=W8_2_BYTES if w2_bytes is None else w2_bytes,
++                pool_gb=_FP8_GB, policy=policy, tag="w8",
++                host_pinned=not base_enabled())
++        else:
++            # Split quintal slots have a DIFFERENT geometry than full-FP4
++            # slots; a distinct pack tag ("fp4q"; the superseded 2-bit
++            # refinement used "fp4s") keeps the modes' pack files apart — a
++            # shared pack dir otherwise ping-pong-rebuilds one file under the
++            # other config's feet (the page-cache store reads it live at
++            # serve time -> garbage FP4 rows on BOTH; measured).
++            fp4_tag = "fp4q" if split_enabled() else "fp4"
++            _TIER = DeltaTier(
++                n_layers, n_experts, dev or torch.device("cuda"),
++                w13_bytes=W13_BYTES if w13_bytes is None else w13_bytes,
++                w2_bytes=W2_BYTES if w2_bytes is None else w2_bytes,
++                policy=policy, tag=fp4_tag if base_enabled() else "delta",
++                host_pinned=not base_enabled())
 +        if base_enabled() and split_enabled() and _BASE_TIER is not None:
 +            # residency coupling: the base tier must not evict slots the
 +            # FP4 tier's refinement rows are mapped against
