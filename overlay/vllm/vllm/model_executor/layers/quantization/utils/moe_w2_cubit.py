@@ -600,6 +600,7 @@ def _ensure_ready() -> bool:
         return True
     except Exception as e:  # noqa: BLE001
         logger.error("moe_w2_cubit unavailable: %s", e)
+        import traceback; logger.error("moe_w2_cubit FULL TRACEBACK:\n%s", traceback.format_exc())
         _state = "unavailable"
         return False
 

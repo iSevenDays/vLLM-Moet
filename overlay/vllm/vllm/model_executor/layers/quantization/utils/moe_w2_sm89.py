@@ -746,7 +746,7 @@ def _op_case_w8fp4(k: int, n_rows: int, m_rows: int):
     a8 = (ab / a_s[..., None]).clamp(-448, 448).to(
         torch.float8_e4m3fn).view(m_rows, k)
     # reference: _E2M1_VALS dequant * 2^(sexp-127), matmul
-    w_deq = _E2M1_VALS.to(torch.float32)[nib.long()] * torch.exp2(
+    w_deq = _E2M1_VALS.to(nib.device).to(torch.float32)[nib.long()] * torch.exp2(
         sexp.float() - 127.0).repeat_interleave(32, 1)
     ref = (a8.float() * a_s.repeat_interleave(32, 1)) @ w_deq.T
     plane = pack_fp4_fragment_major(nib)

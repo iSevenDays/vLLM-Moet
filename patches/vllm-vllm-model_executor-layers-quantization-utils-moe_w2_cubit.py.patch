@@ -1,9 +1,9 @@
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
-index 0000000..3b3d2f6 100644
+index 0000000..62bae21 100644
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
-@@ -0,0 +1,3237 @@
+@@ -0,0 +1,3238 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Routed experts on 2-bit tensor-sym planes (cubit moe_w2) for the
@@ -606,6 +606,7 @@ index 0000000..3b3d2f6 100644
 +        return True
 +    except Exception as e:  # noqa: BLE001
 +        logger.error("moe_w2_cubit unavailable: %s", e)
++        import traceback; logger.error("moe_w2_cubit FULL TRACEBACK:\n%s", traceback.format_exc())
 +        _state = "unavailable"
 +        return False
 +
