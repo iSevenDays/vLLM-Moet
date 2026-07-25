@@ -1,5 +1,5 @@
 diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
-index 03433ed..f2c6181 100644
+index 03433ed..b8da4c7 100644
 --- a/vllm/v1/worker/gpu_worker.py
 +++ b/vllm/v1/worker/gpu_worker.py
 @@ -412,6 +412,29 @@
@@ -32,7 +32,7 @@ index 03433ed..f2c6181 100644
          if self.vllm_config.weight_transfer_config is not None:
              self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
                  self.vllm_config.weight_transfer_config,
-@@ -720,6 +743,31 @@
+@@ -720,6 +743,44 @@
          ):
              self.model_runner._init_kv_zero_meta()
  
@@ -61,10 +61,23 @@ index 03433ed..f2c6181 100644
 +        except Exception as e:  # noqa: BLE001 - warm-start is best-effort
 +            logger.warning("moe_w2 pool warm-start failed: %s", e)
 +
++        # moe_w2 FP8 deferred-pool parity gate: the w8 pool was allocated by
++        # finalize_auto above (defer_pool) — run the end-to-end pool-slot gate
++        # build time had to skip (n_slots was 0). Only the import is soft: a
++        # parity FAILURE must abort the boot (a mis-sized slot serves garbage).
++        try:
++            from vllm.model_executor.layers.quantization.utils import (
++                moe_w2_cubit)
++            _w8_gate = moe_w2_cubit.w8_pool_gate_deferred
++        except ImportError:
++            _w8_gate = None
++        if _w8_gate is not None:
++            _w8_gate()
++
      @instrument(span_name="Warmup (GPU)")
      def compile_or_warm_up_model(self) -> CompilationTimes:
          warmup_sizes: list[int] = []
-@@ -905,6 +953,16 @@
+@@ -905,6 +966,16 @@
      def get_model(self) -> nn.Module:
          return self.model_runner.get_model()
  
@@ -81,7 +94,7 @@ index 03433ed..f2c6181 100644
      def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
          return self.model_runner.get_supported_tasks()
  
-@@ -1024,6 +1082,8 @@
+@@ -1024,6 +1095,8 @@
              if isinstance(
                  output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
              ):
@@ -90,7 +103,7 @@ index 03433ed..f2c6181 100644
                  return output
  
          assert isinstance(output, IntermediateTensors)
-@@ -1033,14 +1093,68 @@
+@@ -1033,14 +1106,68 @@
              and not get_pp_group().is_last_rank
          )
  

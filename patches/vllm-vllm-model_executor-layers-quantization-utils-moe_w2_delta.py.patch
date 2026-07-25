@@ -1,9 +1,9 @@
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
 new file mode 100644
-index 0000000..2b6cd70 100644
+index 0000000..8b3f490 100644
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
-@@ -0,0 +1,2185 @@
+@@ -0,0 +1,2224 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""FP4 delta tier for the 1-GPU 2-bit MoE path (quality restoration).
@@ -219,6 +219,22 @@ index 0000000..2b6cd70 100644
 +_FP8_GB = 0.0 if _FP8_GB_RAW in ("auto", "-1", "-1.0") else float(_FP8_GB_RAW)
 +
 +
++_FP8_STORE = os.getenv("VLLM_MOE_W2_FP8_STORE", "fp8").strip().lower()
++if _FP8_STORE not in ("fp8", "fp4"):
++    raise ValueError(
++        f"VLLM_MOE_W2_FP8_STORE must be 'fp8' or 'fp4', got {_FP8_STORE!r}")
++
++
++def fp8_store_fp4() -> bool:
++    """FP4-STORAGE mode for the w8 tier (VLLM_MOE_W2_FP8_STORE=fp4): slots
++    hold the checkpoint e2m1 nibble plane (half the bytes of the e4m3 byte
++    plane); the kernel decodes nibble->e4m3 in registers. Exact vs fp8-store
++    (e2m1 is a subset of e4m3) PROVIDED the serving scale equals the
++    checkpoint scale — hence the SCALE_REFIT=0 requirement enforced at
++    build (a refit-decremented scale needs u = 2*e2m1, off the e2m1 grid)."""
++    return _FP8_DELTA_ON and _FP8_STORE == "fp4"
++
++
 +def fp8_enabled() -> bool:
 +    """FP8-e4m3 delta PREFILL tier (Ada native FP8 MMA).
 +
@@ -237,7 +253,8 @@ index 0000000..2b6cd70 100644
 +    def __init__(self, n_layers: int, n_experts: int, dev,
 +                 w13_bytes: int = W13_BYTES, w2_bytes: int = W2_BYTES,
 +                 pool_gb: float | None = None, policy: str | None = None,
-+                 tag: str = "delta", host_pinned: bool = True):
++                 tag: str = "delta", host_pinned: bool = True,
++                 defer_pool: bool = False):
 +        self.n_layers = n_layers
 +        self.E = n_experts
 +        # Per-instance policy/tag: with the base cache and the FP4 tier
@@ -273,7 +290,15 @@ index 0000000..2b6cd70 100644
 +        # `pool_gb` overrides the module-level env sizing (used by the BASE
 +        # cache tier, which has its own env knob and never auto-defers).
 +        _gb = _GB if pool_gb is None else float(pool_gb)
-+        self._auto_pending = _AUTO and pool_gb is None
++        # Deferred pool (defer_pool=True — the FP8 prefill tier): the tier is
++        # constructed INSIDE build_layer_planes (via _fp8_tier_for_build), where
++        # a multi-GiB pool competes with the build's per-layer GPU workspaces on
++        # top of the resident base planes (measured: 1 GiB workspace alloc
++        # failure at layer ~40 with a 3.5 GiB pool). finalize_auto (worker hook,
++        # post-KV, pre-capture) allocates it instead; _explicit_gb caps the
++        # auto sizing when the env named a size ("auto"/0 -> pure free-VRAM).
++        self._explicit_gb = float(_gb) if (defer_pool and _gb > 0) else None
++        self._auto_pending = (_AUTO and pool_gb is None) or defer_pool
 +        self.n_slots = 0 if self._auto_pending else max(
 +            int(_gb * 2**30) // self.slot_bytes, 8)
 +        self.pool = torch.empty(self.n_slots, self.slot_bytes, dtype=torch.uint8,
@@ -493,6 +518,15 @@ index 0000000..2b6cd70 100644
 +        budget = free_b - int(_RESERVE_GB * 2**30)
 +        if _MAX_GB > 0:
 +            budget = min(budget, int(_MAX_GB * 2**30))
++        if self._explicit_gb is not None:
++            want = int(self._explicit_gb * 2**30)
++            if want > budget:
++                logger.warning(
++                    "moe_w2 [%s] deferred pool: requested %.2f GiB exceeds the "
++                    "post-KV budget (%.2f GiB free - %.1f GiB reserve) — "
++                    "clipping to the budget", self._tag, self._explicit_gb,
++                    free_b / 2**30, _RESERVE_GB)
++            budget = min(budget, want)
 +        n = max(budget // self.slot_bytes, 0)
 +        if n == 0:
 +            # Nothing to cache into -> behave exactly like manual DELTA_GB=0:
@@ -601,12 +635,15 @@ index 0000000..2b6cd70 100644
 +        self._last_capture = time.monotonic()
 +
 +    def _tick_once(self):
-+        # The w8 tier uses the SAME dynamic promotion + eviction machinery as
-+        # the FP4 delta tier (the sm120-proven path). An earlier commit froze
-+        # the pool once full (`if self._tag == "w8" and not self._free: return`);
-+        # that disablement left the hot-expert subset uncovered during long
-+        # prefills (the prefill working set >> pool, so the pool MUST evict-and-
-+        # repromote to track routing skew). Guard removed to restore coverage.
++        if self._tag == "w8" and not self._free:
++            # w8: frozen once full FOR THE BACKGROUND MANAGER only. A long
++            # prefill's working set (~256 experts/layer) >> pool, so background
++            # adaptivity just churns slots and races the desc kernel's pool
++            # reads. Coverage comes from the SYNCHRONOUS per-chunk
++            # ensure_resident (forward thread, emergency=True), which bypasses
++            # this freeze in _take_slots_batch — the sm120-proven dynamic path
++            # without the background-race surface.
++            return
 +        if time.monotonic() - self._last_capture < 5.0:
 +            return
 +        self._tick += 1
@@ -877,10 +914,12 @@ index 0000000..2b6cd70 100644
 +        Without this, an uncapped gate fire at a full pool bulk-evicted
 +        the accumulated high-need core for once-routed candidates
 +        (wholesale churn; the old MAX_PROMOTE cap merely masked it)."""
-+        # No w8 freeze: ensure_resident / force_promote must be able to evict-
-+        # and-pin the current chunk's hot experts for w8 (same dynamic path as
-+        # FP4). An earlier `if self._tag == "w8" and not self._free: return []`
-+        # guard disabled this and froze the pool; removed to restore coverage.
++        if self._tag == "w8" and not self._free and not emergency:
++            # w8 freeze applies to the background manager only: the synchronous
++            # runner/forward-thread callers (force_promote, ensure_resident)
++            # pass emergency=True and may evict-and-pin — per-chunk prefill
++            # coverage REQUIRES rotating the whole pool every layer.
++            return []
 +        out: list[int] = []
 +        while self._free and len(out) < k:
 +            out.append(self._free.pop())
@@ -2159,7 +2198,7 @@ index 0000000..2b6cd70 100644
 +                w13_bytes=W8_13_BYTES if w13_bytes is None else w13_bytes,
 +                w2_bytes=W8_2_BYTES if w2_bytes is None else w2_bytes,
 +                pool_gb=_FP8_GB, policy=policy, tag="w8",
-+                host_pinned=not base_enabled())
++                host_pinned=not base_enabled(), defer_pool=True)
 +        else:
 +            # Split quintal slots have a DIFFERENT geometry than full-FP4
 +            # slots; a distinct pack tag ("fp4q"; the superseded 2-bit

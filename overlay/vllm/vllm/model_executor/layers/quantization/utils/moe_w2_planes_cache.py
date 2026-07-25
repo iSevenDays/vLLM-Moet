@@ -148,14 +148,20 @@ def expected_sizes(E: int, N13: int, K13: int, N2: int, K2: int,
             exp["fp13"] = E * N13 * K13 // 2
             exp["fp2"] = E * N2 * K2 // 2
     if want_fp8:
-        # FP8 delta tier planes: 1 byte/elem fragment-major e4m3 (no scale
-        # section -- the shared resident base scale serves both tiers). The
-        # meta needs no FP8 field: part PRESENCE + exact size is the validity
-        # contract, and zero_mode/scale_refit/ckpt_id already key every input
-        # of the fp8 derivation. A cache written WITHOUT fp8 parts simply
-        # MISSes when want_fp8 and rebuilds.
-        exp["fp8u13"] = E * N13 * K13
-        exp["fp8u2"] = E * N2 * K2
+        # FP8 delta tier planes: no scale section — the shared resident base
+        # scale serves both tiers. The meta needs no FP8/FP4-store field:
+        # part PRESENCE + exact size is the validity contract, and the mode-
+        # dependent part names (fp4u13/fp4u2 vs fp8u13/fp8u2) mean a cache
+        # written in one mode MISSes in the other and rebuilds. A cache
+        # written WITHOUT any fp8/fp4 parts simply MISSes when want_fp8 and
+        # rebuilds. fp4-store: 0.5 byte/elem nibble plane; fp8-store: 1 byte/elem
+        # e4m3 byte plane. Both coexist in one dir via distinct part names.
+        if moe_w2_delta.fp8_store_fp4():
+            exp["fp4u13"] = E * N13 * K13 // 2
+            exp["fp4u2"] = E * N2 * K2 // 2
+        else:
+            exp["fp8u13"] = E * N13 * K13
+            exp["fp8u2"] = E * N2 * K2
     return exp
 
 

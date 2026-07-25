@@ -318,6 +318,87 @@ def moe_w8_mm_sm89(
 
 
 @triton.jit
+def moe_w8fp4_mm_sm89(
+    desc_ptr,                  # *i64 [pairs, 6] {a, as, w_fp4, bs, c, m_rows}
+    n_rows,                    # C row stride in bf16 elements (= N)
+    K: tl.constexpr,           # GEMM contraction (per-launch, like the cubins)
+    BLOCK_N: tl.constexpr,
+):
+    """FP4-STORAGE variant of moe_w8_mm_sm89 (VLLM_MOE_W2_FP8_STORE=fp4).
+    Field 2 is a fragment-major e2m1 NIBBLE plane (pack_fp4_fragment_major:
+    the SAME [nb, kb, g, t, tile, k32, half, k4] element order as the FP8
+    byte plane, two nibbles per byte, even k4 in the LOW nibble). Every
+    in-block offset is the FP8 kernel's halved: row_off g*64 + tile*8 (was
+    g*128 + tile*16), 16-byte column gather t*16 + half*2 + k4//2 (was
+    t*32 + half*4 + k4), block 512 B (was 1024), k32 stride 4 (was 8).
+    Each nibble decodes to its EXACT e4m3 bit pattern in registers (the
+    e2m1 grid {0,.5,1,1.5,2,3,4,6} is a subset of e4m3), then the identical
+    native fp8 tl.dot + a32/UE8M0 scale fold — same output as the byte
+    kernel at half the slot bytes and half the H2D traffic."""
+    tl.static_assert(K % 64 == 0)
+    pid_n = tl.program_id(0)               # BLOCK_N-row N tile
+    pid_p = tl.program_id(1)               # (expert, token-group) pair
+
+    d = desc_ptr + pid_p * 6
+    m_rows = tl.load(d + 5)
+    if m_rows == 0:                        # dead pair: early EXIT
+        return
+    a_ptr = tl.load(d + 0).to(tl.pointer_type(tl.float8e4nv))
+    as_ptr = tl.load(d + 1).to(tl.pointer_type(tl.float32))
+    b_ptr = tl.load(d + 2).to(tl.pointer_type(tl.uint8))   # nibble plane
+    bs_ptr = tl.load(d + 3).to(tl.pointer_type(tl.uint8))
+    c_ptr = tl.load(d + 4).to(tl.pointer_type(tl.bfloat16))
+
+    offs_m = tl.arange(0, 16)
+    mask_m = offs_m < m_rows
+    r = tl.arange(0, BLOCK_N)              # N-rows within the tile
+    n_abs = pid_n * BLOCK_N + r
+    n_block = n_abs // 16
+    r16 = n_abs % 16
+    row_off = (r16 % 8) * 64 + (r16 // 8) * 8
+    f = tl.arange(0, 32)                   # byte-major element order
+    byte_col = (f // 8) * 16 + ((f // 4) % 2) * 2 + (f % 4) // 2
+    nib_shift = (f % 2) * 4                # k4&1: odd k4 = high nibble
+    # identical K permutation to the w2/w8 kernels
+    k_perm = ((f // 4) % 2) * 16 + (f // 8) * 4 + (f % 4)
+
+    acc = tl.zeros((16, BLOCK_N), dtype=tl.float32)
+    for g in range(0, K // 32):
+        kb = g // 2
+        k32 = g % 2
+        k_glob = kb * 64 + k32 * 32 + k_perm
+        a = tl.load(a_ptr + offs_m[:, None] * K + k_glob[None, :],
+                    mask=mask_m[:, None], other=0.0)
+        a_s = tl.load(as_ptr + offs_m * (K // 32) + g,
+                      mask=mask_m, other=0.0)
+        # ---- W: 16 nibble-plane bytes per N-row of one 32-group; each
+        #      (nb, kb) block is 16*64/2 = 512 bytes.
+        blk = (n_block * (K // 64) + kb) * 512
+        wb = tl.load(
+            b_ptr + blk[:, None] + row_off[:, None]
+            + (byte_col + k32 * 4)[None, :]).to(tl.int32)
+        nib = (wb >> nib_shift[None, :]) & 0xF
+        # e2m1 nibble -> e4m3 bit pattern, exact: sign s = nib>>3, exp field
+        # e2 = (nib>>1)&3, mantissa bit m = nib&1. Normals (e2>0): value
+        # 1.m * 2^(e2-1) -> e4m3 exp' = e2-1+7, mantissa m<<2. Subnormal
+        # m=1 is 0.5 = 2^-1 -> pattern 0x30; zero stays 0 (+-0 both fine).
+        s = nib >> 3
+        e2 = (nib >> 1) & 3
+        m = nib & 1
+        pat = tl.where(e2 > 0, ((e2 + 6) << 3) | (m << 2),
+                       tl.where(m > 0, 48, 0)) | (s << 7)
+        w = pat.to(tl.uint8).to(tl.float8e4nv, bitcast=True)
+        sb = tl.load(
+            bs_ptr + (n_block * (K // 32) + g) * 16 + r16).to(tl.int32)
+        w_s = (sb << 23).to(tl.float32, bitcast=True)      # 2^(sb-127)
+        w_s = tl.where(sb == 0, 5.877471754111438e-39, w_s)  # sb=0 subnormal
+        acc += tl.dot(a, tl.trans(w)) * (a_s[:, None] * w_s[None, :])
+
+    tl.store(c_ptr + offs_m[:, None] * n_rows + n_abs[None, :],
+             acc.to(tl.bfloat16), mask=mask_m[:, None])
+
+
+@triton.jit
 def moe_w4q_mm_sm89(
     desc_ptr,                  # *i64 [pairs, 8] {a, as, base, ref, bs, c, m, pad}
     n_rows,                    # C row stride in bf16 elements (= N)
@@ -458,13 +539,14 @@ def make_w4q_launcher(K: int):
 
 
 def make_w8_launcher(K: int):
-    """Launcher for the FP8-e4m3 delta tier (moe_w8_mm_sm89). Same
-    ``fn(desc, n_rows, pairs)`` call shape as ``make_launcher`` and the same
-    grid = ``(n_rows // _BLOCK_N, pairs)`` — the cubit geometry contract. One
-    kernel serves prefill (mblock 16) and decode via the m_rows mask, so a
-    single registration per K covers both. Flows through ``_launch``'s
-    Triton-launcher branch unchanged (the launcher is a Python callable, not
-    a ctypes.c_void_p cubin handle)."""
+    """Launcher for the FP8-e4m3 delta tier. Same ``fn(desc, n_rows, pairs)``
+    call shape as ``make_launcher`` and the same grid = ``(n_rows // _BLOCK_N,
+    pairs)`` — the cubit geometry contract. The kernel is mode-selected at
+    call time: moe_w8fp4_mm_sm89 when VLLM_MOE_W2_FP8_STORE=fp4 (nibble plane,
+    half the slot bytes), moe_w8_mm_sm89 otherwise (e4m3 byte plane). Both
+    serve prefill (mblock 16) and decode via the m_rows mask; a single
+    registration per K covers both. Flows through ``_launch``'s Triton-launcher
+    branch unchanged (the launcher is a Python callable, not a cubin handle)."""
 
     def launch(desc: torch.Tensor, n_rows: int, pairs: int) -> None:
         if n_rows % _BLOCK_N:
@@ -472,7 +554,10 @@ def make_w8_launcher(K: int):
                 f"SM89 W8 n_rows={n_rows} is not divisible by "
                 f"BLOCK_N={_BLOCK_N}")
         grid = (n_rows // _BLOCK_N, pairs)
-        moe_w8_mm_sm89[grid](
+        from vllm.model_executor.layers.quantization.utils import moe_w2_delta
+        kern = (moe_w8fp4_mm_sm89 if moe_w2_delta.fp8_store_fp4()
+                else moe_w8_mm_sm89)
+        kern[grid](
             desc, n_rows, K=K, BLOCK_N=_BLOCK_N,
             num_warps=_NUM_WARPS)
 
@@ -639,20 +724,64 @@ def _op_case_fp8(k: int, n_rows: int, m_rows: int):
     return desc, bufs, ref
 
 
+def _op_case_w8fp4(k: int, n_rows: int, m_rows: int):
+    """Random one-pair FP4-STORAGE op-level GEMM case on the CURRENT device.
+
+    Mirrors ``_op_case_fp8`` but the weight plane is a fragment-major e2m1
+    NIBBLE plane (``pack_fp4_fragment_major``) and the reference uses the
+    ``_E2M1_VALS`` table. Returns ``(desc, bufs, ref)`` for the 6-field w8
+    descriptor ``{a, as, w_fp4, bs, c, m_rows}`` — same ABI, nibble plane at
+    field 2. Seed 11 to stay distinct from the fp8 (seed 9) and 2-bit (seed 7)
+    cases."""
+    from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (
+        _E2M1_VALS, pack_fp4_fragment_major, pack_scales)
+    dev = torch.device("cuda")
+    g = torch.Generator().manual_seed(11)
+    nib = torch.randint(0, 16, (n_rows, k), dtype=torch.uint8, generator=g)
+    sexp = torch.randint(120, 132, (n_rows, k // 32), dtype=torch.uint8,
+                         generator=g)
+    a = torch.randn(m_rows, k, generator=g) * 0.5
+    ab = a.view(m_rows, k // 32, 32)
+    a_s = ab.abs().amax(-1).clamp_min(1e-10) / 448.0
+    a8 = (ab / a_s[..., None]).clamp(-448, 448).to(
+        torch.float8_e4m3fn).view(m_rows, k)
+    # reference: _E2M1_VALS dequant * 2^(sexp-127), matmul
+    w_deq = _E2M1_VALS.to(torch.float32)[nib.long()] * torch.exp2(
+        sexp.float() - 127.0).repeat_interleave(32, 1)
+    ref = (a8.float() * a_s.repeat_interleave(32, 1)) @ w_deq.T
+    plane = pack_fp4_fragment_major(nib)
+    sb = pack_scales(sexp)
+    bufs = (a8.to(dev), a_s.float().contiguous().to(dev), plane.to(dev),
+            sb.to(dev),
+            torch.zeros(m_rows, n_rows, dtype=torch.bfloat16, device=dev))
+    desc = torch.tensor([[bufs[0].data_ptr(), bufs[1].data_ptr(),
+                          bufs[2].data_ptr(), bufs[3].data_ptr(),
+                          bufs[4].data_ptr(), m_rows]],
+                        dtype=torch.int64, device=dev)
+    return desc, bufs, ref
+
+
 def w8_self_test(k: int = 512, n_rows: int = 32, m_rows: int = 16) -> float:
     """Boot-time parity gate for the FP8-e4m3 delta tier kernel.
 
     Same shape as ``self_test`` (one random op-level GEMM vs a torch
-    reference, 2.5e-2 gate) but exercises the FP8 fragment-major byte layout
-    + the native fp8 ``tl.dot`` path. A layout/addressing bug or a Triton
-    fp8-codegen regression on Ada fails HERE at engine init, attributed,
-    instead of as silent prefill corruption a deploy cycle later. The
-    addressing half is also CPU-validated by
-    kernels/gen/moe_w8_sm89_cpu_check.py (runs anywhere, no GPU); this gate
-    adds the GPU codegen + launch verification. Returns worst_rel; raises
-    RuntimeError on failure."""
+    reference, 2.5e-2 gate) but exercises the delta tier kernel. The kernel
+    and test case are mode-selected: FP4-STORAGE mode (VLLM_MOE_W2_FP8_STORE=
+    fp4) uses moe_w8fp4_mm_sm89 + _op_case_w8fp4 (nibble plane + _E2M1_VALS
+    reference); fp8-store mode uses moe_w8_mm_sm89 + _op_case_fp8 (byte plane).
+    A layout/addressing bug or a Triton fp8-codegen regression fails HERE at
+    engine init, attributed, instead of as silent prefill corruption a deploy
+    cycle later. The addressing half is also CPU-validated by the respective
+    CPU golden (no GPU). Returns worst_rel; raises RuntimeError on failure."""
+    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
     n_rows = ((n_rows + _BLOCK_N - 1) // _BLOCK_N) * _BLOCK_N
-    desc, bufs, ref = _op_case_fp8(k, n_rows, m_rows)
+    if moe_w2_delta.fp8_store_fp4():
+        case = _op_case_w8fp4
+        cpu_golden = "kernels/gen/moe_w8fp4_sm89_cpu_check.py"
+    else:
+        case = _op_case_fp8
+        cpu_golden = "kernels/gen/moe_w8_sm89_cpu_check.py"
+    desc, bufs, ref = case(k, n_rows, m_rows)
     make_w8_launcher(k)(desc, n_rows, 1)
     torch.cuda.synchronize()
     got = bufs[4].float().cpu()
@@ -663,7 +792,6 @@ def w8_self_test(k: int = 512, n_rows: int = 32, m_rows: int = 16) -> float:
             f"moe_w8_sm89 self-test FAILED: worst_rel={worst:.3e} "
             f"(gate 2.5e-2), finite={finite} — the FP8 delta kernel is "
             "miscompiling on this device/driver; check the fragment-major "
-            "byte addressing (pack_fp8_fragment_major), the fp8 tl.dot "
-            "path, and report triton/torch/driver versions. CPU golden: "
-            "kernels/gen/moe_w8_sm89_cpu_check.py")
+            f"layout + fp8 tl.dot path, report triton/torch/driver versions. "
+            f"CPU golden: {cpu_golden}")
     return worst

@@ -768,6 +768,19 @@ class Worker(WorkerBase):
         except Exception as e:  # noqa: BLE001 - warm-start is best-effort
             logger.warning("moe_w2 pool warm-start failed: %s", e)
 
+        # moe_w2 FP8 deferred-pool parity gate: the w8 pool was allocated by
+        # finalize_auto above (defer_pool) — run the end-to-end pool-slot gate
+        # build time had to skip (n_slots was 0). Only the import is soft: a
+        # parity FAILURE must abort the boot (a mis-sized slot serves garbage).
+        try:
+            from vllm.model_executor.layers.quantization.utils import (
+                moe_w2_cubit)
+            _w8_gate = moe_w2_cubit.w8_pool_gate_deferred
+        except ImportError:
+            _w8_gate = None
+        if _w8_gate is not None:
+            _w8_gate()
+
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
         warmup_sizes: list[int] = []
