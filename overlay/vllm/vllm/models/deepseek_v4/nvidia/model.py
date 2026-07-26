@@ -1276,6 +1276,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         name_mapped = name.replace(weight_name, param_name)
                         if is_pp_missing_parameter(name_mapped, self):
                             continue
+                        # VLLM_MOE_W2_IQ2=1 skips the mxfp4 w13/w2 alloc
+                        # (the IQ2 params hold raw blocks, not {-4,-1,1,4}
+                        # plane sources). The non-IQ2 expert tensors still
+                        # present in the sharded checkpoint (experts.
+                        # gate_proj.weight[_scale], up_proj, down_proj) map
+                        # to those unallocated params — skip them here. The
+                        # IQ2 fused entries (gate_weight_iq2_xxs etc.) ARE
+                        # allocated and load via their own mapping entries.
+                        if name_mapped not in params_dict:
+                            continue
                         param = params_dict[name_mapped]
                         # We should ask the weight loader to return success or not
                         # here since otherwise we may skip experts with other

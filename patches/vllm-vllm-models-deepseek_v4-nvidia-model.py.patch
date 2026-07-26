@@ -1,5 +1,5 @@
 diff --git a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
-index 5f4a638..6374069 100644
+index 5f4a638..6f3b21b 100644
 --- a/vllm/models/deepseek_v4/nvidia/model.py
 +++ b/vllm/models/deepseek_v4/nvidia/model.py
 @@ -1,5 +1,6 @@
@@ -136,7 +136,24 @@ index 5f4a638..6374069 100644
              for param_name, weight_name, shard_id in stacked_params_mapping:
                  # Skip non-stacked layers and experts (experts handled below).
                  if ".experts." in name:
-@@ -1266,13 +1345,18 @@
+@@ -1196,6 +1275,16 @@
+                             continue
+                         name_mapped = name.replace(weight_name, param_name)
+                         if is_pp_missing_parameter(name_mapped, self):
++                            continue
++                        # VLLM_MOE_W2_IQ2=1 skips the mxfp4 w13/w2 alloc
++                        # (the IQ2 params hold raw blocks, not {-4,-1,1,4}
++                        # plane sources). The non-IQ2 expert tensors still
++                        # present in the sharded checkpoint (experts.
++                        # gate_proj.weight[_scale], up_proj, down_proj) map
++                        # to those unallocated params — skip them here. The
++                        # IQ2 fused entries (gate_weight_iq2_xxs etc.) ARE
++                        # allocated and load via their own mapping entries.
++                        if name_mapped not in params_dict:
+                             continue
+                         param = params_dict[name_mapped]
+                         # We should ask the weight loader to return success or not
+@@ -1266,13 +1355,18 @@
              return make_deepseek_v4_expert_params_mapping(self.config.n_routed_experts)
          # Params for weights, fp8 weight scales, fp8 activation scales
          # (param_name, weight_name, expert_id, shard_id)

@@ -665,6 +665,24 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.intermediate_size = intermediate_size_per_partition
         self.hidden_size = hidden_size
 
+        # VLLM_MOE_W2_IQ2=1: allocate the raw IQ2_XXS / Q2_K block params
+        # and return early, SKIPPING the mxfp4 e2m1 / scale / bias alloc
+        # below. The IQ2 block layout cannot be split on GEMM dims without
+        # requantizing, so the IQ2 path shards EXPERTS across TP ranks
+        # (128/card at TP=2; see _create_iq2_weights) and the runner's final
+        # all-reduce sums the per-rank partial routed outputs. Skipping the
+        # mxfp4 alloc here is VRAM-mandatory on a 48 GB card: the mxfp4
+        # w13/w2 params would otherwise sit idle on top of the IQ2 params
+        # the path actually uses. The host-RAM staging (VLLM_MOE_W2) below
+        # is also skipped.
+        if self._iq2_active:
+            self._create_iq2_weights(
+                layer=layer,
+                num_experts=num_experts,
+                extra_weight_attrs=extra_weight_attrs,
+            )
+            return
+
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
             torch.zeros(
@@ -739,20 +757,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
             layer.register_parameter("w2_bias", w2_bias)
             set_weight_attrs(w2_bias, extra_weight_attrs)
-        # VLLM_MOE_W2_IQ2=1: allocate the raw IQ2_XXS / Q2_K block params
-        # instead of the mxfp4 e2m1 packed params and return early. The IQ2
-        # block layout cannot be split on GEMM dims without requantizing,
-        # so the IQ2 path keeps the full per-expert byte layout intact and
-        # shards experts on axis 0 at load time (_iq2_expert_weight_loader).
-        # Returning here also skips the mxfp4 host-RAM staging below: the
-        # IQ2 params hold raw blocks already, not {-4,-1,1,4} plane sources.
-        if self._iq2_active:
-            self._create_iq2_weights(
-                layer=layer,
-                num_experts=num_experts,
-                extra_weight_attrs=extra_weight_attrs,
-            )
-            return
         # VLLM_MOE_W2: the raw checkpoint experts of all layers do not fit a
         # single GPU; stage them in host RAM until the 2-bit planes are built
         # in process_weights_after_loading.
@@ -784,23 +788,36 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     ) -> None:
         """Allocate raw IQ2_XXS / Q2_K block params for the Step 2 loader.
 
-        Three params are registered on `layer`, matching the safetensors
+        Three params are registered on ``layer``, matching the safetensors
         checkpoint emitted by tools/convert_iq2_gguf_to_vllm.py (Step 1):
-          - gate_weight_iq2_xxs  [E, intermediate, hidden/QK_K * 66]  u8
-          - up_weight_iq2_xxs    [E, intermediate, hidden/QK_K * 66]  u8
-          - down_weight_q2_k     [E, hidden, intermediate/QK_K * 84]  u8
-
-        All three are kept fused on axis 0 (experts); the per-expert byte
-        layout is intact (no GEMM-dim sharding, no dequant). The custom
-        _iq2_expert_weight_loader (attached as param.weight_loader) shards
-        axis 0 by TP rank at load time.
+          - gate_weight_iq2_xxs  [E_local, intermediate, hidden/QK_K * 66]  u8
+          - up_weight_iq2_xxs    [E_local, intermediate, hidden/QK_K * 66]  u8
+          - down_weight_q2_k     [E_local, hidden, intermediate/QK_K * 84]  u8
 
         The IQ2_XXS/Q2_K block layout spans the FULL in_features dimension
         (QK_K=256 elements per block), so we must use the unsharded sizes
         from FusedMoEConfig even when the surrounding mxfp4 path would
-        shard them.
+        shard them. IQ2 blocks cannot be tensor-sharded on the GEMM dims
+        (splitting a 256-element block would requantize), so the IQ2 path
+        shards EXPERTS instead: under TP=2 each rank allocates
+        ``num_experts // tp_size`` experts (128/card) and the per-rank
+        partial routed outputs are summed by the runner's final all-reduce
+        (``reduce_results=True`` default on FusedMoE; the reduce fires while
+        ``tp_size > 1`` and ``_fused_output_is_reduced`` is False for this
+        non-modular path).
+
+        Expert-parallel self-sharding: vLLM defaults
+        ``enable_expert_parallel=False``, so the production DSv4 TP=2 path
+        is TP-replicated (``num_local_experts=256``, ``expert_map=None``).
+        That would replicate all 256 experts per card and OOM a 48 GB GPU.
+        When the layer has no expert_map and TP>1 divides num_experts, we
+        therefore synthesize the linear map (rank r owns globals
+        ``[r*L:(r+1)*L]``) and register it as the layer's ``_expert_map``
+        buffer. ``_iq2_forward`` reads ``layer.expert_map`` to map global
+        topk_ids to local expert ids; non-local experts contribute zero on
+        this rank and the all-reduce completes the sum. The custom loader
+        (``_iq2_expert_weight_loader``) shards axis 0 by TP rank to match.
         """
-        # Full (pre-TP-shard) in_features — block layout cannot split.
         hidden_full = self.moe.hidden_dim
         # self.moe.intermediate_size is the FULL intermediate; per-partition
         # is self.moe.intermediate_size_per_partition. We need full here.
@@ -810,13 +827,43 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         up_row_bytes = _iq2_row_bytes(hidden_full, _IQ2_XXS_BLOCK_BYTES)
         down_row_bytes = _iq2_row_bytes(intermediate_full, _Q2_K_BLOCK_BYTES)
 
+        # Expert-parallel self-sharding under TP>1 (see docstring).
+        from vllm.distributed import (
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+        )
+        tp_size = get_tensor_model_parallel_world_size()
+        existing_map = getattr(layer, "expert_map", None)
+        if existing_map is None and tp_size > 1 and num_experts % tp_size == 0:
+            n_local = num_experts // tp_size
+            tp_rank = get_tensor_model_parallel_rank()
+            expert_map = torch.full((num_experts,), -1, dtype=torch.int32)
+            start = tp_rank * n_local
+            expert_map[start:start + n_local] = torch.arange(
+                n_local, dtype=torch.int32)
+            # Override the EP-off None buffer installed by
+            # update_expert_map_info. Non-persistent: the map is derived
+            # from rank/tp_size, not a checkpoint tensor. It still moves
+            # to GPU with the module for the forward's global->local index.
+            layer.register_buffer(
+                "_expert_map", expert_map, persistent=False)
+            logger.info(
+                "IQ2 EP self-sharding: rank %s/%s owns %s/%s experts "
+                "(global [%s:%s]); runner all-reduces the per-rank "
+                "partials.", tp_rank, tp_size, n_local, num_experts, start,
+                start + n_local)
+        else:
+            # EP already enabled at config (expert_map present) or TP=1:
+            # this rank owns whatever num_experts was passed in.
+            n_local = num_experts
+
         # Sanity: shapes must match the converter output bit-for-bit.
-        # gate/up: [E, out=intermediate, row_bytes=hidden/256*66]
-        # down:    [E, out=hidden,       row_bytes=intermediate/256*84]
+        # gate/up: [E_local, out=intermediate, row_bytes=hidden/256*66]
+        # down:    [E_local, out=hidden,       row_bytes=intermediate/256*84]
         def _register(name: str, out_features: int, row_bytes: int) -> None:
             p = torch.nn.Parameter(
                 torch.zeros(
-                    num_experts,
+                    n_local,
                     out_features,
                     row_bytes,
                     dtype=torch.uint8,
@@ -836,7 +883,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         # Mark the layer so process_weights_after_loading / apply can detect
         # the IQ2 path even when the method instance is rebound (defensive).
-        layer._iq2_active = True  # type: ignore[attr-defined]
+        layer._iq2_active = True  # type: ignore[attr-defined]  # type: ignore[attr-defined]
 
     def _setup_kernel(
         self,
@@ -978,6 +1025,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self,
         layer: RoutedExperts,
     ) -> FusedMoEQuantConfig | None:
+        # VLLM_MOE_W2_IQ2=1: the IQ2 path runs a per-expert Python-loop
+        # forward (_iq2_forward) and never builds the modular kernel, so
+        # there is no FusedMoEQuantConfig to return. The mxfp4 w13/w2
+        # params it would read here were not allocated (skipped in
+        # create_weights), so accessing them raises AttributeError.
+        # maybe_init_modular_kernel tolerates a None quant config.
+        if self._iq2_active:
+            return None
         w1_bias = getattr(layer, "w13_bias", None)
         w2_bias = getattr(layer, "w2_bias", None)
         swiglu_limit = getattr(layer, "swiglu_limit", None)
@@ -1058,6 +1113,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # and avoid importing Triton at module load.
         from vllm.model_executor.layers.quantization.utils import (
             iq2_xxs_mm_triton, q2_k_mm_triton)
+
+        _iq2_nan_check = os.getenv("VLLM_MOE_W2_IQ2_NAN_CHECK", "0") == "1"
 
         num_tokens, hidden = x.shape
         device = x.device
@@ -1177,6 +1234,30 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # down: Q2_K fused dequant + dot.
             expert_out = q2_k_mm_triton.q2_k_mm(
                 mid, down_w[expert_id], down_shape)  # [M_e, hidden] bf16
+
+            # VLLM_MOE_W2_IQ2_NAN_CHECK: diagnostic. A bad IQ2/Q2_K block can
+            # make the per-expert GEMM emit NaN/Inf, which then propagates
+            # through the residual into the next layer's sparse-MLA indexer
+            # (whose topk over NaN scores yields invalid indices -> illegal
+            # memory access, surfacing as an attention crash). When set, log
+            # the offending local expert and clamp so the request completes
+            # (output is corrupted but the crash is avoided, isolating the
+            # cause to the IQ2 GEMM vs the attention path proper).
+            if _iq2_nan_check:
+                if bool((~torch.isfinite(expert_out)).any()):
+                    logger.error(
+                        "IQ2 non-finite expert_out: local_expert=%s M=%s "
+                        "gate|up|mid|out finite=%s/%s/%s/%s max=%s",
+                        expert_id, int(x_e.shape[0]),
+                        bool(torch.isfinite(gate_out).all()),
+                        bool(torch.isfinite(up_out).all()),
+                        bool(torch.isfinite(mid).all()),
+                        bool(torch.isfinite(expert_out).all()),
+                        float(expert_out.abs().max()))
+                    gate_out = torch.nan_to_num(gate_out)
+                    up_out = torch.nan_to_num(up_out)
+                    mid = torch.nan_to_num(mid)
+                    expert_out = torch.nan_to_num(expert_out)
 
             if apply_router_weight_on_input:
                 contrib = expert_out
