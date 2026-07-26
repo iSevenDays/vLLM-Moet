@@ -1013,6 +1013,184 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             "initialization logic. This function should not be called."
         )
 
+    def _iq2_forward(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Per-expert Python-loop MoE forward for the IQ2_XXS / Q2_K path.
+
+        Mirrors ``cpu_fused_moe_torch`` (the loop-based reference in
+        ``fused_moe/cpu_fused_moe.py``): sort flattened (token, topk-slot)
+        dispatches by expert, run the per-expert gate/up/down GEMMs, scatter
+        back, then combine with the router weights. The per-expert GEMMs are
+        the proven fused dequant+dot kernels from Step 4b/4c
+        (``iq2_xxs_mm`` for gate/up, ``q2_k_mm`` for down) instead of the
+        mxfp4 / moe_w2 kernels.
+
+        Correctness-first: this is intentionally NOT a fused kernel. The
+        proven GEMMs take ``[M, K]`` activations (M = tokens for one expert),
+        which fits the per-expert dispatch directly. Peak throughput is later
+        work.
+
+        Contract: returns ONLY the routed-expert output (shared experts are
+        orchestrated by the MoE runner via ``_maybe_apply_shared_experts``
+        pre/post, matching the non-modular ``moe_w2_cubit`` path). Under
+        expert-parallel TP each rank emits a partial output (non-local
+        experts contribute zero here) and the runner all-reduces.
+
+        Args:
+            layer: RoutedExperts carrying ``gate_weight_iq2_xxs``,
+                ``up_weight_iq2_xxs``, ``down_weight_q2_k`` (registered by
+                ``_create_iq2_weights``), ``expert_map``, and
+                ``apply_router_weight_on_input``.
+            x: bf16 activations ``[num_tokens, hidden]``.
+            topk_weights: router weights ``[num_tokens, topk]`` (any dtype;
+                combined in fp32).
+            topk_ids: global expert ids ``[num_tokens, topk]`` (int).
+
+        Returns:
+            bf16 ``[num_tokens, hidden]`` routed-expert output.
+        """
+        # Lazy imports keep static validation (no torch.distributed) working
+        # and avoid importing Triton at module load.
+        from vllm.model_executor.layers.quantization.utils import (
+            iq2_xxs_mm_triton, q2_k_mm_triton)
+
+        num_tokens, hidden = x.shape
+        device = x.device
+        topk = topk_ids.shape[1]
+        out = torch.zeros(
+            num_tokens, hidden, dtype=torch.float32, device=device)
+
+        if num_tokens == 0:
+            return out.to(torch.bfloat16)
+
+        # ---- LUTs + per-expert weight slabs -------------------------------
+        # grid uint8[2048] + ksigns uint8[128], built from the constant
+        # Step-0 tables (bit-exact proven), per-device cached. Self-contained:
+        # does not depend on the checkpoint emitting ``_lookup.*`` tensors.
+        grid, ksigns = iq2_xxs_mm_triton._get_luts(device)
+
+        gate_w = layer.gate_weight_iq2_xxs  # [E_local, N=intermediate, rb]
+        up_w = layer.up_weight_iq2_xxs      # [E_local, N=intermediate, rb]
+        down_w = layer.down_weight_q2_k     # [E_local, N=hidden,      rb]
+
+        e_local, gate_n, gate_rb = gate_w.shape
+        _, up_n, up_rb = up_w.shape
+        _, dn_n, dn_rb = down_w.shape
+
+        # Logical K per family: K = (row_bytes / block_bytes) * QK_K.
+        gate_k = (gate_rb // _IQ2_XXS_BLOCK_BYTES) * _QK_K  # = hidden
+        up_k = (up_rb // _IQ2_XXS_BLOCK_BYTES) * _QK_K      # = hidden
+        dn_k = (dn_rb // _Q2_K_BLOCK_BYTES) * _QK_K         # = intermediate
+
+        if gate_k != hidden or up_k != hidden:
+            raise RuntimeError(
+                f"IQ2 gate/up K ({gate_k}/{up_k}) != hidden ({hidden}); "
+                "checkpoint/layer dim mismatch.")
+        if dn_n != hidden:
+            raise RuntimeError(
+                f"IQ2 down N ({dn_n}) != hidden ({hidden}).")
+        if gate_n != up_n:
+            raise RuntimeError(
+                f"IQ2 gate N ({gate_n}) != up N ({up_n}); gate/up must "
+                "share the intermediate dimension.")
+        # gate/up: w_shape = (N=intermediate, K=hidden)
+        # down:    w_shape = (N=hidden,       K=intermediate)
+        gate_shape = (gate_n, gate_k)
+        up_shape = (up_n, up_k)
+        down_shape = (dn_n, dn_k)
+
+        # ---- Dispatch: global topk_ids -> local expert ids ----------------
+        expert_map = getattr(layer, "expert_map", None)
+        flat_global = topk_ids.reshape(-1).to(torch.long)
+        if expert_map is not None:
+            # expert_map[g] = local_id, or -1 if the expert is not on this
+            # rank (EP). Non-local dispatches contribute zero here; the
+            # runner's all-reduce sums the per-rank partials.
+            flat_local = expert_map[flat_global]
+        else:
+            flat_local = flat_global
+            if e_local != layer.global_num_experts:
+                raise RuntimeError(
+                    f"IQ2 expert_map is None but E_local ({e_local}) != "
+                    f"global_num_experts ({layer.global_num_experts}); "
+                    "cannot map global topk_ids to local experts. Enable "
+                    "expert-parallel or run TP=1.")
+
+        valid_mask = flat_local >= 0
+        if not bool(valid_mask.any()):
+            return out.to(torch.bfloat16)
+
+        local_ids_v = flat_local[valid_mask]
+        slots_v = torch.nonzero(valid_mask, as_tuple=False).flatten()
+        token_ids_v = slots_v // topk
+        weights_v = topk_weights.reshape(-1).to(torch.float32)[slots_v]
+
+        # Sort dispatches by local expert id so each expert's tokens are
+        # contiguous (one segment per expert).
+        order = local_ids_v.argsort()
+        local_ids_s = local_ids_v[order]
+        token_ids_s = token_ids_v[order]
+        weights_s = weights_v[order]
+
+        # Gather per-dispatch activations (a token routed to the same expert
+        # in two slots appears twice -- mirrors cpu_fused_moe's
+        # sorted_tokens expansion; the duplicate-slot weight sum falls out
+        # correctly in the combine via index_add_).
+        x_bf16 = x if x.dtype == torch.bfloat16 else x.to(torch.bfloat16)
+        x_per_slot = x_bf16[token_ids_s]  # [num_dispatches, hidden]
+
+        # If the router weight was already folded into x (topk=1 fast path),
+        # don't multiply it in again during combine.
+        apply_router_weight_on_input = getattr(
+            layer, "apply_router_weight_on_input", False)
+
+        # ---- Per-expert gate/up SwiGLU down + weighted combine ------------
+        uniq, counts = torch.unique_consecutive(
+            local_ids_s, return_counts=True)
+        offsets = torch.cat([
+            torch.zeros(1, dtype=torch.long, device=device),
+            counts.cumsum(0).to(torch.long),
+        ])
+
+        for i in range(int(uniq.numel())):
+            expert_id = int(uniq[i].item())
+            s = int(offsets[i].item())
+            e = int(offsets[i + 1].item())
+            x_e = x_per_slot[s:e]
+            if x_e.shape[0] == 0:
+                continue
+            tids_e = token_ids_s[s:e]
+
+            # gate/up: IQ2_XXS fused dequant + dot.
+            gate_out = iq2_xxs_mm_triton.iq2_xxs_mm(
+                x_e, gate_w[expert_id], gate_shape, grid, ksigns)
+            up_out = iq2_xxs_mm_triton.iq2_xxs_mm(
+                x_e, up_w[expert_id], up_shape, grid, ksigns)
+            # SwiGLU = SiLU(gate) * up (DSv4 routed experts use plain silu;
+            # the clamped variant is shared-experts only).
+            mid = torch.nn.functional.silu(gate_out) * up_out
+            # down: Q2_K fused dequant + dot.
+            expert_out = q2_k_mm_triton.q2_k_mm(
+                mid, down_w[expert_id], down_shape)  # [M_e, hidden] bf16
+
+            if apply_router_weight_on_input:
+                contrib = expert_out
+            else:
+                w_e = weights_s[s:e].to(expert_out.dtype)
+                contrib = expert_out * w_e.unsqueeze(-1)
+            # index_add_ handles the same token dispatched to this expert in
+            # multiple slots (weights sum) and to different experts (partial
+            # sums across the loop). fp32 accumulation matches the reference
+            # combine precision.
+            out.index_add_(0, tids_e, contrib.to(torch.float32))
+
+        return out.to(torch.bfloat16)
+
     def apply(
         self,
         layer: RoutedExperts,
@@ -1022,17 +1200,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
-        # VLLM_MOE_W2_IQ2=1: the IQ2_XXS / Q2_K Triton GEMM is Step 4b of
-        # the port. Until it lands, surface an explicit NotImplementedError
-        # so a misconfigured serve (env set without the kernel) fails fast
-        # instead of silently routing through the mxfp4 path.
+        # VLLM_MOE_W2_IQ2=1: IQ2_XXS / Q2_K routed-expert forward. The
+        # proven Step 4b/4c Triton GEMMs are wired in as a per-expert
+        # Python-loop MoE forward (correctness-first; the fused fast path is
+        # later work). Shared experts stay orchestrated by the MoE runner.
         if self._iq2_active:
-            raise NotImplementedError(
-                "IQ2_XXS MoE GEMM (Step 4b) is not wired up yet. "
-                "VLLM_MOE_W2_IQ2=1 currently enables the weight-loading "
-                "path only (Step 2); the dispatching Triton kernel is "
-                "Step 4b. Unset VLLM_MOE_W2_IQ2 to use the production "
-                "{-4,-1,1,4} mxfp4 path.")
+            return self._iq2_forward(layer, x, topk_weights, topk_ids)
         # VLLM_MOE_W2 routed-expert path (cubit moe_w2_mm, 2-bit planes).
         # Shared experts are orchestrated by the MoE runner (pre/post
         # _maybe_apply_shared_experts); the non-modular w2 path returns only the

@@ -20,8 +20,10 @@ vllm-vllm-model_executor-layers-fused_moe-router-fused_topk_bias_router.py.patch
 vllm-vllm-model_executor-layers-quantization-fp8.py.patch
 vllm-vllm-model_executor-layers-quantization-modelopt.py.patch
 vllm-vllm-model_executor-layers-quantization-mxfp4.py.patch
-vllm-vllm-model_executor-layers-quantization-utils-__pycache__-moe_w2_store.cpython-311.pyc.patch
 vllm-vllm-model_executor-layers-quantization-utils-fp8_utils.py.patch
+vllm-vllm-model_executor-layers-quantization-utils-iq2_xxs_mm_triton.py.patch
+vllm-vllm-model_executor-layers-quantization-utils-iq2_xxs_ref.py.patch
+vllm-vllm-model_executor-layers-quantization-utils-iq2_xxs_triton.py.patch
 vllm-vllm-model_executor-layers-quantization-utils-moe_w2_bf12.py.patch
 vllm-vllm-model_executor-layers-quantization-utils-moe_w2_cubit.py.patch
 vllm-vllm-model_executor-layers-quantization-utils-moe_w2_delta.py.patch
@@ -32,6 +34,7 @@ vllm-vllm-model_executor-layers-quantization-utils-moe_w2_planes_cache.py.patch
 vllm-vllm-model_executor-layers-quantization-utils-moe_w2_sm89.py.patch
 vllm-vllm-model_executor-layers-quantization-utils-moe_w2_store.py.patch
 vllm-vllm-model_executor-layers-quantization-utils-prefill_timers.py.patch
+vllm-vllm-model_executor-layers-quantization-utils-q2_k_mm_triton.py.patch
 vllm-vllm-model_executor-layers-sparse_attn_indexer.py.patch
 vllm-vllm-model_executor-models-deepseek_mtp.py.patch
 vllm-vllm-model_executor-models-qwen3_dspark.py.patch
