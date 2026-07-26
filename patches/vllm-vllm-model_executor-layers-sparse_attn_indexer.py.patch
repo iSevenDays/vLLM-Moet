@@ -1,5 +1,5 @@
 diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
-index ceb52e5..d7be66a 100644
+index ceb52e5..081d8eb 100644
 --- a/vllm/model_executor/layers/sparse_attn_indexer.py
 +++ b/vllm/model_executor/layers/sparse_attn_indexer.py
 @@ -1,13 +1,18 @@
@@ -35,10 +35,28 @@ index ceb52e5..d7be66a 100644
  from vllm.v1.worker.workspace import current_workspace_manager
  
  logger = init_logger(__name__)
-@@ -42,6 +53,37 @@
+@@ -42,6 +53,55 @@
  
  # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
  MXFP4_BLOCK_SIZE = 32
++
++# One-shot latch: the peak-logits dummy allocation is only needed during the
++# init profile_run (to reserve the op's runtime workspace for KV sizing). It
++# must NOT re-fire during the post-KV warmup/capture forwards, because the
++# deferred FP4 delta pool has already consumed the post-KV free space by then
++# and a second 512 MiB transient OOMs the pool. The robust signal that we are
++# PAST the init profile_run is "the deferred FP4 delta pool has been
++# allocated" (finalize_auto runs after KV sizing / init profile, before the
++# warmup/capture). In normal mode (no FP4 delta) the pool is never allocated
++# so this returns False and the dummy fires unchanged.
++def _fp4_delta_pool_active() -> bool:
++    try:
++        from vllm.model_executor.layers.quantization.utils import (
++            moe_w2_delta)
++        tier = getattr(moe_w2_delta, "_TIER", None)
++        return tier is not None and getattr(tier, "n_slots", 0) > 0
++    except Exception:
++        return False
 +
 +
 +def _in_cudagraph_capture() -> bool:
@@ -73,7 +91,7 @@ index ceb52e5..d7be66a 100644
  
  
  def _assert_cutedsl_dcp_merge_supported(
-@@ -291,6 +333,36 @@
+@@ -291,6 +351,36 @@
      return kv_cache.unsqueeze(-2)
  
  
@@ -110,7 +128,7 @@ index ceb52e5..d7be66a 100644
  @eager_break_during_capture
  def sparse_attn_indexer(
      hidden_states: torch.Tensor,
-@@ -313,6 +385,8 @@
+@@ -313,6 +403,8 @@
      dcp_world_size: int = 1,
      cp_kv_cache_interleave_size: int = 1,
      skip_topk_buffer_clear: bool = False,
@@ -119,7 +137,7 @@ index ceb52e5..d7be66a 100644
  ) -> torch.Tensor:
      # careful! this will be None in dummy run
      attn_metadata = get_forward_context().attn_metadata
-@@ -332,11 +406,52 @@
+@@ -332,11 +424,64 @@
          )
  
          # Dummy allocation to simulate for peak logits tensor memory during inference.
@@ -159,10 +177,22 @@ index ceb52e5..d7be66a 100644
 +        skip_capture_dummy = os.getenv(
 +            "VLLM_DSV4_INDEXER_SKIP_CAPTURE_DUMMY", "1"
 +        ) in ("1", "true", "True", "TRUE")
-+        if skip_capture_dummy and _in_cudagraph_capture():
-+            # Capture path: the indexer's genuine peak-logits tensor at
-+            # capture batch sizes is tiny (queries * compressed_keys * 4 B);
-+            # the profile run already accounted for peak memory.
++        _cap = _in_cudagraph_capture()
++        _pool = _fp4_delta_pool_active()
++        _n = globals().get("_INDEXER_SKIP_DEBUG_COUNT", 0)
++        globals()["_INDEXER_SKIP_DEBUG_COUNT"] = _n + 1
++        if _n < 6:
++            logger.warning(
++                "INDEXER_SKIP_DEBUG call#%d: in_capture=%s pool_active=%s "
++                "skip_gate=%s",
++                _n, _cap, _pool, skip_capture_dummy)
++        if skip_capture_dummy and (_cap or _pool):
++            # Capture path OR post-profile warmup/capture forwards (detected
++            # via the deferred FP4 delta pool being allocated, which happens
++            # after the init profile_run): the indexer's genuine peak-logits
++            # tensor at these batch sizes is tiny; the init profile_run
++            # already reserved the op's runtime workspace. Re-firing here
++            # (esp. the eager warmup after the pool is allocated) OOMs it.
 +            max_logits_elems = 0
 +        else:
 +            max_logits_elems = (
@@ -177,7 +207,7 @@ index ceb52e5..d7be66a 100644
  
          return sparse_attn_indexer_fake(
              hidden_states,
-@@ -355,6 +470,9 @@
+@@ -355,6 +500,9 @@
              topk_indices_buffer,
              skip_k_cache_insert,
              use_fp4_cache,
@@ -187,7 +217,7 @@ index ceb52e5..d7be66a 100644
          )
      attn_metadata_narrowed = attn_metadata[k_cache_prefix]
      assert isinstance(attn_metadata_narrowed, DeepseekV32IndexerMetadata)
-@@ -493,6 +611,17 @@
+@@ -493,6 +641,17 @@
                  row_starts=chunk.cu_seqlen_ks,
              )
  
@@ -205,7 +235,7 @@ index ceb52e5..d7be66a 100644
      if has_decode:
          decode_metadata = attn_metadata_narrowed.decode
          assert decode_metadata is not None
-@@ -570,17 +699,29 @@
+@@ -570,17 +729,29 @@
                  clean_logits=False,
              )
          num_rows = logits.shape[0]
@@ -238,7 +268,7 @@ index ceb52e5..d7be66a 100644
              512,
              1024,
              2048,
-@@ -595,7 +736,7 @@
+@@ -595,7 +766,7 @@
                  seq_lens,
                  topk_indices,
                  topk_workspace,
@@ -247,7 +277,7 @@ index ceb52e5..d7be66a 100644
                  attn_metadata_narrowed.max_seq_len,
              )
          elif use_persistent_topk:
-@@ -608,8 +749,8 @@
+@@ -608,8 +779,8 @@
                  seq_lens,
                  topk_indices,
                  topk_workspace,
@@ -258,7 +288,7 @@ index ceb52e5..d7be66a 100644
              )
          else:
              ops.top_k_per_row_decode(
-@@ -620,7 +761,33 @@
+@@ -620,7 +791,33 @@
                  num_rows,
                  logits.stride(0),
                  logits.stride(1),
@@ -293,7 +323,7 @@ index ceb52e5..d7be66a 100644
              )
  
          if decode_metadata.global_seq_lens is not None:
-@@ -668,6 +835,8 @@
+@@ -668,6 +865,8 @@
      dcp_world_size: int = 1,
      cp_kv_cache_interleave_size: int = 1,
      skip_topk_buffer_clear: bool = False,
@@ -302,7 +332,7 @@ index ceb52e5..d7be66a 100644
  ) -> torch.Tensor:
      return topk_indices_buffer
  
-@@ -731,6 +900,46 @@
+@@ -731,6 +930,46 @@
                  "the current vLLM environment."
              )
  
@@ -349,7 +379,7 @@ index ceb52e5..d7be66a 100644
      def forward_native(
          self,
          hidden_states: torch.Tensor,
-@@ -781,6 +990,7 @@
+@@ -781,6 +1020,7 @@
              self.dcp_rank,
              self.dcp_world_size,
              self.cp_kv_cache_interleave_size,
@@ -357,7 +387,7 @@ index ceb52e5..d7be66a 100644
          )
  
      def forward_xpu(
-@@ -800,6 +1010,9 @@
+@@ -800,6 +1040,9 @@
          weights: torch.Tensor,
      ):
          assert not self.use_fp4_cache, "AMD platform doesn't support fp4 cache yet"

@@ -302,6 +302,7 @@ docker run -d --name "$NAME" --restart "$RESTART" --gpus "$GPUS" --network "$NET
   --reasoning-parser deepseek_v4 \
   $TPARGS $PREFIXARGS $MTPARGS \
   --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"],"cudagraph_capture_sizes":['"$CUDAGRAPH_SIZES"']}' \
+  ${ENFORCE_EAGER:+--enforce-eager} \
   --port "$PORT"
 BUILD=$(docker exec "$NAME" cat /opt/moet-checks/SOURCE.txt 2>/dev/null | grep -v '^#' | head -1 || true)
 echo "started $NAME (sm_89, gpus=${GPUS} tp=${TP} residency=${RESIDENCY}, memcap=${MEM_GB}g, ready-timeout=${READY_TIMEOUT_S}s, port ${PORT}, network=$NETWORK, restart=$RESTART, max-model-len=$MAXLEN, util=$UTIL, batched=$BATCHED_TOKENS, seqs=$NUM_SEQS, mtp=$MTP_TOKENS, prefix-cache=$PREFIX_CACHING, scale-refit=$SCALE_REFIT, sm89-native=${SM89_NATIVE:-default-on}, graphs=[$CUDAGRAPH_SIZES], breakable-cudagraph=$BREAKABLE_CUDAGRAPH, quality-prefill=$QUALITY_PREFILL)"
