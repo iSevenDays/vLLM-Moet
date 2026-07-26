@@ -1,0 +1,693 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Fused IQ2_XXS dequant + dot GEMM (Triton) -- Step 4b de-risking slice.
+
+This is the core de-risk for the IQ2_XXS -> Ada (sm_89) native-decode port:
+a STANDALONE fused kernel that computes the MoE W2 / gate / up matmul
+
+    C[M, N] = A[M, K] (bf16 activations) @ W[N, K]^T   (W stored as IQ2_XXS)
+
+directly from the raw IQ2_XXS block bytes, *without* materializing the
+dequantized weight matrix. For each 256-K block (66 bytes) the kernel
+decodes the 256 weight values into registers (reusing the bitfield +
+grid-lookup logic proven bit-exact in ``iq2_xxs_triton.py``, Step 4a) and
+folds them straight into a bf16 ``tl.dot`` with a 32-wide A tile,
+accumulating in fp32 -- exactly the structure of the shipped {-4,-1,1,4}
+kernel ``moe_w2_sm89.moe_w2_mm_sm89`` (lines 129-165: load weight tile,
+dequant in-register, bf16 dot, fp32 accumulate, scale fold), with the
+IQ2_XXS codebook in place of the 2-bit {-4,-1,1,4} codebook.
+
+Why this kernel exists (the three de-risk questions):
+
+  1. REGISTER / SHARED-MEMORY PRESSURE.  Per N-row, one 256-K IQ2_XXS block
+     is 66 bytes of HBM (8 blocks per K=2048 row = 528 bytes).  The kernel
+     never holds a full 256-wide decoded tile: it decodes ONE 32-element
+     sub-block at a time straight into a [BLOCK_N, 32] bf16 register tile
+     (1 KiB at BLOCK_N=16), dots it with a [BLOCK_M, 32] A tile, and folds
+     the result into the [BLOCK_M, BLOCK_N] fp32 accumulator.  So the live
+     decoded footprint is O(BLOCK_N * 32) bf16 + O(BLOCK_M * BLOCK_N) fp32,
+     not O(BLOCK_N * 256).  The grid lookup is 4 gathers of 8 bytes per
+     sub-block (32 bytes / N-row / sub-block) from the 2 KiB grid that
+     stays resident in L1.  -> the fused path fits without spill cliffs
+     (validated: compiles + runs at the speeds reported by ``__main__``).
+
+  2. ACCURACY.  Decode happens in fp32 (matching the Step-4a reference) and
+     is cast to bf16 only at the ``tl.dot`` boundary, so the only loss vs
+     the fp32-dequant reference is bf16-MMA rounding (the same loss the
+     {-4,-1,1,4} kernel accepts).  ``__main__`` measures the gap vs the
+     CPU-reference dequant + torch fp32 matmul; the achieved relative error
+     is reported there (target ~1e-2, comparable to the {-4,-1,1,4} gate).
+
+  3. PERFORMANCE.  The fused kernel reads 2.0625 bits/element of weight HBM
+     (66 B / 256 elems) instead of 16 bit/elem (bf16), so it is HBM-cheap
+     even though the dequant ALU is real.  ``__main__`` reports kernel time
+     vs ``torch.matmul`` (bf16, tensor cores) on the same shape so the
+     cost of fusing the dequant is visible.  This is a *correctness* de-risk,
+     not a peak-throughput benchmark -- the headline is "the math works and
+     the time is sane", not "we beat cuBLAS".
+
+The math folded into each 32-element dot (per sub-block ib32 of block kb):
+
+    d        = fp16(block[0:2])                 # super-block scale
+    ls       = 2 * ((aux1 >> 28) & 0xf) + 1     # odd per-sub-block scale, [1,31]
+    a_k      = (aux0 >> 8*k) & 0xff             # 4 grid indices (k=0..3)
+    sign_k   = (aux1 >> 7*k) & 0x7f             # 4 sign-table indices
+    grid8    = iq2xxs_grid[a_k]                 # 8 bytes in {8, 25, 43}
+    signs    = ksigns_iq2xs[sign_k]             # 8 sign bits
+    w[i]     = 0.125 * d * ls * grid8[i] * (+/-1)
+    acc     += A[:, kb*256 + ib32*32 + i] * w[i]   (bf16 dot, fp32 accumulate)
+
+NOT integrated into vLLM MoE dispatch -- this is the standalone proof.  The
+W2/gate/up GEMM-for-one-expert shape used here is M (tokens) x N=4096 x K=2048
+(the DSv4 ``ffn_gate_exps`` / ``ffn_up_exps`` per-expert slab, IQ2_XXS).
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import time
+from typing import Optional, Tuple
+
+import numpy as np
+import torch
+import triton
+import triton.language as tl
+
+# Reuse the proven lookup tables + CPU reference + GGUF parser.
+try:
+    from .iq2_xxs_ref import (
+        QK_K,
+        IQ2_XXS_BLOCK_BYTES,
+        _IQ2XXS_GRID,
+        _KSIGNS_IQ2XS,
+        dequant_iq2_xxs,
+        parse_gguf_header,
+        find_tensors_by_prefix,
+        GGUF_TYPE_IQ2_XXS,
+    )
+except ImportError:  # standalone execution
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from iq2_xxs_ref import (  # type: ignore[no-redef]
+        QK_K,
+        IQ2_XXS_BLOCK_BYTES,
+        _IQ2XXS_GRID,
+        _KSIGNS_IQ2XS,
+        dequant_iq2_xxs,
+        parse_gguf_header,
+        find_tensors_by_prefix,
+        GGUF_TYPE_IQ2_XXS,
+    )
+
+
+DEFAULT_GGUF = "/root/antirez/ds4/ds4flash.gguf"
+
+
+# ---------------------------------------------------------------------------
+# Module-level device-cached lookup-table tensors (grid flat uint8[2048],
+# ksigns uint8[128]).  Same encoding as iq2_xxs_triton._get_tables.
+# ---------------------------------------------------------------------------
+_LUT_CACHE: dict = {}
+
+
+def _get_luts(device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    key = (device.type, device.index if device.type == "cuda" else 0)
+    cached = _LUT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    grid_u64 = np.asarray(_IQ2XXS_GRID, dtype=np.uint64)           # (256,)
+    shifts = np.arange(8, dtype=np.uint64) * np.uint64(8)
+    grid_bytes = (
+        (grid_u64[:, None] >> shifts) & np.uint64(0xff)
+    ).astype(np.uint8)                                             # (256, 8)
+    grid_flat = torch.from_numpy(
+        np.ascontiguousarray(grid_bytes).reshape(-1)
+    ).to(device)                                                   # uint8 [2048]
+    ksigns = torch.from_numpy(
+        np.asarray(_KSIGNS_IQ2XS, dtype=np.uint8)
+    ).to(device)                                                   # uint8 [128]
+    assert grid_flat.shape == (2048,), grid_flat.shape
+    assert ksigns.shape == (128,), ksigns.shape
+    _LUT_CACHE[key] = (grid_flat, ksigns)
+    return grid_flat, ksigns
+
+
+# ---------------------------------------------------------------------------
+# Triton fused GEMM kernel: one program per BLOCK_N-row N-tile.
+#
+# Contraction strategy: iterate over K one IQ2_XXS block (256 elems) at a
+# time; inside each block, static-unroll the 8 sub-blocks of 32 elements,
+# decoding each 32-wide W stripe straight into a bf16 register tile and
+# dotting it with the matching [BLOCK_M, 32] A tile.  This mirrors the
+# {-4,-1,1,4} kernel's 32-group contraction (one tl.dot per 32-elem stripe)
+# with IQ2_XXS dequant in place of the 2-bit codebook.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _iq2_xxs_mm_kernel(
+    a_ptr,        # *bf16 [M, K]
+    w_ptr,        # *uint8 [N, BLOCKS_PER_ROW * 66]
+    grid_ptr,     # *uint8 [2048]  (iq2xxs_grid, flattened)
+    ksigns_ptr,   # *uint8 [128]   (ksigns_iq2xs)
+    c_ptr,        # *bf16 [M, N]
+    M,            # runtime rows of A (for masking when M < BLOCK_M)
+    N_RUNTIME,    # runtime rows of W
+    stride_am, stride_ak,
+    stride_wn,
+    stride_cm, stride_cn,
+    BLOCKS_PER_ROW: tl.constexpr,   # K // 256
+    K: tl.constexpr,                # contraction (e.g. 2048)
+    BLOCK_M: tl.constexpr,          # tl.dot needs >= 16
+    BLOCK_N: tl.constexpr,          # tl.dot needs >= 16
+    BLOCK_BYTES: tl.constexpr,      # 66
+):
+    pid_n = tl.program_id(0)
+
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_m = offs_m < M
+    mask_n = offs_n < N_RUNTIME
+
+    # Decode constants.
+    i8 = tl.arange(0, 8)       # within-group byte index
+    k4 = tl.arange(0, 4)       # group index inside a 32-elem sub-block
+    i32 = tl.arange(0, 32)     # within-sub-block element index
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for kb in range(BLOCKS_PER_ROW):
+        # ---- per-N-row block base (66 bytes per IQ2_XXS block) ----------
+        block_base = offs_n * stride_wn + kb * BLOCK_BYTES         # [BLOCK_N]
+
+        # ---- d (fp16) -- shared across all 8 sub-blocks of this block ----
+        d_lo = tl.load(w_ptr + block_base + 0, mask=mask_n, other=0).to(tl.uint32)
+        d_hi = tl.load(w_ptr + block_base + 1, mask=mask_n, other=0).to(tl.uint32)
+        d_u16 = (d_lo | (d_hi << 8)).to(tl.uint16)
+        d_fp16 = d_u16.to(tl.float16, bitcast=True)
+        d_fp32 = d_fp16.to(tl.float32)                             # [BLOCK_N]
+        scale_pre = 0.125 * d_fp32                                 # [BLOCK_N]
+
+        # ---- 8 sub-blocks of 32 elements each (static-unrolled) ---------
+        for ib32 in tl.static_range(8):
+            sub_base = block_base + 2 + ib32 * 8                  # [BLOCK_N]
+
+            # Load q0..q3 (4 uint16 = 8 bytes) and pack into aux0/aux1.
+            # Identical byte-pair combine as Step 4a (portable uint8 loads).
+            q0_lo = tl.load(w_ptr + sub_base + 0, mask=mask_n, other=0).to(tl.uint32)
+            q0_hi = tl.load(w_ptr + sub_base + 1, mask=mask_n, other=0).to(tl.uint32)
+            q0 = q0_lo | (q0_hi << 8)
+            q1_lo = tl.load(w_ptr + sub_base + 2, mask=mask_n, other=0).to(tl.uint32)
+            q1_hi = tl.load(w_ptr + sub_base + 3, mask=mask_n, other=0).to(tl.uint32)
+            q1 = q1_lo | (q1_hi << 8)
+            q2_lo = tl.load(w_ptr + sub_base + 4, mask=mask_n, other=0).to(tl.uint32)
+            q2_hi = tl.load(w_ptr + sub_base + 5, mask=mask_n, other=0).to(tl.uint32)
+            q2 = q2_lo | (q2_hi << 8)
+            q3_lo = tl.load(w_ptr + sub_base + 6, mask=mask_n, other=0).to(tl.uint32)
+            q3_hi = tl.load(w_ptr + sub_base + 7, mask=mask_n, other=0).to(tl.uint32)
+            q3 = q3_lo | (q3_hi << 8)
+
+            aux0 = q0 | (q1 << 16)                                # [BLOCK_N] u32
+            aux1 = q2 | (q3 << 16)                                # [BLOCK_N] u32
+
+            ls_field = (aux1 >> 28) & 0xf                         # [BLOCK_N]
+            ls = (2 * ls_field + 1).to(tl.float32)               # [BLOCK_N]
+            scale_sb = scale_pre * ls                             # [BLOCK_N]
+
+            # 4 groups of 8 -> vectorized gather. [BLOCK_N, 4] indices.
+            a_k = (aux0[:, None] >> (8 * k4[None, :])) & 0xff     # [BLOCK_N, 4]
+            sign_k = (aux1[:, None] >> (7 * k4[None, :])) & 0x7f  # [BLOCK_N, 4]
+
+            # Grid: 8 bytes per (N-row, group) -> [BLOCK_N, 4, 8].
+            grid_offs = a_k[:, :, None] * 8 + i8[None, None, :]   # [BN,4,8]
+            grid_vals = tl.load(grid_ptr + grid_offs).to(tl.int32)
+
+            sign_byte = tl.load(ksigns_ptr + sign_k).to(tl.int32)        # [BN,4]
+            sign_bit = (sign_byte[:, :, None] >> i8[None, None, :]) & 1  # [BN,4,8]
+            sign_factor = 1 - 2 * sign_bit                                # [BN,4,8]
+
+            signed = (grid_vals * sign_factor).to(tl.float32)             # [BN,4,8]
+            scaled = scale_sb[:, None, None] * signed                     # [BN,4,8]
+            # Row-major reshape: [bn, k, i] -> [bn, k*8+i] == [bn, 32].
+            w_tile = tl.reshape(scaled, (BLOCK_N, 32)).to(tl.bfloat16)    # [BN,32]
+
+            # A tile [BLOCK_M, 32] for this sub-block's K-window.
+            k_glob = kb * 256 + ib32 * 32 + i32                  # [32]
+            a_tile = tl.load(
+                a_ptr + offs_m[:, None] * stride_am + k_glob[None, :] * stride_ak,
+                mask=mask_m[:, None], other=0.0,
+            ).to(tl.bfloat16)                                    # [BLOCK_M,32]
+
+            # Fused bf16 dot, fp32 accumulate.
+            acc += tl.dot(a_tile, tl.trans(w_tile))
+
+    tl.store(
+        c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+        acc.to(tl.bfloat16),
+        mask=mask_m[:, None] & mask_n[None, :],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Python wrapper.
+# ---------------------------------------------------------------------------
+def iq2_xxs_mm(
+    a_bf16: torch.Tensor,
+    w_iq2xxs_bytes: torch.Tensor,
+    w_shape: Tuple[int, int],
+    grid: torch.Tensor,
+    ksigns: torch.Tensor,
+    *,
+    block_m: int = 16,
+    block_n: int = 16,
+    num_warps: int = 2,
+) -> torch.Tensor:
+    """Fused IQ2_XXS GEMM: C[M,N] = A[M,K] @ W[N,K]^T.
+
+    Args:
+        a_bf16: bf16 activations ``[M, K]``.
+        w_iq2xxs_bytes: uint8 tensor holding the raw IQ2_XXS blocks of W.
+            Either flat ``[N * blocks_per_row * 66]`` or pre-shaped
+            ``[N, blocks_per_row * 66]``.  ``blocks_per_row = K // 256``.
+        w_shape: ``(N, K)`` logical weight shape.  ``K`` must be a multiple
+            of 256.  The byte layout is the same block-linear layout that
+            ``iq2_xxs_ref.dequant_iq2_xxs(bytes, (N, K))`` consumes, i.e.
+            element ``W[n, k]`` lives in IQ2_XXS block ``(n, k // 256)`` at
+            within-block position ``k % 256`` -- so reshape-to-(N,K) of the
+            reference dequant matches this kernel byte-for-byte.
+        grid: uint8 ``[2048]`` -- ``iq2xxs_grid`` unpacked to 256*8 bytes.
+        ksigns: uint8 ``[128]`` -- ``ksigns_iq2xs``.
+        block_m / block_n: Triton tile sizes (must be >= 16 for tl.dot).
+            ``block_m`` only needs to cover the largest M you'll pass (rows
+            beyond M are masked); 16 is the minimum and handles M <= 16.
+        num_warps: Triton warp count.
+
+    Returns:
+        bf16 ``[M, N]`` tensor on the same device as ``a_bf16``.
+    """
+    if a_bf16.dtype != torch.bfloat16:
+        raise TypeError(f"A must be bf16, got {a_bf16.dtype}")
+    if w_iq2xxs_bytes.dtype != torch.uint8:
+        raise TypeError(f"W bytes must be uint8, got {w_iq2xxs_bytes.dtype}")
+    M, K_a = a_bf16.shape
+    N, K = w_shape
+    if K != K_a:
+        raise ValueError(f"K mismatch: A has K={K_a}, w_shape has K={K}")
+    if K % QK_K != 0:
+        raise ValueError(f"K={K} must be a multiple of {QK_K}")
+    blocks_per_row = K // QK_K
+    row_bytes = blocks_per_row * IQ2_XXS_BLOCK_BYTES
+
+    if block_m < 16:
+        raise ValueError(f"block_m must be >= 16 (tl.dot), got {block_m}")
+    if block_n < 16:
+        raise ValueError(f"block_n must be >= 16 (tl.dot), got {block_n}")
+
+    device = a_bf16.device
+    a_bf16 = a_bf16.contiguous()
+    w = w_iq2xxs_bytes.reshape(-1).contiguous().to(device)
+    if w.numel() != N * row_bytes:
+        raise ValueError(
+            f"W bytes: have {w.numel()} (= {w.numel() // row_bytes} N-rows), "
+            f"expected {N * row_bytes} (= {N} N-rows x {row_bytes} B)."
+        )
+    w = w.reshape(N, row_bytes)
+    grid = grid.reshape(-1).contiguous().to(device)
+    ksigns = ksigns.reshape(-1).contiguous().to(device)
+
+    c = torch.empty((M, N), dtype=torch.bfloat16, device=device)
+
+    grid_dim = (triton.cdiv(N, block_n),)
+    _iq2_xxs_mm_kernel[grid_dim](
+        a_bf16,
+        w,
+        grid,
+        ksigns,
+        c,
+        M,
+        N,
+        a_bf16.stride(0), a_bf16.stride(1),
+        w.stride(0),
+        c.stride(0), c.stride(1),
+        BLOCKS_PER_ROW=blocks_per_row,
+        K=K,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_BYTES=IQ2_XXS_BLOCK_BYTES,
+        num_warps=num_warps,
+    )
+    return c
+
+
+# ---------------------------------------------------------------------------
+# Validation helpers.
+# ---------------------------------------------------------------------------
+def _compare(
+    ref: np.ndarray, got: np.ndarray
+) -> Tuple[float, float, float, float]:
+    """Return (max_abs, worst_rel, max_rel_elem, rel_l2).
+
+    Metrics (the same conventions used by ``moe_w2_sm89.self_test`` and the
+    shipped op gate):
+
+    * ``max_abs``       : max |ref - got|.
+    * ``worst_rel``     : ``max_abs / max|ref|`` -- the production-style
+                          gate (this is what the {-4,-1,1,4} kernel's
+                          ~2e-3 parity refers to).  Robust to the
+                          cancellation spikes that blow up element-wise
+                          relative error at near-zero reference outputs.
+    * ``max_rel_elem``  : max |ref-got|/|ref| over |ref|>1e-8 (element-wise
+                          relative; informational, spikes near zero).
+    * ``rel_l2``        : ||ref-got||_2 / ||ref||_2 (aggregate relative).
+    """
+    abs_diff = np.abs(ref - got)
+    max_abs = float(abs_diff.max()) if abs_diff.size else 0.0
+    ref_abs_max = float(np.abs(ref).max()) if ref.size else 0.0
+    worst_rel = (max_abs / ref_abs_max) if ref_abs_max > 0 else 0.0
+    nz = np.abs(ref) > 1e-8
+    max_rel_elem = (
+        float((abs_diff[nz] / np.abs(ref)[nz]).max()) if nz.any() else 0.0
+    )
+    denom = float(np.linalg.norm(ref))
+    rel_l2 = float(np.linalg.norm(ref - got) / denom) if denom > 0 else 0.0
+    return max_abs, worst_rel, max_rel_elem, rel_l2
+
+
+def _make_random_iq2xxs_weights(
+    n: int, k: int, seed: int = 0
+) -> np.ndarray:
+    """Random VALID IQ2_XXS byte blocks for an [N, K] weight, [N, row_bytes] uint8.
+
+    Any fp16 d + any 32 uint16 qs is a valid IQ2_XXS encoding, so we sample
+    both uniformly.  d is sampled in a sane positive fp16 range.
+    """
+    rng = np.random.default_rng(seed)
+    blocks_per_row = k // QK_K
+    row_bytes = blocks_per_row * IQ2_XXS_BLOCK_BYTES
+    out = np.zeros((n, row_bytes), dtype=np.uint8)
+    n_blocks = n * blocks_per_row
+    # d at the start of each 66-byte block.
+    d_fp16 = rng.uniform(0.001, 1.0, size=n_blocks).astype(np.float16)
+    d_bytes = d_fp16.view(np.uint8).reshape(n_blocks, 2)
+    # qs: 32 uint16 (64 bytes) per block, any pattern is valid.
+    qs = rng.integers(0, 65536, size=(n_blocks, 32), dtype=np.uint16)
+    qs_bytes = qs.view(np.uint8).reshape(n_blocks, 64)
+    # Interleave per block: [d(2), qs(64)] repeated across n_blocks.
+    blocks = np.concatenate([d_bytes, qs_bytes], axis=1)          # [n_blocks, 66]
+    blocks = blocks.reshape(n, blocks_per_row, IQ2_XXS_BLOCK_BYTES)
+    return blocks.reshape(n, row_bytes)
+
+
+def _reference(
+    a_bf16: torch.Tensor,
+    w_bytes_flat: bytes,
+    w_shape: Tuple[int, int],
+    device: torch.device,
+) -> torch.Tensor:
+    """CPU reference: dequant W (fp32) -> bf16 -> matmul fp32-accumulate.
+
+    Returns the fp32 reference C on ``device``.
+    """
+    N, K = w_shape
+    w_fp32 = dequant_iq2_xxs(w_bytes_flat, (N, K))                # numpy fp32 [N,K]
+    w_bf16 = torch.from_numpy(np.ascontiguousarray(w_fp32)).to(torch.bfloat16)
+    # A is bf16 -> .float() is a lossless widen; fp32 matmul.
+    c_ref = a_bf16.cpu().float() @ w_bf16.float().t()            # [M,N] fp32
+    return c_ref.to(device)
+
+
+def _validate_random(
+    m: int, n: int, k: int, seed: int, device: torch.device
+) -> dict:
+    """Random-IQ2_XXS validation at the given (M, N, K)."""
+    w_bytes_np = _make_random_iq2xxs_weights(n, k, seed=seed)     # [N, row_bytes]
+    w_bytes_flat = w_bytes_np.tobytes()
+    w_bytes_t = torch.from_numpy(w_bytes_np.copy())
+
+    rng = torch.Generator().manual_seed(seed + 17)
+    a_bf16 = (torch.randn(m, k, generator=rng) * 0.3).to(torch.bfloat16)
+
+    grid_t, ksigns_t = _get_luts(device)
+
+    c_tri = iq2_xxs_mm(
+        a_bf16.to(device), w_bytes_t.to(device), (n, k),
+        grid_t, ksigns_t,
+    )
+    c_ref = _reference(a_bf16, w_bytes_flat, (n, k), device)      # fp32 on device
+
+    got = c_tri.float().cpu().numpy()
+    ref = c_ref.cpu().numpy()
+    max_abs, worst_rel, max_rel_elem, rel_l2 = _compare(ref, got)
+
+    # bf16-GPU matmul reference (closest to kernel math, isolates accum order).
+    w_fp32 = dequant_iq2_xxs(w_bytes_flat, (n, k))
+    w_bf16 = torch.from_numpy(np.ascontiguousarray(w_fp32)).to(torch.bfloat16).to(device)
+    with torch.no_grad():
+        c_bf16gpu = torch.matmul(a_bf16.to(device), w_bf16.t()).float().cpu().numpy()
+    _, worst_rel_bf16, _, rel_l2_vsbf16 = _compare(c_bf16gpu, got)
+
+    return {
+        "m": m, "n": n, "k": k,
+        "max_abs": max_abs, "worst_rel": worst_rel,
+        "max_rel_elem": max_rel_elem, "rel_l2": rel_l2,
+        "worst_rel_vs_bf16gpu": worst_rel_bf16,
+        "rel_l2_vs_bf16gpu": rel_l2_vsbf16,
+        "ref_abs_max": float(np.abs(ref).max()),
+    }
+
+
+def _load_gguf_expert_bytes(
+    gguf_path: str, tensor_name_prefix: str = "blk.0.ffn_gate_exps."
+) -> Optional[Tuple[np.ndarray, Tuple[int, int]]]:
+    """Read expert-0's raw IQ2_XXS bytes for a DSv4 expert tensor.
+
+    Returns (flat_bytes_uint8, (N, K)) where N, K are chosen so that the
+    expert slab reshapes cleanly to [N, K] with K a multiple of 256 and
+    the per-expert byte count == N * (K // 256) * 66.  For DSv4
+    ``ffn_gate_exps`` dims [ne0=4096, ne1=2048, ne2=256], expert 0's slab
+    is 32768 blocks = 2,162,688 bytes; we interpret it as (N=4096, K=2048),
+    i.e. N=ne0, K=ne1 (matching the task's stated N=4096 out, K=2048 in).
+    """
+    if not os.path.exists(gguf_path):
+        return None
+    import mmap
+    with open(gguf_path, "rb") as fh:
+        with mmap.mmap(fh.fileno(), 0, prot=mmap.PROT_READ) as mm:
+            buf = bytes(mm[: 64 * 1024 * 1024])
+            tensors, data_off, _align = parse_gguf_header(buf)
+    cands = find_tensors_by_prefix(tensors, tensor_name_prefix, GGUF_TYPE_IQ2_XXS)
+    if not cands:
+        return None
+    t = cands[0]
+    # dims are [ne0, ne1, ne2]; pick N = ne0, K = ne1 (K must be multiple of 256).
+    ne = t.dims
+    if len(ne) < 2:
+        return None
+    n, k = int(ne[0]), int(ne[1])
+    if k % QK_K != 0:
+        # try the other orientation
+        n, k = int(ne[1]), int(ne[0])
+        if k % QK_K != 0:
+            return None
+    blocks_per_row = k // QK_K
+    # Per-expert byte count (one slab along the slowest dim).
+    expert_bytes = n * blocks_per_row * IQ2_XXS_BLOCK_BYTES
+    abs_off = data_off + t.offset
+    with open(gguf_path, "rb") as bf:
+        bf.seek(abs_off)
+        raw = bf.read(expert_bytes)
+    if len(raw) != expert_bytes:
+        return None
+    return np.frombuffer(raw, dtype=np.uint8).copy(), (n, k)
+
+
+def _validate_gguf(
+    gguf_path: str, m: int, device: torch.device,
+    tensor_name_prefix: str = "blk.0.ffn_gate_exps.",
+) -> Optional[dict]:
+    res = _load_gguf_expert_bytes(gguf_path, tensor_name_prefix)
+    if res is None:
+        return None
+    w_bytes_np, (n, k) = res
+    w_bytes_flat = w_bytes_np.tobytes()
+    w_bytes_t = torch.from_numpy(w_bytes_np)
+
+    rng = torch.Generator().manual_seed(123)
+    a_bf16 = (torch.randn(m, k, generator=rng) * 0.3).to(torch.bfloat16)
+
+    grid_t, ksigns_t = _get_luts(device)
+    c_tri = iq2_xxs_mm(
+        a_bf16.to(device), w_bytes_t.to(device), (n, k),
+        grid_t, ksigns_t,
+    )
+    c_ref = _reference(a_bf16, w_bytes_flat, (n, k), device)
+
+    got = c_tri.float().cpu().numpy()
+    ref = c_ref.cpu().numpy()
+    max_abs, worst_rel, max_rel_elem, rel_l2 = _compare(ref, got)
+
+    w_fp32 = dequant_iq2_xxs(w_bytes_flat, (n, k))
+    w_bf16 = torch.from_numpy(np.ascontiguousarray(w_fp32)).to(torch.bfloat16).to(device)
+    with torch.no_grad():
+        c_bf16gpu = torch.matmul(a_bf16.to(device), w_bf16.t()).float().cpu().numpy()
+    _, worst_rel_bf16, _, rel_l2_vsbf16 = _compare(c_bf16gpu, got)
+
+    return {
+        "m": m, "n": n, "k": k,
+        "max_abs": max_abs, "worst_rel": worst_rel,
+        "max_rel_elem": max_rel_elem, "rel_l2": rel_l2,
+        "worst_rel_vs_bf16gpu": worst_rel_bf16,
+        "rel_l2_vs_bf16gpu": rel_l2_vsbf16,
+        "ref_abs_max": float(np.abs(ref).max()),
+    }
+
+
+def _bench(
+    a_bf16: torch.Tensor,
+    w_bytes_t: torch.Tensor,
+    w_shape: Tuple[int, int],
+    grid_t: torch.Tensor,
+    ksigns_t: torch.Tensor,
+    device: torch.device,
+    repeats: int = 50,
+) -> Tuple[float, float, float]:
+    """Time the fused kernel vs torch.matmul (bf16). Returns (kernel_ms,
+    torch_matmul_ms, kernel_tflops)."""
+    n, k = w_shape
+    # Warmup + time fused kernel.
+    for _ in range(5):
+        iq2_xxs_mm(a_bf16, w_bytes_t, w_shape, grid_t, ksigns_t)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+        s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        s.record()
+        for _ in range(repeats):
+            iq2_xxs_mm(a_bf16, w_bytes_t, w_shape, grid_t, ksigns_t)
+        e.record()
+        torch.cuda.synchronize()
+        kernel_ms = s.elapsed_time(e) / repeats
+    else:
+        t0 = time.perf_counter()
+        for _ in range(repeats):
+            iq2_xxs_mm(a_bf16, w_bytes_t, w_shape, grid_t, ksigns_t)
+        kernel_ms = (time.perf_counter() - t0) / repeats * 1000.0
+
+    m = a_bf16.shape[0]
+    flops = 2.0 * m * n * k
+    kernel_tflops = flops / (kernel_ms / 1000.0) / 1e12
+
+    # torch.matmul reference (bf16, tensor cores).
+    w_fp32 = dequant_iq2_xxs(
+        w_bytes_t.cpu().numpy().tobytes(), (n, k)
+    )
+    w_bf16 = torch.from_numpy(np.ascontiguousarray(w_fp32)).to(torch.bfloat16).to(device)
+    a_dev = a_bf16.to(device)
+    for _ in range(5):
+        torch.matmul(a_dev, w_bf16.t())
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+        s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        s.record()
+        for _ in range(repeats):
+            torch.matmul(a_dev, w_bf16.t())
+        e.record()
+        torch.cuda.synchronize()
+        torch_ms = s.elapsed_time(e) / repeats
+    else:
+        t0 = time.perf_counter()
+        for _ in range(repeats):
+            torch.matmul(a_dev, w_bf16.t())
+        torch_ms = (time.perf_counter() - t0) / repeats * 1000.0
+
+    return kernel_ms, torch_ms, kernel_tflops
+
+
+def main(argv=None) -> int:
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--gguf", default=DEFAULT_GGUF)
+    parser.add_argument(
+        "--no-gguf", action="store_true",
+        help="skip the real-GGUF validation even if the file is present",
+    )
+    parser.add_argument(
+        "--bench", action="store_true",
+        help="also run a small kernel-vs-torch.matmul timing comparison",
+    )
+    args = parser.parse_args(argv)
+
+    if args.device.startswith("cuda") and not torch.cuda.is_available():
+        print("[iq2_xxs_mm] CUDA not available; falling back to CPU")
+        device = torch.device("cpu")
+    else:
+        device = torch.device(args.device)
+    print(f"[iq2_xxs_mm] device: {device}")
+
+    # Eagerly build + cache the LUTs (also surfaces any table error early).
+    grid_t, ksigns_t = _get_luts(device)
+    print(f"[iq2_xxs_mm] LUTs: grid {tuple(grid_t.shape)} ksigns {tuple(ksigns_t.shape)}")
+
+    overall_pass = True
+    tol_rel = 2.5e-2   # gate, same as the {-4,-1,1,4} kernel self-test.
+
+    # ----- Random validation at the two target M values -----------------
+    N, K = 4096, 2048    # DSv4 ffn_gate_exps per-expert (out, in).
+    for M in (4, 8):
+        print(f"\n=== Random IQ2_XXS GEMM  M={M}  N={N}  K={K} ===")
+        r = _validate_random(M, N, K, seed=args.seed, device=device)
+        print(f"  ref |C|_max            : {r['ref_abs_max']:.4f}")
+        print(f"  max abs diff          : {r['max_abs']:.3e}")
+        print(f"  worst_rel (prod gate) : {r['worst_rel']:.3e}   "
+              f"[= max_abs / ref |C|_max; ~2e-3 like the {-4,-1,-1,4}-bit kernel]")
+        print(f"  rel L2      (vs fp32) : {r['rel_l2']:.3e}")
+        print(f"  worst_rel vs bf16-GPU : {r['worst_rel_vs_bf16gpu']:.3e}   "
+              f"(isolates bf16-MMA accum-order)")
+        print(f"  rel L2      vs bf16   : {r['rel_l2_vs_bf16gpu']:.3e}")
+        print(f"  max_rel_elem (vs fp32): {r['max_rel_elem']:.3e}   "
+              f"[informational; spikes at near-zero ref]")
+        ok = (r["worst_rel"] < tol_rel) and np.isfinite(r["worst_rel"])
+        overall_pass = overall_pass and ok
+        print(f"  RESULT (gate {tol_rel:.0e})    : {'PASS' if ok else 'FAIL'} "
+              f"on worst_rel")
+
+    # ----- Real GGUF expert-0 validation -------------------------------
+    if not args.no_gguf:
+        print(f"\n=== Real GGUF expert-0 IQ2_XXS GEMM  (gguf={args.gguf}) ===")
+        res = _validate_gguf(args.gguf, m=8, device=device)
+        if res is None:
+            print("  [skip] GGUF not found or no IQ2_XXS expert tensor")
+        else:
+            print(f"  shape M=8 N={res['n']} K={res['k']}")
+            print(f"  ref |C|_max            : {res['ref_abs_max']:.4f}")
+            print(f"  max abs diff          : {res['max_abs']:.3e}")
+            print(f"  worst_rel (prod gate) : {res['worst_rel']:.3e}")
+            print(f"  rel L2      (vs fp32) : {res['rel_l2']:.3e}")
+            print(f"  worst_rel vs bf16-GPU : {res['worst_rel_vs_bf16gpu']:.3e}")
+            print(f"  rel L2      vs bf16   : {res['rel_l2_vs_bf16gpu']:.3e}")
+            print(f"  max_rel_elem (vs fp32): {res['max_rel_elem']:.3e}")
+            ok = (res["worst_rel"] < tol_rel) and np.isfinite(res["worst_rel"])
+            overall_pass = overall_pass and ok
+            print(f"  RESULT (gate {tol_rel:.0e})    : {'PASS' if ok else 'FAIL'} "
+                  f"on worst_rel")
+
+    # ----- Optional timing ---------------------------------------------
+    if args.bench and device.type == "cuda":
+        print(f"\n=== Timing (M=8 N={N} K={K}, bf16 tensor cores vs fused) ===")
+        w_bytes_np = _make_random_iq2xxs_weights(N, K, seed=args.seed)
+        w_bytes_t = torch.from_numpy(w_bytes_np.copy()).to(device)
+        rng = torch.Generator().manual_seed(args.seed + 17)
+        a_bf16 = (torch.randn(8, K, generator=rng) * 0.3).to(torch.bfloat16).to(device)
+        k_ms, t_ms, k_tf = _bench(
+            a_bf16, w_bytes_t, (N, K), grid_t, ksigns_t, device,
+        )
+        print(f"  fused iq2_xxs_mm : {k_ms*1000:.1f} us  ({k_tf:.3f} TFLOPS-equiv)")
+        print(f"  torch.matmul bf16: {t_ms*1000:.1f} us")
+        print(f"  HBM read (fused) : {N*(K//256)*66/1e6:.2f} MB weights @ "
+              f"2.06 bits/elem  vs  {N*K*2/1e6:.1f} MB bf16")
+
+    print(f"\n=== OVERALL: {'PASS' if overall_pass else 'FAIL'} ===")
+    return 0 if overall_pass else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
