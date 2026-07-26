@@ -1,8 +1,15 @@
 diff --git a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
-index 5f4a638..66b1b00 100644
+index 5f4a638..6374069 100644
 --- a/vllm/models/deepseek_v4/nvidia/model.py
 +++ b/vllm/models/deepseek_v4/nvidia/model.py
-@@ -70,6 +70,9 @@
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ import typing
+ from collections.abc import Callable, Iterable
+ from itertools import islice
+@@ -70,6 +71,9 @@
      DeepseekV4FlashInferSM120Attention,
  )
  from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
@@ -12,7 +19,56 @@ index 5f4a638..66b1b00 100644
  from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
  from vllm.platforms import current_platform
  from vllm.sequence import IntermediateTensors
-@@ -775,17 +778,45 @@
+@@ -141,7 +145,7 @@
+ def make_deepseek_v4_expert_params_mapping(
+     num_experts: int,
+ ) -> list[tuple[str, str, int, str]]:
+-    return [
++    base = [
+         (
+             "experts.w13_" if shard_id in ("w1", "w3") else "experts.w2_",
+             f"experts.{expert_id}.{weight_name}.",
+@@ -154,6 +158,39 @@
+             ("w2", "w2"),
+             ("w3", "w3"),
+         ]
++    ]
++    base.extend(_iq2_expert_mapping())
++    return base
++
++
++def _iq2_expert_mapping() -> list[tuple[str, str, int, str]]:
++    """Expert-mapping tuples for the VLLM_MOE_W2_IQ2=1 weight format.
++
++    The IQ2_XXS / Q2_K checkpoint (tools/convert_iq2_gguf_to_vllm.py, Step 1)
++    emits ONE fused tensor per direction with all experts concatenated on
++    axis 0, using HF-style names:
++      model.layers.{L}.mlp.experts.gate_proj.weight_iq2_xxs
++      model.layers.{L}.mlp.experts.up_proj.weight_iq2_xxs
++      model.layers.{L}.mlp.experts.down_proj.weight_q2_k
++
++    Each entry's (param_name, weight_name, expert_id=0, shard_id) tuple is
++    consumed by DeepseekV4ForCausalLM.load_weights the same way as the
++    per-expert entries above: if `weight_name` is a substring of the
++    incoming tensor name, replace it with `param_name` and dispatch to the
++    param's weight_loader. The IQ2 params carry their own fused-all-experts
++    loader (mxfp4._iq2_expert_weight_loader) that shards axis 0 by TP rank,
++    so the single entry per direction is sufficient.
++    """
++    if os.getenv("VLLM_MOE_W2_IQ2", "0") != "1":
++        return []
++    return [
++        # (param_name_substr, weight_name_substr, expert_id, shard_id)
++        ("experts.gate_weight_iq2_xxs",
++         "experts.gate_proj.weight_iq2_xxs", 0, "w1"),
++        ("experts.up_weight_iq2_xxs",
++         "experts.up_proj.weight_iq2_xxs", 0, "w3"),
++        ("experts.down_weight_q2_k",
++         "experts.down_proj.weight_q2_k", 0, "w2"),
+     ]
+ 
+ 
+@@ -775,17 +812,45 @@
              "Use FLASHINFER_MLA_SPARSE_DSV4 for DeepSeek V4 FlashInfer "
              "sparse MLA."
          )
@@ -59,3 +115,44 @@ index 5f4a638..66b1b00 100644
          return DeepseekV4FlashInferSM120Attention
      return DeepseekV4FlashMLAAttention
  
+@@ -1164,6 +1229,20 @@
+         for name, loaded_weight in weights:
+             if pad_shared_expert and ".shared_experts." in name:
+                 loaded_weight = self._pad_shared_expert_weight(name, loaded_weight)
++            # VLLM_MOE_W2_IQ2=1: the IQ2 converter (Step 1) emits two
++            # top-level LUT tensors — _lookup.iq2xxs_grid (uint64[256]) and
++            # _lookup.ksigns_iq2xs (uint8[128]) — for self-containment.
++            # Stash them in the mxfp4 module's IQ2 LUT cache (the Step 4b
++            # Triton kernel will read them; until then this just prevents
++            # the names from leaking into params_dict and KeyErrors). The
++            # same LUTs are also inlined in the kernel as a fallback.
++            if name.startswith("_lookup."):
++                if os.getenv("VLLM_MOE_W2_IQ2", "0") == "1":
++                    from vllm.model_executor.layers.quantization.mxfp4 import (
++                        _IQ2_LUTS)
++                    _IQ2_LUTS[name.removeprefix("_lookup.")] = loaded_weight
++                loaded_params.add(name)
++                continue
+             for param_name, weight_name, shard_id in stacked_params_mapping:
+                 # Skip non-stacked layers and experts (experts handled below).
+                 if ".experts." in name:
+@@ -1266,13 +1345,18 @@
+             return make_deepseek_v4_expert_params_mapping(self.config.n_routed_experts)
+         # Params for weights, fp8 weight scales, fp8 activation scales
+         # (param_name, weight_name, expert_id, shard_id)
+-        return fused_moe_make_expert_params_mapping(
++        mapping = fused_moe_make_expert_params_mapping(
+             self,
+             ckpt_gate_proj_name="w1",
+             ckpt_down_proj_name="w2",
+             ckpt_up_proj_name="w3",
+             num_experts=self.config.n_routed_experts,
+         )
++        # VLLM_MOE_W2_IQ2=1: append the fused-all-experts IQ2 entries (no-op
++        # when the env var is unset). make_deepseek_v4_expert_params_mapping
++        # already includes them via _iq2_expert_mapping().
++        mapping.extend(_iq2_expert_mapping())
++        return mapping
+ 
+     def finalize_mega_moe_weights(self) -> None:
+         for layer in islice(self.layers, self.start_layer, self.end_layer):

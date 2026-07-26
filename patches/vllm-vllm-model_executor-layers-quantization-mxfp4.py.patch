@@ -1,11 +1,164 @@
 diff --git a/vllm/model_executor/layers/quantization/mxfp4.py b/vllm/model_executor/layers/quantization/mxfp4.py
-index 5ef5fd4..02834b6 100644
+index 5ef5fd4..b8b858b 100644
 --- a/vllm/model_executor/layers/quantization/mxfp4.py
 +++ b/vllm/model_executor/layers/quantization/mxfp4.py
-@@ -620,6 +620,28 @@
+@@ -1,5 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import os
+ 
+ import torch
+ 
+@@ -35,6 +37,113 @@
+ from vllm.model_executor.utils import replace_parameter, set_weight_attrs
+ 
+ logger = init_logger(__name__)
++
++
++# ---------------------------------------------------------------------------
++# IQ2_XXS / Q2_K weight-loading path (Step 2 of the IQ2_XXS port).
++#
++# Opt-in via VLLM_MOE_W2_IQ2=1. When enabled, Mxfp4MoEMethod.create_weights
++# allocates the raw IQ2_XXS / Q2_K block tensors emitted by
++# tools/convert_iq2_gguf_to_vllm.py (Step 1) instead of the mxfp4 e2m1 packed
++# tensors, and process_weights_after_loading skips the mxfp4 plane build (which
++# would otherwise requantize to the {-4,-1,1,4} tsym4 alphabet). The Triton
++# GEMM that consumes these raw blocks is Step 4b; apply() raises a clear
++# NotImplementedError until that lands. Default (env unset) is unchanged: the
++# production {-4,-1,1,4} mxfp4 path.
++#
++# Block layout (matches utils/iq2_xxs_ref.py Step 0 + the converter):
++#   QK_K = 256 elements per block.
++#   IQ2_XXS block = 66 bytes  -> row_bytes = (in_features / QK_K) * 66
++#   Q2_K    block = 84 bytes  -> row_bytes = (in_features / QK_K) * 84
++# Per-expert storage is C-order [out_features, row_bytes]; all experts
++# concatenate on axis 0 (the TP-shard dim): TP=2 -> rank r takes
++# experts [r*128:(r+1)*128].
++# ---------------------------------------------------------------------------
++_QK_K = 256
++_IQ2_XXS_BLOCK_BYTES = 66
++_Q2_K_BLOCK_BYTES = 84
++
++# Process-wide cache for the two IQ2 LUTs that the converter emits as
++# _lookup.iq2xxs_grid (uint64[256]) and _lookup.ksigns_iq2xs (uint8[128]).
++# DeepseekV4ForCausalLM.load_weights stashes them here; the Step 4b Triton
++# kernel will read them (or fall back to its inlined copies).
++_IQ2_LUTS: dict[str, torch.Tensor] = {}
++
++
++def _iq2_enabled() -> bool:
++    """VLLM_MOE_W2_IQ2=1 gates the IQ2_XXS/Q2_K weight-loading path."""
++    return os.getenv("VLLM_MOE_W2_IQ2", "0") == "1"
++
++
++def _iq2_row_bytes(in_features: int, block_bytes: int) -> int:
++    """Bytes required to store one row of `in_features` elements given a
++    block layout of `block_bytes` bytes per QK_K elements."""
++    if in_features % _QK_K != 0:
++        raise ValueError(
++            f"IQ2 in_features ({in_features}) must be a multiple of "
++            f"QK_K ({_QK_K}); the block layout cannot span a partial "
++            "block. Use a checkpoint whose expert dims are QK_K-aligned."
++        )
++    return (in_features // _QK_K) * block_bytes
++
++
++def _iq2_expert_weight_loader(
++    param: torch.nn.Parameter,
++    loaded_weight: torch.Tensor,
++    weight_name: str,
++    shard_id: str,  # noqa: ARG001 - kept for signature parity
++    expert_id: int,  # noqa: ARG001 - kept for signature parity
++    return_success: bool = False,
++) -> bool | None:
++    """Weight loader for the fused-all-experts IQ2_XXS / Q2_K params.
++
++    The checkpoint tensor packs every expert on axis 0 with the full
++    per-expert byte layout intact (no GEMM-dim sharding — IQ2 blocks cannot
++    be split without requantizing). TP shards axis 0 (experts): for TP=t and
++    rank r, this loader copies loaded_weight[r*L:(r+1)*L] into param, where
++    L = param.shape[0] is the local expert count the layer allocated.
++
++    Args:
++        param: [local_experts, out_features, row_bytes] uint8 parameter.
++        loaded_weight: [global_experts, out_features, row_bytes] uint8 tensor
++            straight from the safetensors checkpoint.
++        weight_name: mapped param name (unused; signature parity).
++        shard_id: w1/w2/w3 (unused; the direction is encoded in the param
++            itself since gate/up/down are distinct params).
++        expert_id: per-expert id from the mapping (unused; the IQ2 mapping
++            emits a single fused entry so this is always 0).
++        return_success: when True, return a bool instead of None.
++
++    Returns:
++        True (or None) after the copy.
++    """
++    # Imported lazily so static validation (no torch.distributed init) works.
++    from vllm.distributed import (
++        get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size)
++
++    g_experts = int(loaded_weight.shape[0])
++    l_experts = int(param.shape[0])
++    if l_experts == g_experts:
++        # No expert sharding (TP=1 or experts-replicated TP).
++        shard = loaded_weight
++    elif l_experts > 0 and l_experts * get_tensor_model_parallel_world_size() \
++            == g_experts:
++        tp_rank = get_tensor_model_parallel_rank()
++        shard = loaded_weight[tp_rank * l_experts:(tp_rank + 1) * l_experts]
++    else:
++        raise ValueError(
++            f"IQ2 expert weight loader cannot satisfy param axis-0 "
++            f"({l_experts}) from checkpoint axis-0 ({g_experts}) with "
++            f"tp_size={get_tensor_model_parallel_world_size()}. The IQ2 "
++            "path shards experts on axis 0; set EP or run TP=1.")
++
++    if tuple(shard.shape) != tuple(param.shape):
++        raise ValueError(
++            f"IQ2 expert weight loader shape mismatch for {weight_name}: "
++            f"param {tuple(param.shape)} vs shard {tuple(shard.shape)} "
++            f"(shard_id={shard_id}).")
++    param.data.copy_(shard)
++    return True if return_success else None
+ 
+ 
+ class Mxfp4Config(QuantizationConfig):
+@@ -492,6 +601,16 @@
+         self.w13_precision_config = None
+         self.w2_precision_config = None
+ 
++        # VLLM_MOE_W2_IQ2=1 swaps the weight-loading path to the raw
++        # IQ2_XXS / Q2_K block layout (Step 2 of the IQ2_XXS port). When
++        # active, create_weights allocates the IQ2 params instead of the
++        # mxfp4 e2m1 packed tensors, and process_weights_after_loading
++        # skips the mxfp4 plane build (which would requantize to the
++        # {-4,-1,1,4} tsym4 alphabet). The Triton GEMM that consumes these
++        # raw blocks is Step 4b; apply() raises a clear NotImplementedError
++        # until that lands. Default (env unset) is unchanged.
++        self._iq2_active = _iq2_enabled()
++
+     @property
+     def supports_eplb(self) -> bool:
+         return True
+@@ -620,6 +739,104 @@
              )
              layer.register_parameter("w2_bias", w2_bias)
              set_weight_attrs(w2_bias, extra_weight_attrs)
++        # VLLM_MOE_W2_IQ2=1: allocate the raw IQ2_XXS / Q2_K block params
++        # instead of the mxfp4 e2m1 packed params and return early. The IQ2
++        # block layout cannot be split on GEMM dims without requantizing,
++        # so the IQ2 path keeps the full per-expert byte layout intact and
++        # shards experts on axis 0 at load time (_iq2_expert_weight_loader).
++        # Returning here also skips the mxfp4 host-RAM staging below: the
++        # IQ2 params hold raw blocks already, not {-4,-1,1,4} plane sources.
++        if self._iq2_active:
++            self._create_iq2_weights(
++                layer=layer,
++                num_experts=num_experts,
++                extra_weight_attrs=extra_weight_attrs,
++            )
++            return
 +        # VLLM_MOE_W2: the raw checkpoint experts of all layers do not fit a
 +        # single GPU; stage them in host RAM until the 2-bit planes are built
 +        # in process_weights_after_loading.
@@ -28,13 +181,84 @@ index 5ef5fd4..02834b6 100644
 +            # here OOM-killed three Ada deploy cycles with no traceback).
 +            if not moe_w2_cubit.arm_stream_build(layer):
 +                moe_w2_cubit.warn_full_staging(layer, "mxfp4 arm failed")
++
++    def _create_iq2_weights(
++        self,
++        layer: RoutedExperts,
++        num_experts: int,
++        extra_weight_attrs: dict,
++    ) -> None:
++        """Allocate raw IQ2_XXS / Q2_K block params for the Step 2 loader.
++
++        Three params are registered on `layer`, matching the safetensors
++        checkpoint emitted by tools/convert_iq2_gguf_to_vllm.py (Step 1):
++          - gate_weight_iq2_xxs  [E, intermediate, hidden/QK_K * 66]  u8
++          - up_weight_iq2_xxs    [E, intermediate, hidden/QK_K * 66]  u8
++          - down_weight_q2_k     [E, hidden, intermediate/QK_K * 84]  u8
++
++        All three are kept fused on axis 0 (experts); the per-expert byte
++        layout is intact (no GEMM-dim sharding, no dequant). The custom
++        _iq2_expert_weight_loader (attached as param.weight_loader) shards
++        axis 0 by TP rank at load time.
++
++        The IQ2_XXS/Q2_K block layout spans the FULL in_features dimension
++        (QK_K=256 elements per block), so we must use the unsharded sizes
++        from FusedMoEConfig even when the surrounding mxfp4 path would
++        shard them.
++        """
++        # Full (pre-TP-shard) in_features — block layout cannot split.
++        hidden_full = self.moe.hidden_dim
++        # self.moe.intermediate_size is the FULL intermediate; per-partition
++        # is self.moe.intermediate_size_per_partition. We need full here.
++        intermediate_full = self.moe.intermediate_size
++
++        gate_row_bytes = _iq2_row_bytes(hidden_full, _IQ2_XXS_BLOCK_BYTES)
++        up_row_bytes = _iq2_row_bytes(hidden_full, _IQ2_XXS_BLOCK_BYTES)
++        down_row_bytes = _iq2_row_bytes(intermediate_full, _Q2_K_BLOCK_BYTES)
++
++        # Sanity: shapes must match the converter output bit-for-bit.
++        # gate/up: [E, out=intermediate, row_bytes=hidden/256*66]
++        # down:    [E, out=hidden,       row_bytes=intermediate/256*84]
++        def _register(name: str, out_features: int, row_bytes: int) -> None:
++            p = torch.nn.Parameter(
++                torch.zeros(
++                    num_experts,
++                    out_features,
++                    row_bytes,
++                    dtype=torch.uint8,
++                ),
++                requires_grad=False,
++            )
++            layer.register_parameter(name, p)
++            # set_weight_attrs installs the default RoutedExperts weight
++            # loader (and any other extras); we then override it with the
++            # IQ2 fused-all-experts loader for axis-0 TP sharding.
++            set_weight_attrs(p, extra_weight_attrs)
++            p.weight_loader = _iq2_expert_weight_loader
++
++        _register("gate_weight_iq2_xxs", intermediate_full, gate_row_bytes)
++        _register("up_weight_iq2_xxs", intermediate_full, up_row_bytes)
++        _register("down_weight_q2_k", hidden_full, down_row_bytes)
++
++        # Mark the layer so process_weights_after_loading / apply can detect
++        # the IQ2 path even when the method instance is rebound (defensive).
++        layer._iq2_active = True  # type: ignore[attr-defined]
  
      def _setup_kernel(
          self,
-@@ -725,6 +747,17 @@
+@@ -725,6 +942,26 @@
              )
  
      def process_weights_after_loading(self, layer):
++        # VLLM_MOE_W2_IQ2=1: skip the mxfp4 build_layer_planes step. That
++        # step requants the loaded mxfp4 e2m1 weights into the
++        # {-4,-1,1,4} tsym4 alphabet for the cubit moe_w2_mm kernel; the
++        # IQ2 params hold raw IQ2_XXS / Q2_K blocks that must stay
++        # bit-for-bit as loaded. Step 3 (the IQ2 plane builder) and Step 4b
++        # (the Triton GEMM) will plug in here. For now we leave the raw
++        # blocks as-is — the IQ2 kernel reads them directly.
++        if self._iq2_active:
++            return
 +        # VLLM_MOE_W2: build 2-bit tensor-sym planes; skip Marlin/other backends.
 +        from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
 +        if moe_w2_cubit.is_w2_layer(getattr(layer, "layer_name", "")):
@@ -49,10 +273,21 @@ index 5ef5fd4..02834b6 100644
          w13 = layer.w13_weight
          w2 = layer.w2_weight
          w13_scale = layer.w13_weight_scale
-@@ -785,6 +818,19 @@
+@@ -785,6 +1022,30 @@
          shared_experts: SharedExperts | None,
          shared_experts_input: torch.Tensor | None,
      ) -> torch.Tensor:
++        # VLLM_MOE_W2_IQ2=1: the IQ2_XXS / Q2_K Triton GEMM is Step 4b of
++        # the port. Until it lands, surface an explicit NotImplementedError
++        # so a misconfigured serve (env set without the kernel) fails fast
++        # instead of silently routing through the mxfp4 path.
++        if self._iq2_active:
++            raise NotImplementedError(
++                "IQ2_XXS MoE GEMM (Step 4b) is not wired up yet. "
++                "VLLM_MOE_W2_IQ2=1 currently enables the weight-loading "
++                "path only (Step 2); the dispatching Triton kernel is "
++                "Step 4b. Unset VLLM_MOE_W2_IQ2 to use the production "
++                "{-4,-1,1,4} mxfp4 path.")
 +        # VLLM_MOE_W2 routed-expert path (cubit moe_w2_mm, 2-bit planes).
 +        # Shared experts are orchestrated by the MoE runner (pre/post
 +        # _maybe_apply_shared_experts); the non-modular w2 path returns only the
