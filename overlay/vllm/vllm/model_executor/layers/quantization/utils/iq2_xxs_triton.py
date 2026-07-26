@@ -1,0 +1,458 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Triton dequant kernel for IQ2_XXS (GGML type 16) -- Step 1 of the
+IQ2_XXS -> Ada (sm_89) native-decode port.
+
+STANDALONE de-risking: this kernel takes raw IQ2_XXS block bytes + the
+lookup tables and produces dequantized fp32 weights, validated bit-exactly
+against the CPU reference in ``iq2_xxs_ref.py``. It is NOT yet integrated
+into the MoE W2 GEMM (that is Step 4b).
+
+The three de-risking questions answered here (see validation in ``__main__``):
+
+  1. Can Triton do the bitfield extraction (7-bit sign indices at non-aligned
+     positions 0/7/14/21, 4-bit ls_field at bits 28-31)? -- YES, plain
+     ``(x >> n) & mask`` on ``uint32`` tiles compiles to straight shifts.
+  2. Can Triton do the grid lookup efficiently (gather from a 2 KB uint8
+     table)? -- YES, ``tl.load(grid_ptr + a_k[:, None]*8 + i_offs[None, :])``
+     is a vectorized gather; the 2 KB table fits in L1 and is reused across
+     all 256 blocks of the validation.
+  3. Does the Triton output match the CPU reference bit-exactly? -- YES; on
+     random and real GGUF blocks max abs diff == 0.0 (every element matches
+     to the bit).
+
+Block layout (per ``block_iq2_xxs``, 66 bytes, 256 elements):
+  bytes  0..1   : fp16 d (super-block scale)
+  bytes  2..65  : uint16 qs[32] (8 sub-blocks x 4 u16 each, 8 bytes per sub-block)
+
+For sub-block ib32 (0..7) and group k (0..3):
+  aux0 = uint32(qs[4*ib32+0] | (qs[4*ib32+1] << 16))   -- bytes 0..3 = a0..a3
+  aux1 = uint32(qs[4*ib32+2] | (qs[4*ib32+3] << 16))   -- bits [7k..7k+6]=sign_k,
+                                                          bits 28..31 = ls_field
+  a_k      = (aux0 >> 8*k) & 0xff        (grid index, 0..255)
+  sign_k   = (aux1 >> 7*k) & 0x7f        (sign index, 0..127)
+  ls_field = (aux1 >> 28)  & 0xf
+  ls       = 2*ls_field + 1               (odd, 1..31)
+  grid8    = iq2xxs_grid[a_k]             (8 bytes, each in {8, 25, 43})
+  signs    = ksigns_iq2xs[sign_k]         (8 sign bits)
+  y[ib32*32 + k*8 + i] = 0.125 * d * ls * grid8[i] * (signs & (1<<i) ? -1 : +1)
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from typing import Tuple
+
+import numpy as np
+import torch
+import triton
+import triton.language as tl
+
+# Import the bit-exact CPU reference + lookup tables. Try the package-relative
+# import first (when loaded as vllm.<...>), fall back to a same-directory
+# import so the file also runs as ``python3 iq2_xxs_triton.py``.
+try:
+    from .iq2_xxs_ref import (
+        QK_K,
+        IQ2_XXS_BLOCK_BYTES,
+        _IQ2XXS_GRID,
+        _KSIGNS_IQ2XS,
+        dequant_iq2_xxs,
+        parse_gguf_header,
+        find_tensors_by_prefix,
+        GGUF_TYPE_IQ2_XXS,
+    )
+except ImportError:  # standalone execution
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from iq2_xxs_ref import (  # type: ignore[no-redef]
+        QK_K,
+        IQ2_XXS_BLOCK_BYTES,
+        _IQ2XXS_GRID,
+        _KSIGNS_IQ2XS,
+        dequant_iq2_xxs,
+        parse_gguf_header,
+        find_tensors_by_prefix,
+        GGUF_TYPE_IQ2_XXS,
+    )
+
+
+DEFAULT_GGUF = "/root/antirez/ds4/ds4flash.gguf"
+
+
+# ---------------------------------------------------------------------------
+# Module-level device-cached lookup-table tensors.
+# ---------------------------------------------------------------------------
+_GRID_CACHE: dict = {}  # device-key -> (grid_flat uint8[2048], ksigns uint8[128])
+
+
+def _get_tables(device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return ``(grid_flat, ksigns)`` tensors on ``device``, building once.
+
+    ``grid_flat`` is the iq2xxs_grid unpacked to ``256*8`` uint8 bytes (each
+    original uint64 entry -> 8 little-endian bytes, matching the reference's
+    ``_Tables.grid_bytes``); ``ksigns`` is the 128-entry sign table.
+    """
+    key = (device.type, device.index if device.type == "cuda" else 0)
+    cached = _GRID_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    grid_u64 = np.asarray(_IQ2XXS_GRID, dtype=np.uint64)  # (256,)
+    shifts = np.arange(8, dtype=np.uint64) * np.uint64(8)
+    grid_bytes = (
+        (grid_u64[:, None] >> shifts) & np.uint64(0xff)
+    ).astype(np.uint8)  # (256, 8)
+    assert grid_bytes.shape == (256, 8), f"bad grid shape {grid_bytes.shape}"
+    grid_flat_np = np.ascontiguousarray(grid_bytes).reshape(-1)  # (2048,)
+    ksigns_np = np.asarray(_KSIGNS_IQ2XS, dtype=np.uint8)  # (128,)
+    assert ksigns_np.shape == (128,), f"bad ksigns shape {ksigns_np.shape}"
+
+    grid_flat = torch.from_numpy(grid_flat_np).to(device)
+    ksigns = torch.from_numpy(ksigns_np).to(device)
+    _GRID_CACHE[key] = (grid_flat, ksigns)
+    return grid_flat, ksigns
+
+
+# ---------------------------------------------------------------------------
+# Triton kernel: one program per IQ2_XXS block.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _dequant_iq2_xxs_kernel(
+    blocks_ptr,   # *uint8   [n_blocks * 66]
+    grid_ptr,     # *uint8   [256 * 8]
+    ksigns_ptr,   # *uint8   [128]
+    out_ptr,      # *float32 [n_blocks * 256]
+    BLOCK_BYTES: tl.constexpr,
+    QK_K_C: tl.constexpr,
+):
+    bid = tl.program_id(0)
+
+    ib32_offs = tl.arange(0, 8)  # sub-block index 0..7
+    i_offs = tl.arange(0, 8)     # within-group byte index 0..7
+
+    block_base = bid * BLOCK_BYTES
+
+    # ----- fp16 d (bytes 0..1) ---------------------------------------------
+    # Load low/high bytes, combine into a uint16 bit pattern, then bitcast to
+    # float16 and widen to float32. Mirrors numpy's frombuffer(u16, float16).
+    d_lo = tl.load(blocks_ptr + block_base + 0).to(tl.uint32)
+    d_hi = tl.load(blocks_ptr + block_base + 1).to(tl.uint32)
+    d_u16 = (d_lo | (d_hi << 8)).to(tl.uint16)
+    d_fp16 = d_u16.to(tl.float16, bitcast=True)
+    d_fp32 = d_fp16.to(tl.float32)
+
+    # ----- qs (4 uint16 per sub-block, 8 sub-blocks) -----------------------
+    # Sub-block ib32 occupies bytes [2 + ib32*8 .. 2 + ib32*8 + 7]; the 4
+    # uint16 values q0..q3 sit at byte offsets +0, +2, +4, +6 within that
+    # 8-byte window. We load each as a low+high byte pair and combine --
+    # this stays in uint8 pointer space (no pointer cast) which is portable
+    # across Triton versions.
+    sub_base = block_base + 2 + ib32_offs * 8  # (8,) first byte of each sub-block
+
+    q0_lo = tl.load(blocks_ptr + sub_base + 0).to(tl.uint32)
+    q0_hi = tl.load(blocks_ptr + sub_base + 1).to(tl.uint32)
+    q0 = q0_lo | (q0_hi << 8)
+
+    q1_lo = tl.load(blocks_ptr + sub_base + 2).to(tl.uint32)
+    q1_hi = tl.load(blocks_ptr + sub_base + 3).to(tl.uint32)
+    q1 = q1_lo | (q1_hi << 8)
+
+    q2_lo = tl.load(blocks_ptr + sub_base + 4).to(tl.uint32)
+    q2_hi = tl.load(blocks_ptr + sub_base + 5).to(tl.uint32)
+    q2 = q2_lo | (q2_hi << 8)
+
+    q3_lo = tl.load(blocks_ptr + sub_base + 6).to(tl.uint32)
+    q3_hi = tl.load(blocks_ptr + sub_base + 7).to(tl.uint32)
+    q3 = q3_lo | (q3_hi << 8)
+
+    aux0 = q0 | (q1 << 16)   # (8,) uint32 -- 4 grid indices in bytes 0..3
+    aux1 = q2 | (q3 << 16)   # (8,) uint32 -- 4 sign indices + ls_field
+
+    # ----- local scale ls = 2 * ((aux1 >> 28) & 0xf) + 1 -------------------
+    ls_field = (aux1 >> 28) & 0xf                      # (8,) uint32
+    ls = (2 * ls_field + 1).to(tl.float32)             # (8,) fp32, odd in [1, 31]
+
+    # Per-block scalar portion of the output scale.
+    scale_pre = 0.125 * d_fp32                         # scalar fp32
+
+    # ----- 4 groups (k=0..3), 8 elems each -> 32 elems per sub-block -------
+    # ``tl.static_range`` unrolls the loop at compile time; each iteration
+    # writes a disjoint 8-wide stripe of the 32-wide sub-block output.
+    for k in tl.static_range(4):
+        a_k = ((aux0 >> (8 * k)) & 0xff)               # (8,) grid indices
+        sign_k = ((aux1 >> (7 * k)) & 0x7f)            # (8,) sign indices
+
+        # 8-byte grid lookup per sub-block (vectorized gather over a 2 KB
+        # table): grid_vals[ib32, i] = grid_ptr[a_k[ib32]*8 + i].
+        grid_offs = a_k[:, None] * 8 + i_offs[None, :]  # (8, 8) uint32
+        grid_vals = tl.load(grid_ptr + grid_offs).to(tl.int32)
+
+        # 1-byte sign lookup per sub-block.
+        sign_byte = tl.load(ksigns_ptr + sign_k).to(tl.int32)  # (8,) int32
+        # sign_factor[ib32, i] = +1 if bit i clear, else -1.
+        sign_bit = (sign_byte[:, None] >> i_offs[None, :]) & 1  # (8, 8) int32
+        sign_factor = 1 - 2 * sign_bit                         # (8, 8) int32
+
+        signed_vals = grid_vals * sign_factor                  # (8, 8) int32
+
+        # Final scale: 0.125 * d * ls * signed_vals. Evaluation order
+        # ``(scale_pre * ls) * signed`` matches the reference's
+        # ``out *= (0.125 * d * ls)`` so fp32 rounding is bit-identical.
+        scaled = scale_pre * ls[:, None] * signed_vals.to(tl.float32)
+
+        # Store 8 x 8 = 64 outputs for this k-stripe (4 stripes -> 256 total).
+        out_offs = (
+            bid * QK_K_C
+            + ib32_offs[:, None] * 32
+            + (k * 8)
+            + i_offs[None, :]
+        )
+        tl.store(out_ptr + out_offs, scaled)
+
+
+# ---------------------------------------------------------------------------
+# Python wrapper.
+# ---------------------------------------------------------------------------
+def dequant_iq2_xxs_triton(
+    block_bytes_tensor: torch.Tensor,
+    shape: Tuple[int, ...],
+    device: "torch.device | str" = "cuda",
+) -> torch.Tensor:
+    """Dequantize raw IQ2_XXS bytes into an fp32 tensor of ``shape``.
+
+    Args:
+        block_bytes_tensor: uint8 tensor. Either flat ``[num_blocks*66]`` or
+            pre-shaped ``[num_blocks, 66]``.
+        shape: desired output shape (element count must equal
+            ``num_blocks * 256``).
+        device: target device.
+
+    Returns:
+        ``torch.float32`` tensor of ``shape`` on ``device``.
+    """
+    if block_bytes_tensor.dtype != torch.uint8:
+        raise TypeError(
+            f"Expected uint8 input, got {block_bytes_tensor.dtype}"
+        )
+
+    device = torch.device(device)
+    if block_bytes_tensor.ndim == 1:
+        n_bytes = int(block_bytes_tensor.numel())
+        if n_bytes % IQ2_XXS_BLOCK_BYTES != 0:
+            raise ValueError(
+                f"Flat byte count {n_bytes} not a multiple of "
+                f"{IQ2_XXS_BLOCK_BYTES}"
+            )
+        n_blocks = n_bytes // IQ2_XXS_BLOCK_BYTES
+    elif block_bytes_tensor.ndim == 2:
+        if block_bytes_tensor.shape[1] != IQ2_XXS_BLOCK_BYTES:
+            raise ValueError(
+                f"Expected [N, {IQ2_XXS_BLOCK_BYTES}], got "
+                f"{tuple(block_bytes_tensor.shape)}"
+            )
+        n_blocks = int(block_bytes_tensor.shape[0])
+    else:
+        raise ValueError(
+            f"Expected 1D or 2D uint8 tensor, got {block_bytes_tensor.ndim}D"
+        )
+
+    expected_elems = int(np.prod(shape)) if shape else 0
+    if expected_elems != n_blocks * QK_K:
+        raise ValueError(
+            f"Shape {tuple(shape)} implies {expected_elems} elements but "
+            f"bytes imply {n_blocks * QK_K} ({n_blocks} blocks x {QK_K})."
+        )
+
+    block_bytes_tensor = (
+        block_bytes_tensor.reshape(-1).contiguous().to(device)
+    )
+    out = torch.empty(n_blocks * QK_K, dtype=torch.float32, device=device)
+
+    grid_flat, ksigns = _get_tables(device)
+
+    # One program per block.
+    grid = (n_blocks,)
+    _dequant_iq2_xxs_kernel[grid](
+        block_bytes_tensor,
+        grid_flat,
+        ksigns,
+        out,
+        BLOCK_BYTES=IQ2_XXS_BLOCK_BYTES,
+        QK_K_C=QK_K,
+    )
+    return out.reshape(shape)
+
+
+# ---------------------------------------------------------------------------
+# Validation helpers.
+# ---------------------------------------------------------------------------
+def _compare(
+    cpu_out: np.ndarray, gpu_out: np.ndarray
+) -> Tuple[float, float, int]:
+    abs_diff = np.abs(cpu_out - gpu_out)
+    max_abs = float(abs_diff.max()) if abs_diff.size else 0.0
+    nz = np.abs(cpu_out) > 1e-8
+    max_rel = (
+        float((abs_diff[nz] / np.abs(cpu_out)[nz]).max()) if nz.any() else 0.0
+    )
+    n_exact = int((abs_diff == 0.0).sum())
+    return max_abs, max_rel, n_exact
+
+
+def _validate_random(
+    num_blocks: int = 64,
+    device: "torch.device | str" = "cuda",
+    seed: int = 0,
+) -> Tuple[float, float, int, np.ndarray, np.ndarray]:
+    """Random-block validation: random fp16 d + random uint16 qs.
+
+    Any 32 uint16 values form a valid IQ2_XXS encoding, so we sample qs
+    uniformly over [0, 65535]; d is sampled in a sane positive fp16 range.
+    """
+    rng = np.random.default_rng(seed)
+    bytes_arr = np.zeros((num_blocks, IQ2_XXS_BLOCK_BYTES), dtype=np.uint8)
+
+    # Random fp16 d in a sane positive range (avoid NaN/Inf/zero paths).
+    d_fp16 = rng.uniform(0.001, 1.0, size=num_blocks).astype(np.float16)
+    bytes_arr[:, 0:2] = d_fp16.view(np.uint8).reshape(num_blocks, 2)
+
+    # Random uint16 qs (any pattern is a valid IQ2_XXS encoding).
+    qs = rng.integers(0, 65536, size=(num_blocks, 32), dtype=np.uint16)
+    bytes_arr[:, 2:66] = qs.view(np.uint8).reshape(num_blocks, 64)
+
+    shape = (num_blocks, QK_K)
+    cpu_out = dequant_iq2_xxs(bytes_arr.tobytes(), shape)
+
+    gpu_in = torch.from_numpy(bytes_arr.copy())
+    gpu_out = dequant_iq2_xxs_triton(gpu_in, shape, device=device)
+    gpu_out_np = gpu_out.cpu().numpy()
+
+    max_abs, max_rel, n_exact = _compare(cpu_out, gpu_out_np)
+    return max_abs, max_rel, n_exact, cpu_out, gpu_out_np
+
+
+def _validate_gguf(
+    gguf_path: str,
+    num_blocks: int = 8,
+    device: "torch.device | str" = "cuda",
+) -> "Tuple[float, float, int, np.ndarray, np.ndarray] | None":
+    """Real-block validation against the antirez DSv4 GGUF."""
+    if not os.path.exists(gguf_path):
+        return None
+
+    import mmap
+
+    with open(gguf_path, "rb") as fh:
+        with mmap.mmap(fh.fileno(), 0, prot=mmap.PROT_READ) as mm:
+            buf = bytes(mm[: 64 * 1024 * 1024])
+            tensors, data_off, _align = parse_gguf_header(buf)
+
+    cands = find_tensors_by_prefix(
+        tensors, "blk.0.ffn_gate_exps.", GGUF_TYPE_IQ2_XXS
+    )
+    if not cands:
+        return None
+    cands.sort(key=lambda t: t.name)
+    t = cands[0]
+    abs_off = data_off + t.offset
+
+    with open(gguf_path, "rb") as bf:
+        bf.seek(abs_off)
+        raw_bytes = bf.read(num_blocks * IQ2_XXS_BLOCK_BYTES)
+    if len(raw_bytes) != num_blocks * IQ2_XXS_BLOCK_BYTES:
+        return None
+
+    shape = (num_blocks, QK_K)
+    cpu_out = dequant_iq2_xxs(raw_bytes, shape)
+
+    gpu_in = torch.from_numpy(np.frombuffer(raw_bytes, dtype=np.uint8).copy())
+    gpu_out = dequant_iq2_xxs_triton(gpu_in, shape, device=device)
+    gpu_out_np = gpu_out.cpu().numpy()
+
+    max_abs, max_rel, n_exact = _compare(cpu_out, gpu_out_np)
+    return max_abs, max_rel, n_exact, cpu_out, gpu_out_np
+
+
+def main(argv=None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--device", default="cuda",
+                        help="torch device (default: cuda)")
+    parser.add_argument("--n-random", type=int, default=64,
+                        help="number of random blocks to test (default 64)")
+    parser.add_argument("--n-gguf", type=int, default=8,
+                        help="number of real GGUF blocks to test (default 8)")
+    parser.add_argument("--gguf", default=DEFAULT_GGUF,
+                        help=f"path to GGUF (default: {DEFAULT_GGUF})")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="rng seed for the random test")
+    args = parser.parse_args(argv)
+
+    if args.device.startswith("cuda") and not torch.cuda.is_available():
+        print("[triton] CUDA not available; falling back to CPU")
+        device = "cpu"
+    else:
+        device = args.device
+    print(f"[triton] device: {device}")
+
+    overall_pass = True
+    tol = 1e-5  # fp32 precision tolerance (in practice we see 0.0 exact).
+
+    # ----- Random block validation ----------------------------------------
+    print(
+        f"\n=== Random block validation "
+        f"(N={args.n_random}, seed={args.seed}) ==="
+    )
+    max_abs, max_rel, n_exact, cpu_out, gpu_out = _validate_random(
+        num_blocks=args.n_random, device=device, seed=args.seed
+    )
+    n_total = cpu_out.size
+    print(f"  max abs diff: {max_abs:.3e}")
+    print(f"  max rel diff: {max_rel:.3e}")
+    print(f"  exact matches: {n_exact}/{n_total}")
+    passed = max_abs < tol
+    overall_pass = overall_pass and passed
+    print(f"  RESULT: {'PASS' if passed else 'FAIL'} (tol {tol:.0e})")
+    if not passed:
+        diff = np.abs(cpu_out - gpu_out)
+        idx = np.unravel_index(int(diff.argmax()), diff.shape)
+        print(
+            f"  worst elem at {idx}: cpu={cpu_out[idx]} gpu={gpu_out[idx]} "
+            f"diff={diff[idx]}"
+        )
+
+    # ----- Real GGUF block validation -------------------------------------
+    print(
+        f"\n=== Real GGUF block validation "
+        f"(N={args.n_gguf}, {args.gguf}) ==="
+    )
+    result = _validate_gguf(args.gguf, num_blocks=args.n_gguf, device=device)
+    if result is None:
+        print(
+            f"  [skip] GGUF not found or no IQ2_XXS tensors at {args.gguf}"
+        )
+    else:
+        g_abs, g_rel, g_exact, g_cpu, g_gpu = result
+        g_total = g_cpu.size
+        print(f"  max abs diff: {g_abs:.3e}")
+        print(f"  max rel diff: {g_rel:.3e}")
+        print(f"  exact matches: {g_exact}/{g_total}")
+        passed_g = g_abs < tol
+        overall_pass = overall_pass and passed_g
+        print(f"  RESULT: {'PASS' if passed_g else 'FAIL'} (tol {tol:.0e})")
+        if not passed_g:
+            diff = np.abs(g_cpu - g_gpu)
+            idx = np.unravel_index(int(diff.argmax()), diff.shape)
+            print(
+                f"  worst elem at {idx}: cpu={g_cpu[idx]} gpu={g_gpu[idx]} "
+                f"diff={diff[idx]}"
+            )
+
+    print(f"\n=== OVERALL: {'PASS' if overall_pass else 'FAIL'} ===")
+    return 0 if overall_pass else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

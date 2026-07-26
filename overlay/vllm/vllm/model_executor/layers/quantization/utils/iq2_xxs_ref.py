@@ -232,10 +232,18 @@ def dequant_iq2_xxs_block(block_bytes: bytes) -> np.ndarray:
         ).astype(np.int64)                                 # (8,)
 
         grid_vals = TABLES.grid_bytes[a_k]                 # (8 ib32, 8 bytes)
-        signs_mask = TABLES.ksigns[sign_k]                 # (8 ib32, 8 bits)
-        # sign[i] = -1 if (signs_mask & kmask[i]) else +1
+        signs_mask = TABLES.ksigns[sign_k]                 # (8 ib32,) uint8
+        # sign[ib32, i] = -1 if (signs_mask[ib32] & kmask[i]) else +1.
+        # NOTE: ``signs_mask[:, None]`` is required so the (8,) per-ib32 sign
+        # bytes broadcast against the (1, 8) kmask into the intended (8, 8)
+        # sign matrix. Without ``[:, None]`` numpy aligns the trailing dim
+        # of (8,) with (1, 8), collapsing to (1, 8) -- which then broadcasts
+        # the *same* (diagonal) sign pattern to every ib32 row and produces
+        # wrong signs for any block with non-trivial sign bytes. Antirez's
+        # metal reference (moe.metal:2887-2906) is the ground truth:
+        # ``grid[i] * (signs & kmask_iq2xs[i] ? -1.f : 1.f)``.
         sign_neg = (
-            (signs_mask & TABLES.kmask[None, :]) != 0
+            (signs_mask[:, None] & TABLES.kmask[None, :]) != 0
         )                                                   # (8, 8) bool
         signed = grid_vals.astype(np.int32) * np.where(
             sign_neg, np.int32(-1), np.int32(1)
