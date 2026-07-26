@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -766,6 +767,15 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     so map generic sparse-MLA choices to the DSv4-specialized attention class.
     Without an explicit backend, SM12 defaults to FlashInfer while the other
     CUDA arches keep the FlashMLA path.
+
+    Ada (pre-SM90) bf16-KV escape hatch: setting ``VLLM_DSV4_ADA_BF16_KV=1``
+    overrides the default fp8_ds_mla SM120 attention class and selects
+    ``DeepseekV4FlashInferMLAAttention`` (``use_fp8_ds_mla_layout=False``),
+    whose Triton sparse-MLA / SWA-insert kernels have a complete bf16 branch.
+    The operator must also pass ``--kv-cache-dtype auto`` (or ``bfloat16``);
+    with the default ``--kv-cache-dtype fp8`` the resolver would instead pick
+    per-tensor fp8 E4M3 (still valid, but not bf16). The fp8_ds_mla default is
+    unchanged when the env var is unset / ``"0"``.
     """
     backend = vllm_config.attention_config.backend
     device_capability = current_platform.get_device_capability()
@@ -779,6 +789,17 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
             "sparse MLA."
         )
     pre_sm90 = device_capability is not None and device_capability.major < 9
+    # Ada bf16-KV escape hatch (opt-in). See docstring above.
+    if (pre_sm90
+            and os.environ.get("VLLM_DSV4_ADA_BF16_KV", "0") == "1"):
+        logger.info_once(
+            "DeepseekV4 attention: VLLM_DSV4_ADA_BF16_KV=1 on sm_%d%d - "
+            "selecting DeepseekV4FlashInferMLAAttention (bf16 KV row; "
+            "use_fp8_ds_mla_layout=False). Requires --kv-cache-dtype "
+            "auto/bfloat16; the fp8_ds_mla default is overridden only "
+            "when this env var is set.",
+            device_capability.major, device_capability.minor)
+        return DeepseekV4FlashInferMLAAttention
     if backend == AttentionBackendEnum.FLASHINFER_MLA_SPARSE_DSV4:
         if device_capability is not None and (
                 device_capability.major == 12 or pre_sm90):
