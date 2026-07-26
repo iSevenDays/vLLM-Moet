@@ -1,8 +1,8 @@
 diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
-index ceb52e5..34d38a1 100644
+index ceb52e5..d7be66a 100644
 --- a/vllm/model_executor/layers/sparse_attn_indexer.py
 +++ b/vllm/model_executor/layers/sparse_attn_indexer.py
-@@ -1,6 +1,8 @@
+@@ -1,13 +1,18 @@
  # SPDX-License-Identifier: Apache-2.0
  # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
  """Custom Sparse Attention Indexer layers."""
@@ -11,7 +11,18 @@ index ceb52e5..34d38a1 100644
  
  import torch
  
-@@ -34,6 +36,12 @@
+ import vllm.envs as envs
+ from vllm import _custom_ops as ops
+ from vllm._aiter_ops import rocm_aiter_ops
+-from vllm.compilation.breakable_cudagraph import eager_break_during_capture
++from vllm.compilation.breakable_cudagraph import (
++    BreakableCUDAGraphCapture,
++    eager_break_during_capture,
++)
+ from vllm.config import get_current_vllm_config
+ from vllm.distributed import get_dcp_group
+ from vllm.forward_context import get_forward_context
+@@ -34,6 +39,12 @@
      DeepseekV32IndexerMetadata,
  )
  from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
@@ -24,7 +35,45 @@ index ceb52e5..34d38a1 100644
  from vllm.v1.worker.workspace import current_workspace_manager
  
  logger = init_logger(__name__)
-@@ -291,6 +299,36 @@
+@@ -42,6 +53,37 @@
+ 
+ # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
+ MXFP4_BLOCK_SIZE = 32
++
++
++def _in_cudagraph_capture() -> bool:
++    """Return True iff the current forward is part of a CUDA graph capture.
++
++    Distinguishes the *init-time profiling* forward (eager; vLLM's
++    ``profile_run`` passes ``force_eager=is_profile`` in
++    ``gpu_model_runner._dummy_run``) from every subsequent *capture* forward.
++
++    Two signals are OR'd so the call is correct under every cudagraph mode:
++
++    1. ``torch.cuda.is_current_stream_capturing()`` covers FULL-mode capture
++       (and the non-breakable PIECEWISE path), where the indexer body runs
++       inside ``torch.cuda.graph(...)`` -- see
++       ``vllm/compilation/cuda_graph.py`` and ``graph_capture`` in
++       ``vllm/distributed/parallel_state.py``.
++    2. ``BreakableCUDAGraphCapture.is_active()`` covers the breakable
++       PIECEWISE path, which DeepSeek-V4 auto-enables
++       (``vllm/config/vllm.py`` forces ``VLLM_USE_BREAKABLE_CUDAGRAPH=1`` for
++       ``DeepseekV4ForCausalLM``). There the ``@eager_break_during_capture``
++       decorator on ``sparse_attn_indexer`` ends the current capture segment
++       and runs the indexer eagerly as an "eager break" -- the stream is not
++       capturing at that moment, but the outer capture context is still on
++       the thread-local.
++
++    The init profiling forward trips neither signal: it runs eagerly and no
++    ``BreakableCUDAGraphCapture`` has been entered yet.
++    """
++    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
++        return True
++    return BreakableCUDAGraphCapture.is_active()
+ 
+ 
+ def _assert_cutedsl_dcp_merge_supported(
+@@ -291,6 +333,36 @@
      return kv_cache.unsqueeze(-2)
  
  
@@ -61,7 +110,7 @@ index ceb52e5..34d38a1 100644
  @eager_break_during_capture
  def sparse_attn_indexer(
      hidden_states: torch.Tensor,
-@@ -313,6 +351,8 @@
+@@ -313,6 +385,8 @@
      dcp_world_size: int = 1,
      cp_kv_cache_interleave_size: int = 1,
      skip_topk_buffer_clear: bool = False,
@@ -70,7 +119,65 @@ index ceb52e5..34d38a1 100644
  ) -> torch.Tensor:
      # careful! this will be None in dummy run
      attn_metadata = get_forward_context().attn_metadata
-@@ -355,6 +395,9 @@
+@@ -332,11 +406,52 @@
+         )
+ 
+         # Dummy allocation to simulate for peak logits tensor memory during inference.
+-        # FP8 elements so elements == bytes
+-        max_logits_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+-        _ = torch.empty(
+-            max_logits_elems, dtype=torch.uint8, device=hidden_states.device
+-        )
++        # FP8 elements so elements == bytes.
++        #
++        # moET (Ada sm_89) note: this same non-dict ("fake") branch fires in
++        # TWO unrelated contexts, and the dummy must NOT be allocated in both:
++        #
++        #   (a) Init-time profiling forward (``profile_run``). The deferred FP4
++        #       delta pool (see ``moe_w2_delta.py`` / ``moe_w2_cubit.py``) is
++        #       sized to consume the VRAM vLLM leaves free AFTER the indexer
++        #       workspace has been reserved. The full
++        #       VLLM_SPARSE_INDEXER_MAX_LOGITS_MB (default 512 MiB) MUST be
++        #       allocated here so vLLM under-sizes the KV cache and leaves
++        #       room for both the indexer peak and the ~1.5 GiB FP4 pool.
++        #       Breaking this shrinks the pool below 256 slots.
++        #   (b) CUDA-graph CAPTURE forwards (``capture_model`` /
++        #       ``profile_cudagraph_memory``). The FP4 pool is already
++        #       materialised by the time these run, so allocating another
++        #       512 MiB here tips Ada over: "CUDA out of memory: Tried to
++        #       allocate 512.00 MiB" (reproduced across 5 boots). Capture
++        #       batches are tiny (``cudagraph_capture_sizes``), so the real
++        #       peak-logits tensor at capture is a few MiB -- the 512 MiB
++        #       reservation is pure waste.
++        #
++        # ``_in_cudagraph_capture()`` cleanly distinguishes the two: profile
++        # runs eagerly (no capturing, no BreakableCUDAGraphCapture), while
++        # every capture forward runs either inside ``torch.cuda.graph(...)``
++        # or inside a ``BreakableCUDAGraphCapture`` context. Gated by
++        # ``VLLM_DSV4_INDEXER_SKIP_CAPTURE_DUMMY`` (default "1" -- skip during
++        # capture); set to "0" to restore the unconditional reservation.
++        skip_capture_dummy = os.getenv(
++            "VLLM_DSV4_INDEXER_SKIP_CAPTURE_DUMMY", "1"
++        ) in ("1", "true", "True", "TRUE")
++        if skip_capture_dummy and _in_cudagraph_capture():
++            # Capture path: the indexer's genuine peak-logits tensor at
++            # capture batch sizes is tiny (queries * compressed_keys * 4 B);
++            # the profile run already accounted for peak memory.
++            max_logits_elems = 0
++        else:
++            max_logits_elems = (
++                envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
++            )
++        if max_logits_elems > 0:
++            _ = torch.empty(
++                max_logits_elems,
++                dtype=torch.uint8,
++                device=hidden_states.device,
++            )
+ 
+         return sparse_attn_indexer_fake(
+             hidden_states,
+@@ -355,6 +470,9 @@
              topk_indices_buffer,
              skip_k_cache_insert,
              use_fp4_cache,
@@ -80,7 +187,7 @@ index ceb52e5..34d38a1 100644
          )
      attn_metadata_narrowed = attn_metadata[k_cache_prefix]
      assert isinstance(attn_metadata_narrowed, DeepseekV32IndexerMetadata)
-@@ -493,6 +536,17 @@
+@@ -493,6 +611,17 @@
                  row_starts=chunk.cu_seqlen_ks,
              )
  
@@ -98,7 +205,7 @@ index ceb52e5..34d38a1 100644
      if has_decode:
          decode_metadata = attn_metadata_narrowed.decode
          assert decode_metadata is not None
-@@ -570,17 +624,29 @@
+@@ -570,17 +699,29 @@
                  clean_logits=False,
              )
          num_rows = logits.shape[0]
@@ -131,7 +238,7 @@ index ceb52e5..34d38a1 100644
              512,
              1024,
              2048,
-@@ -595,7 +661,7 @@
+@@ -595,7 +736,7 @@
                  seq_lens,
                  topk_indices,
                  topk_workspace,
@@ -140,7 +247,7 @@ index ceb52e5..34d38a1 100644
                  attn_metadata_narrowed.max_seq_len,
              )
          elif use_persistent_topk:
-@@ -608,8 +674,8 @@
+@@ -608,8 +749,8 @@
                  seq_lens,
                  topk_indices,
                  topk_workspace,
@@ -151,7 +258,7 @@ index ceb52e5..34d38a1 100644
              )
          else:
              ops.top_k_per_row_decode(
-@@ -620,7 +686,33 @@
+@@ -620,7 +761,33 @@
                  num_rows,
                  logits.stride(0),
                  logits.stride(1),
@@ -186,7 +293,7 @@ index ceb52e5..34d38a1 100644
              )
  
          if decode_metadata.global_seq_lens is not None:
-@@ -668,6 +760,8 @@
+@@ -668,6 +835,8 @@
      dcp_world_size: int = 1,
      cp_kv_cache_interleave_size: int = 1,
      skip_topk_buffer_clear: bool = False,
@@ -195,7 +302,7 @@ index ceb52e5..34d38a1 100644
  ) -> torch.Tensor:
      return topk_indices_buffer
  
-@@ -731,6 +825,46 @@
+@@ -731,6 +900,46 @@
                  "the current vLLM environment."
              )
  
@@ -242,7 +349,7 @@ index ceb52e5..34d38a1 100644
      def forward_native(
          self,
          hidden_states: torch.Tensor,
-@@ -781,6 +915,7 @@
+@@ -781,6 +990,7 @@
              self.dcp_rank,
              self.dcp_world_size,
              self.cp_kv_cache_interleave_size,
@@ -250,7 +357,7 @@ index ceb52e5..34d38a1 100644
          )
  
      def forward_xpu(
-@@ -800,6 +935,9 @@
+@@ -800,6 +1010,9 @@
          weights: torch.Tensor,
      ):
          assert not self.use_fp4_cache, "AMD platform doesn't support fp4 cache yet"

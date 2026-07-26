@@ -9,7 +9,10 @@ import torch
 import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
-from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.compilation.breakable_cudagraph import (
+    BreakableCUDAGraphCapture,
+    eager_break_during_capture,
+)
 from vllm.config import get_current_vllm_config
 from vllm.distributed import get_dcp_group
 from vllm.forward_context import get_forward_context
@@ -50,6 +53,37 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
+
+
+def _in_cudagraph_capture() -> bool:
+    """Return True iff the current forward is part of a CUDA graph capture.
+
+    Distinguishes the *init-time profiling* forward (eager; vLLM's
+    ``profile_run`` passes ``force_eager=is_profile`` in
+    ``gpu_model_runner._dummy_run``) from every subsequent *capture* forward.
+
+    Two signals are OR'd so the call is correct under every cudagraph mode:
+
+    1. ``torch.cuda.is_current_stream_capturing()`` covers FULL-mode capture
+       (and the non-breakable PIECEWISE path), where the indexer body runs
+       inside ``torch.cuda.graph(...)`` -- see
+       ``vllm/compilation/cuda_graph.py`` and ``graph_capture`` in
+       ``vllm/distributed/parallel_state.py``.
+    2. ``BreakableCUDAGraphCapture.is_active()`` covers the breakable
+       PIECEWISE path, which DeepSeek-V4 auto-enables
+       (``vllm/config/vllm.py`` forces ``VLLM_USE_BREAKABLE_CUDAGRAPH=1`` for
+       ``DeepseekV4ForCausalLM``). There the ``@eager_break_during_capture``
+       decorator on ``sparse_attn_indexer`` ends the current capture segment
+       and runs the indexer eagerly as an "eager break" -- the stream is not
+       capturing at that moment, but the outer capture context is still on
+       the thread-local.
+
+    The init profiling forward trips neither signal: it runs eagerly and no
+    ``BreakableCUDAGraphCapture`` has been entered yet.
+    """
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        return True
+    return BreakableCUDAGraphCapture.is_active()
 
 
 def _assert_cutedsl_dcp_merge_supported(
@@ -372,11 +406,52 @@ def sparse_attn_indexer(
         )
 
         # Dummy allocation to simulate for peak logits tensor memory during inference.
-        # FP8 elements so elements == bytes
-        max_logits_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
-        _ = torch.empty(
-            max_logits_elems, dtype=torch.uint8, device=hidden_states.device
-        )
+        # FP8 elements so elements == bytes.
+        #
+        # moET (Ada sm_89) note: this same non-dict ("fake") branch fires in
+        # TWO unrelated contexts, and the dummy must NOT be allocated in both:
+        #
+        #   (a) Init-time profiling forward (``profile_run``). The deferred FP4
+        #       delta pool (see ``moe_w2_delta.py`` / ``moe_w2_cubit.py``) is
+        #       sized to consume the VRAM vLLM leaves free AFTER the indexer
+        #       workspace has been reserved. The full
+        #       VLLM_SPARSE_INDEXER_MAX_LOGITS_MB (default 512 MiB) MUST be
+        #       allocated here so vLLM under-sizes the KV cache and leaves
+        #       room for both the indexer peak and the ~1.5 GiB FP4 pool.
+        #       Breaking this shrinks the pool below 256 slots.
+        #   (b) CUDA-graph CAPTURE forwards (``capture_model`` /
+        #       ``profile_cudagraph_memory``). The FP4 pool is already
+        #       materialised by the time these run, so allocating another
+        #       512 MiB here tips Ada over: "CUDA out of memory: Tried to
+        #       allocate 512.00 MiB" (reproduced across 5 boots). Capture
+        #       batches are tiny (``cudagraph_capture_sizes``), so the real
+        #       peak-logits tensor at capture is a few MiB -- the 512 MiB
+        #       reservation is pure waste.
+        #
+        # ``_in_cudagraph_capture()`` cleanly distinguishes the two: profile
+        # runs eagerly (no capturing, no BreakableCUDAGraphCapture), while
+        # every capture forward runs either inside ``torch.cuda.graph(...)``
+        # or inside a ``BreakableCUDAGraphCapture`` context. Gated by
+        # ``VLLM_DSV4_INDEXER_SKIP_CAPTURE_DUMMY`` (default "1" -- skip during
+        # capture); set to "0" to restore the unconditional reservation.
+        skip_capture_dummy = os.getenv(
+            "VLLM_DSV4_INDEXER_SKIP_CAPTURE_DUMMY", "1"
+        ) in ("1", "true", "True", "TRUE")
+        if skip_capture_dummy and _in_cudagraph_capture():
+            # Capture path: the indexer's genuine peak-logits tensor at
+            # capture batch sizes is tiny (queries * compressed_keys * 4 B);
+            # the profile run already accounted for peak memory.
+            max_logits_elems = 0
+        else:
+            max_logits_elems = (
+                envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+            )
+        if max_logits_elems > 0:
+            _ = torch.empty(
+                max_logits_elems,
+                dtype=torch.uint8,
+                device=hidden_states.device,
+            )
 
         return sparse_attn_indexer_fake(
             hidden_states,
