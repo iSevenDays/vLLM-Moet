@@ -1245,14 +1245,24 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # cause to the IQ2 GEMM vs the attention path proper).
             if _iq2_nan_check:
                 if bool((~torch.isfinite(expert_out)).any()):
+                    # Distinguish Inf (overflow, e.g. down acc > bf16 max
+                    # from a saturating mid) from NaN (0/0 or inf-inf).
+                    out_isnan = bool(torch.isnan(expert_out).any())
+                    out_isinf = bool(torch.isinf(expert_out).any())
                     logger.error(
                         "IQ2 non-finite expert_out: local_expert=%s M=%s "
-                        "gate|up|mid|out finite=%s/%s/%s/%s max=%s",
+                        "gate|up|mid|out finite=%s/%s/%s/%s "
+                        "out_nan=%s out_inf=%s "
+                        "max|gate|=%s max|up|=%s max|mid|=%s max|out|=%s",
                         expert_id, int(x_e.shape[0]),
                         bool(torch.isfinite(gate_out).all()),
                         bool(torch.isfinite(up_out).all()),
                         bool(torch.isfinite(mid).all()),
                         bool(torch.isfinite(expert_out).all()),
+                        out_isnan, out_isinf,
+                        float(gate_out.abs().max()),
+                        float(up_out.abs().max()),
+                        float(mid.abs().max()),
                         float(expert_out.abs().max()))
                     gate_out = torch.nan_to_num(gate_out)
                     up_out = torch.nan_to_num(up_out)
