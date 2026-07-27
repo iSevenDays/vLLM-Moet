@@ -1,5 +1,5 @@
 diff --git a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
-index 5f4a638..1e13de3 100644
+index 5f4a638..b435678 100644
 --- a/vllm/models/deepseek_v4/nvidia/model.py
 +++ b/vllm/models/deepseek_v4/nvidia/model.py
 @@ -1,5 +1,6 @@
@@ -99,7 +99,23 @@ index 5f4a638..1e13de3 100644
          return DeepseekV4FlashInferSM120Attention
      return DeepseekV4FlashMLAAttention
  
-@@ -1164,6 +1213,20 @@
+@@ -1141,6 +1190,15 @@
+         ]
+         params_dict = dict(self.named_parameters())
+         loaded_params: set[str] = set()
++        # (post-mapping-name, shard_id) tuples for the stacked-params path.
++        # Needed because the same fused param name (e.g.
++        # layers.0.attn.fused_wqa_wkv.weight) is loaded from MULTIPLE shards
++        # (wq_a=shard 0, wkv=shard 1) and we must not skip the second shard
++        # just because the first completed. We DO want to skip the bf16-overlay
++        # file's duplicate yield of the same shard (the fp8 shards still hold
++        # wq_a.weight/wkv.weight and would otherwise overwrite the bf16 values
++        # via a dtype-cast copy_).
++        loaded_shards: set[tuple[str, int]] = set()
+ 
+         # TP for attention
+         tp_size = get_tensor_model_parallel_world_size()
+@@ -1164,6 +1222,20 @@
          for name, loaded_weight in weights:
              if pad_shared_expert and ".shared_experts." in name:
                  loaded_weight = self._pad_shared_expert_weight(name, loaded_weight)
@@ -120,7 +136,38 @@ index 5f4a638..1e13de3 100644
              for param_name, weight_name, shard_id in stacked_params_mapping:
                  # Skip non-stacked layers and experts (experts handled below).
                  if ".experts." in name:
-@@ -1197,6 +1260,16 @@
+@@ -1174,9 +1246,30 @@
+ 
+                 if is_pp_missing_parameter(name, self):
+                     break
++                # Fp8Config.ignored_layers path (e.g. the Q8_0-bf16 non-MoE
++                # hypothesis test): when an attention/shared-experts Linear is
++                # listed in ignored_layers it loads as UnquantizedLinearMethod
++                # (bf16 weight, NO weight_scale_inv). The fp8 shards still
++                # carry the .scale (renamed .weight_scale_inv) tensors, which
++                # the safetensors iterator yields by file key -- skipping them
++                # here avoids a KeyError on the unmapped scale name.
++                if name not in params_dict:
++                    break
++                # First-yield-wins per (name, shard_id): the bf16 overlay
++                # shard (dsv4_nonmoe_bf16.safetensors) sorts before the fp8
++                # model-* shards, so each shard loads from bf16 first. The fp8
++                # shard still yields the same key (its bytes are unchanged)
++                # and would otherwise overwrite the bf16 values via a
++                # dtype-cast copy_. We must key on (name, shard_id) -- not
++                # name alone -- because fused modules like fused_wqa_wkv
++                # receive multiple distinct shards (wq_a=0, wkv=1) under the
++                # SAME fused name, and all of them must load.
++                if (name, shard_id) in loaded_shards:
++                    break
+                 param = params_dict[name]
+                 weight_loader = param.weight_loader
+                 weight_loader(param, loaded_weight, shard_id)
++                loaded_shards.add((name, shard_id))
+                 loaded_params.add(name)
+                 break
+             else:
+@@ -1197,6 +1290,16 @@
                          name_mapped = name.replace(weight_name, param_name)
                          if is_pp_missing_parameter(name_mapped, self):
                              continue
@@ -137,7 +184,7 @@ index 5f4a638..1e13de3 100644
                          param = params_dict[name_mapped]
                          # We should ask the weight loader to return success or not
                          # here since otherwise we may skip experts with other
-@@ -1215,7 +1288,10 @@
+@@ -1215,7 +1318,10 @@
                          if success:
                              name = name_mapped
                              break
@@ -149,7 +196,27 @@ index 5f4a638..1e13de3 100644
                      continue
                  elif "attn_sink" in name:
                      if is_pp_missing_parameter(name, self):
-@@ -1235,6 +1311,25 @@
+@@ -1228,6 +1334,19 @@
+                 else:
+                     if is_pp_missing_parameter(name, self):
+                         continue
++                    # Same ignored_layers skip as above, for the non-stacked
++                    # path (e.g. wq_b.weight_scale_inv, wo_a.weight_scale_inv
++                    # for layers in Fp8Config.ignored_layers -- the loader
++                    # yields these from the fp8 shards but the unquantized
++                    # Linear has no scale param).
++                    if name not in params_dict:
++                        continue
++                    # First-yield-wins (same rationale as the stacked branch
++                    # above): the bf16 overlay shard loads before the fp8
++                    # shards; skip the fp8 duplicate so it does not overwrite
++                    # the bf16 weights via a dtype-cast copy_.
++                    if name in loaded_params:
++                        continue
+                     param = params_dict[name]
+                     weight_loader = getattr(
+                         param, "weight_loader", default_weight_loader
+@@ -1235,6 +1354,25 @@
                      weight_loader(param, loaded_weight)
                      loaded_params.add(name)
                      continue
@@ -175,7 +242,7 @@ index 5f4a638..1e13de3 100644
  
          return loaded_params
  
-@@ -1266,13 +1361,18 @@
+@@ -1266,13 +1404,18 @@
              return make_deepseek_v4_expert_params_mapping(self.config.n_routed_experts)
          # Params for weights, fp8 weight scales, fp8 activation scales
          # (param_name, weight_name, expert_id, shard_id)
@@ -195,7 +262,7 @@ index 5f4a638..1e13de3 100644
  
      def finalize_mega_moe_weights(self) -> None:
          for layer in islice(self.layers, self.start_layer, self.end_layer):
-@@ -1437,8 +1537,95 @@
+@@ -1437,8 +1580,95 @@
          return getattr(self.model, "_mtp_hidden_buffer", None)
  
      def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

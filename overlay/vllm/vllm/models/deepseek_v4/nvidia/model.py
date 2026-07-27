@@ -1190,6 +1190,15 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         ]
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        # (post-mapping-name, shard_id) tuples for the stacked-params path.
+        # Needed because the same fused param name (e.g.
+        # layers.0.attn.fused_wqa_wkv.weight) is loaded from MULTIPLE shards
+        # (wq_a=shard 0, wkv=shard 1) and we must not skip the second shard
+        # just because the first completed. We DO want to skip the bf16-overlay
+        # file's duplicate yield of the same shard (the fp8 shards still hold
+        # wq_a.weight/wkv.weight and would otherwise overwrite the bf16 values
+        # via a dtype-cast copy_).
+        loaded_shards: set[tuple[str, int]] = set()
 
         # TP for attention
         tp_size = get_tensor_model_parallel_world_size()
@@ -1237,9 +1246,30 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
                 if is_pp_missing_parameter(name, self):
                     break
+                # Fp8Config.ignored_layers path (e.g. the Q8_0-bf16 non-MoE
+                # hypothesis test): when an attention/shared-experts Linear is
+                # listed in ignored_layers it loads as UnquantizedLinearMethod
+                # (bf16 weight, NO weight_scale_inv). The fp8 shards still
+                # carry the .scale (renamed .weight_scale_inv) tensors, which
+                # the safetensors iterator yields by file key -- skipping them
+                # here avoids a KeyError on the unmapped scale name.
+                if name not in params_dict:
+                    break
+                # First-yield-wins per (name, shard_id): the bf16 overlay
+                # shard (dsv4_nonmoe_bf16.safetensors) sorts before the fp8
+                # model-* shards, so each shard loads from bf16 first. The fp8
+                # shard still yields the same key (its bytes are unchanged)
+                # and would otherwise overwrite the bf16 values via a
+                # dtype-cast copy_. We must key on (name, shard_id) -- not
+                # name alone -- because fused modules like fused_wqa_wkv
+                # receive multiple distinct shards (wq_a=0, wkv=1) under the
+                # SAME fused name, and all of them must load.
+                if (name, shard_id) in loaded_shards:
+                    break
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+                loaded_shards.add((name, shard_id))
                 loaded_params.add(name)
                 break
             else:
@@ -1303,6 +1333,19 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     continue
                 else:
                     if is_pp_missing_parameter(name, self):
+                        continue
+                    # Same ignored_layers skip as above, for the non-stacked
+                    # path (e.g. wq_b.weight_scale_inv, wo_a.weight_scale_inv
+                    # for layers in Fp8Config.ignored_layers -- the loader
+                    # yields these from the fp8 shards but the unquantized
+                    # Linear has no scale param).
+                    if name not in params_dict:
+                        continue
+                    # First-yield-wins (same rationale as the stacked branch
+                    # above): the bf16 overlay shard loads before the fp8
+                    # shards; skip the fp8 duplicate so it does not overwrite
+                    # the bf16 weights via a dtype-cast copy_.
+                    if name in loaded_params:
                         continue
                     param = params_dict[name]
                     weight_loader = getattr(
