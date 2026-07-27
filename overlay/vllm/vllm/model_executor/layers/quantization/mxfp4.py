@@ -142,6 +142,22 @@ def _iq2_expert_weight_loader(
             f"IQ2 expert weight loader shape mismatch for {weight_name}: "
             f"param {tuple(param.shape)} vs shard {tuple(shard.shape)} "
             f"(shard_id={shard_id}).")
+    # Observability: confirm the loader fires + the shard is non-zero. The
+    # silent failure mode (mapping mismatch leaves params at their init zeros)
+    # otherwise shows up only as zero MoE output much later, costing a full
+    # boot + probe cycle to diagnose.
+    if os.getenv("VLLM_MOE_W2_IQ2_DIAG", "0") == "1":
+        try:
+            nonzero = int((shard != 0).sum().item())
+            total = int(shard.numel())
+            smax = int(shard.max()) if total else 0
+            logger.info(
+                "IQ2 LOADER: %s param.shape=%s shard.shape=%s "
+                "nonzero=%d/%d (%.4f) shard.max=%d",
+                weight_name, tuple(param.shape), tuple(shard.shape),
+                nonzero, total, nonzero / max(total, 1), smax)
+        except Exception:  # noqa: BLE001
+            pass
     param.data.copy_(shard)
     return True if return_success else None
 
@@ -1114,13 +1130,44 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         from vllm.model_executor.layers.quantization.utils import (
             iq2_xxs_mm_triton, q2_k_mm_triton)
 
-        _iq2_nan_check = os.getenv("VLLM_MOE_W2_IQ2_NAN_CHECK", "0") == "1"
+        # NAN_CHECK: default ON for in-flight diagnostics (was opt-in). When
+        # a per-expert GEMM emits non-finite values, CLAMP and log loudly so
+        # the boot survives and the offending expert is identified. Set
+        # VLLM_MOE_W2_IQ2_NAN_CHECK=0 to disable.
+        _iq2_nan_check = os.getenv("VLLM_MOE_W2_IQ2_NAN_CHECK", "1") != "0"
+        # DIAG: log per-call stats for the first N calls per process so we
+        # can inspect live activations + output without flooding logs.
+        _iq2_diag = os.getenv("VLLM_MOE_W2_IQ2_DIAG", "0") == "1"
+        global _IQ2_FWD_CALL_COUNT
+        try:
+            _IQ2_FWD_CALL_COUNT += 1
+        except NameError:
+            _IQ2_FWD_CALL_COUNT = 1
+        _do_diag = _iq2_diag and _IQ2_FWD_CALL_COUNT <= int(
+            os.getenv("VLLM_MOE_W2_IQ2_DIAG_N", "12"))
 
         num_tokens, hidden = x.shape
         device = x.device
         topk = topk_ids.shape[1]
         out = torch.zeros(
             num_tokens, hidden, dtype=torch.float32, device=device)
+
+        if _do_diag:
+            try:
+                x_finite = bool(torch.isfinite(x).all())
+                logger.info(
+                    "IQ2 DIAG call#%d entry: layer=%s num_tokens=%s hidden=%s "
+                    "topk=%s x.dtype=%s x.max=%s x.min=%s x.finite=%s "
+                    "topk_ids.max=%s topk_ids.min=%s topk_weights.finite=%s",
+                    _IQ2_FWD_CALL_COUNT, getattr(layer, "layer_name", "?"),
+                    num_tokens, hidden, topk, x.dtype,
+                    float(x.abs().max()) if x.numel() else 0.0,
+                    float(x.min()) if x.numel() else 0.0, x_finite,
+                    int(topk_ids.max()) if topk_ids.numel() else -1,
+                    int(topk_ids.min()) if topk_ids.numel() else -1,
+                    bool(torch.isfinite(topk_weights).all()))
+            except Exception:  # noqa: BLE001
+                pass
 
         if num_tokens == 0:
             return out.to(torch.bfloat16)
@@ -1214,10 +1261,19 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             counts.cumsum(0).to(torch.long),
         ])
 
-        for i in range(int(uniq.numel())):
-            expert_id = int(uniq[i].item())
-            s = int(offsets[i].item())
-            e = int(offsets[i + 1].item())
+        # Hoist the GPU→CPU syncs OUT of the per-expert loop. Under EP each
+        # rank owns different experts/tokens, so per-iteration .item() syncs
+        # fire at different points on each rank → the ranks desynchronize →
+        # the end-of-forward TP all-reduce deadlocks (the 11-min
+        # shm_broadcast stall). Precompute the expert/offset lists ONCE (2
+        # syncs total) so the loop body is sync-free and both ranks reach the
+        # all-reduce together.
+        uniq_list = uniq.tolist()
+        offsets_list = offsets.tolist()
+        for i in range(len(uniq_list)):
+            expert_id = uniq_list[i]
+            s = offsets_list[i]
+            e = offsets_list[i + 1]
             x_e = x_per_slot[s:e]
             if x_e.shape[0] == 0:
                 continue
@@ -1234,6 +1290,26 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # down: Q2_K fused dequant + dot.
             expert_out = q2_k_mm_triton.q2_k_mm(
                 mid, down_w[expert_id], down_shape)  # [M_e, hidden] bf16
+
+            if _do_diag:
+                try:
+                    logger.info(
+                        "IQ2 DIAG call#%d expert=%s M=%s "
+                        "gate.finite=%s gate.max=%s "
+                        "up.finite=%s up.max=%s "
+                        "mid.finite=%s mid.max=%s "
+                        "out.finite=%s out.max=%s",
+                        _IQ2_FWD_CALL_COUNT, expert_id, int(x_e.shape[0]),
+                        bool(torch.isfinite(gate_out).all()),
+                        float(gate_out.abs().max()),
+                        bool(torch.isfinite(up_out).all()),
+                        float(up_out.abs().max()),
+                        bool(torch.isfinite(mid).all()),
+                        float(mid.abs().max()),
+                        bool(torch.isfinite(expert_out).all()),
+                        float(expert_out.abs().max()))
+                except Exception:  # noqa: BLE001
+                    pass
 
             # VLLM_MOE_W2_IQ2_NAN_CHECK: diagnostic. A bad IQ2/Q2_K block can
             # make the per-expert GEMM emit NaN/Inf, which then propagates
@@ -1280,6 +1356,28 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # combine precision.
             out.index_add_(0, tids_e, contrib.to(torch.float32))
 
+        # EP all-reduce note: under expert-parallel TP each rank computed
+        # ONLY its local experts' contributions (non-local experts map to -1
+        # and were skipped above). The FusedMoE runner's
+        # _maybe_reduce_final_output sums the per-rank partials: for this
+        # non-modular apply() the moe_kernel is None, so
+        # _fused_output_is_reduced is False, the gate
+        #   not is_sequence_parallel and not skip_final_all_reduce
+        #   and (tp_size > 1 or ep_size > 1) and not _fused_output_is_reduced
+        # passes and tensor_model_parallel_all_reduce fires once on the
+        # combined shared+fused output. We MUST NOT all-reduce here or that
+        # path double-reduces.
+        if _do_diag:
+            try:
+                logger.info(
+                    "IQ2 DIAG call#%d exit: out.finite=%s out.max=%s "
+                    "out.sum=%s local_experts=%s",
+                    _IQ2_FWD_CALL_COUNT, bool(torch.isfinite(out).all()),
+                    float(out.abs().max()) if out.numel() else 0.0,
+                    float(out.sum()) if out.numel() else 0.0,
+                    len(uniq_list))
+            except Exception:  # noqa: BLE001
+                pass
         return out.to(torch.bfloat16)
 
     def apply(

@@ -164,34 +164,18 @@ def make_deepseek_v4_expert_params_mapping(
 
 
 def _iq2_expert_mapping() -> list[tuple[str, str, int, str]]:
-    """Expert-mapping tuples for the VLLM_MOE_W2_IQ2=1 weight format.
+    """No-op retained for back-compat. The IQ2 weight load is handled by the
+    name-normalization block at the top of DeepseekV4ForCausalLM.load_weights
+    (the converter emits keys in either legacy "model.layers.L.mlp.experts.
+    {dir}_proj.weight_{family}" form or the vLLM param-name form "layers.L.
+    ffn.experts.routed_experts.{dir}_weight_{family}"; both normalize to the
+    registered param name, which carries its own fused-all-experts loader).
 
-    The IQ2_XXS / Q2_K checkpoint (tools/convert_iq2_gguf_to_vllm.py, Step 1)
-    emits ONE fused tensor per direction with all experts concatenated on
-    axis 0, using HF-style names:
-      model.layers.{L}.mlp.experts.gate_proj.weight_iq2_xxs
-      model.layers.{L}.mlp.experts.up_proj.weight_iq2_xxs
-      model.layers.{L}.mlp.experts.down_proj.weight_q2_k
-
-    Each entry's (param_name, weight_name, expert_id=0, shard_id) tuple is
-    consumed by DeepseekV4ForCausalLM.load_weights the same way as the
-    per-expert entries above: if `weight_name` is a substring of the
-    incoming tensor name, replace it with `param_name` and dispatch to the
-    param's weight_loader. The IQ2 params carry their own fused-all-experts
-    loader (mxfp4._iq2_expert_weight_loader) that shards axis 0 by TP rank,
-    so the single entry per direction is sufficient.
+    Returning [] here avoids the substring-replace path in load_weights,
+    which is awkward to fit to the mlp->ffn + routed_experts + family-rename
+    transformation needed for the legacy converter format.
     """
-    if os.getenv("VLLM_MOE_W2_IQ2", "0") != "1":
-        return []
-    return [
-        # (param_name_substr, weight_name_substr, expert_id, shard_id)
-        ("experts.gate_weight_iq2_xxs",
-         "experts.gate_proj.weight_iq2_xxs", 0, "w1"),
-        ("experts.up_weight_iq2_xxs",
-         "experts.up_proj.weight_iq2_xxs", 0, "w3"),
-        ("experts.down_weight_q2_k",
-         "experts.down_proj.weight_q2_k", 0, "w2"),
-    ]
+    return []
 
 
 class DeepseekV4MegaMoEExperts(nn.Module):
@@ -1304,7 +1288,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         if success:
                             name = name_mapped
                             break
-                    loaded_params.add(name_mapped)
+                    # Use `name` (set to name_mapped on success, unchanged
+                    # otherwise) to avoid an UnboundLocalError when no
+                    # expert_mapping entry matched this name.
+                    loaded_params.add(name)
                     continue
                 elif "attn_sink" in name:
                     if is_pp_missing_parameter(name, self):
@@ -1324,6 +1311,25 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     weight_loader(param, loaded_weight)
                     loaded_params.add(name)
                     continue
+
+        # IQ2 observability: list the registered IQ2/Q2_K params + whether
+        # they loaded. The mapping land path is non-obvious (FusedMoE wraps
+        # RoutedExperts, both renamed from mlp->ffn) so a silent mapping
+        # miss leaves the IQ2 params at their init zeros and only surfaces
+        # as zero MoE output much later.
+        if os.getenv("VLLM_MOE_W2_IQ2", "0") == "1" \
+                and os.getenv("VLLM_MOE_W2_IQ2_DIAG", "0") == "1":
+            iq2_params = [(n, p) for n, p in self.named_parameters()
+                          if "iq2_xxs" in n or "q2_k" in n]
+            logger.info(
+                "IQ2 PARAM REGISTRY: %d params with iq2/q2_k (showing first 6):",
+                len(iq2_params))
+            for n, p in iq2_params[:6]:
+                nz = int((p.data != 0).sum().item())
+                logger.info(
+                    "  param %s shape=%s dtype=%s nonzero=%d/%d (%.4f)",
+                    n, tuple(p.shape), p.dtype, nz, p.numel(),
+                    nz / max(p.numel(), 1))
 
         return loaded_params
 
@@ -1531,8 +1537,95 @@ class DeepseekV4ForCausalLM(
         return getattr(self.model, "_mtp_hidden_buffer", None)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # VLLM_MOE_W2_IQ2=1: the IQ2 safetensors adds two key classes the
+        # generic AutoWeightsLoader can't dispatch (it prefix-matches to a
+        # child module, and there is no ``_lookup`` child nor a direct param
+        # for the fused IQ2 expert tensors under their checkpoint name):
+        #   * ``_lookup.{iq2xxs_grid,ksigns_iq2xs}`` (constants the kernel
+        #     inlines as a fallback; we stash them in mxfp4._IQ2_LUTS).
+        #   * ``{model.,}layers.L.mlp.experts.{gate,up,down}_proj.weight_{iq2_xxs,q2_k}``
+        #     which normalize to the registered param name
+        #     ``layers.L.ffn.experts.routed_experts.<dir>_weight_<family>``
+        #     and load via mxfp4._iq2_expert_weight_loader (TP-shards axis 0).
+        # Pre-handle these before AutoWeightsLoader sees them.
+        loaded_params: set[str] = set()
+        if os.getenv("VLLM_MOE_W2_IQ2", "0") == "1":
+            params_dict = dict(self.named_parameters())
+
+            def _iq2_preprocess(
+                stream: Iterable[tuple[str, torch.Tensor]]
+            ) -> Iterable[tuple[str, torch.Tensor]]:
+                seen_iq2 = 0
+                for name, w in stream:
+                    if name.startswith("_lookup."):
+                        try:
+                            from vllm.model_executor.layers.quantization.mxfp4 import (
+                                _IQ2_LUTS)
+                            _IQ2_LUTS[name.removeprefix("_lookup.")] = w
+                        except Exception:  # noqa: BLE001
+                            pass
+                        loaded_params.add(name)
+                        if seen_iq2 < 2:
+                            logger.info("IQ2 PREPROCESS lookup: %s", name)
+                            seen_iq2 += 1
+                        continue
+                    if (
+                        ".experts." in name
+                        and (".weight_iq2_xxs" in name
+                             or ".weight_q2_k" in name)
+                        and "routed_experts." not in name
+                    ):
+                        # Keep the same prefix as the incoming name (the
+                        # outer DeepseekV4ForCausalLM's params_dict uses
+                        # ``model.layers.*`` because the inner model is
+                        # self.model; the inner model's params omit ``model.``).
+                        norm = name
+                        norm = norm.replace(
+                            ".mlp.experts.",
+                            ".ffn.experts.routed_experts.", 1)
+                        norm = norm.replace(
+                            "gate_proj.weight_iq2_xxs",
+                            "gate_weight_iq2_xxs")
+                        norm = norm.replace(
+                            "up_proj.weight_iq2_xxs",
+                            "up_weight_iq2_xxs")
+                        norm = norm.replace(
+                            "down_proj.weight_q2_k",
+                            "down_weight_q2_k")
+                        param = params_dict.get(norm)
+                        if param is not None:
+                            weight_loader = typing.cast(
+                                Callable[..., bool], param.weight_loader
+                            )
+                            weight_loader(
+                                param,
+                                w,
+                                norm,
+                                shard_id=("w1" if "gate_weight" in norm
+                                          else "w3" if "up_weight" in norm
+                                          else "w2"),
+                                expert_id=0,
+                                return_success=True,
+                            )
+                            loaded_params.add(norm)
+                            if seen_iq2 < 4:
+                                logger.info(
+                                    "IQ2 PREPROCESS expert: %s -> %s "
+                                    "(param.shape=%s)",
+                                    name, norm, tuple(param.shape))
+                                seen_iq2 += 1
+                            continue
+                        else:
+                            if seen_iq2 < 8:
+                                logger.warning(
+                                    "IQ2 PREPROCESS MISS: %s -> %s (not in "
+                                    "params_dict)", name, norm)
+                                seen_iq2 += 1
+                    yield name, w
+
+            weights = _iq2_preprocess(weights)
         loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
-        loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded_params |= loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         self.model.finalize_mega_moe_weights()
         return loaded_params
 

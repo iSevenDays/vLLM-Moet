@@ -161,8 +161,9 @@ def _iq2_xxs_mm_kernel(
     BLOCK_BYTES: tl.constexpr,      # 66
 ):
     pid_n = tl.program_id(0)
+    pid_m = tl.program_id(1)
 
-    offs_m = tl.arange(0, BLOCK_M)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     mask_m = offs_m < M
     mask_n = offs_n < N_RUNTIME
@@ -276,8 +277,9 @@ def iq2_xxs_mm(
         grid: uint8 ``[2048]`` -- ``iq2xxs_grid`` unpacked to 256*8 bytes.
         ksigns: uint8 ``[128]`` -- ``ksigns_iq2xs``.
         block_m / block_n: Triton tile sizes (must be >= 16 for tl.dot).
-            ``block_m`` only needs to cover the largest M you'll pass (rows
-            beyond M are masked); 16 is the minimum and handles M <= 16.
+            The kernel tiles across BOTH M and N, so any ``block_m`` >= 16
+            handles any M (the grid is ``(cdiv(N, block_n), cdiv(M, block_m))``
+            and out-of-range rows are masked).
         num_warps: Triton warp count.
 
     Returns:
@@ -315,7 +317,7 @@ def iq2_xxs_mm(
 
     c = torch.empty((M, N), dtype=torch.bfloat16, device=device)
 
-    grid_dim = (triton.cdiv(N, block_n),)
+    grid_dim = (triton.cdiv(N, block_n), triton.cdiv(M, block_m))
     _iq2_xxs_mm_kernel[grid_dim](
         a_bf16,
         w,
@@ -632,7 +634,9 @@ def main(argv=None) -> int:
 
     # ----- Random validation at the two target M values -----------------
     N, K = 4096, 2048    # DSv4 ffn_gate_exps per-expert (out, in).
-    for M in (4, 8):
+    # Include M > BLOCK_M (16) so the M-tiling grid is exercised -- earlier
+    # the kernel only tiled across N and silently dropped rows [16, M).
+    for M in (4, 8, 17, 64, 512):
         print(f"\n=== Random IQ2_XXS GEMM  M={M}  N={N}  K={K} ===")
         r = _validate_random(M, N, K, seed=args.seed, device=device)
         print(f"  ref |C|_max            : {r['ref_abs_max']:.4f}")

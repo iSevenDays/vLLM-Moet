@@ -192,10 +192,17 @@ EXPECTED_DIMS_Q2_K: Tuple[int, int, int] = (INTERMEDIATE, HIDDEN, N_EXPERTS)
 def layer_param_names(layer_idx: int) -> Tuple[str, str, str]:
     """vLLM/HF param names for (gate=w1, up=w3, down=w2) of layer L."""
     L = layer_idx
+    # Emit the vLLM DSv4 param-name format directly: the model wires MoE as
+    # ``self.ffn`` (not ``self.mlp``), FusedMoE wraps the IQ2 params under
+    # ``routed_experts.``, and self.named_parameters() is relative to the
+    # model (no ``model.`` prefix). The IQ2 family names ({gate,up}_weight,
+    # down_weight) match the params registered in mxfp4._create_iq2_weights.
+    # DeepseekV4ForCausalLM.load_weights still does prefix normalization
+    # for the legacy "model.layers.*.mlp.experts.*_proj.*" format too.
     return (
-        f"model.layers.{L}.mlp.experts.gate_proj.weight_iq2_xxs",
-        f"model.layers.{L}.mlp.experts.up_proj.weight_iq2_xxs",
-        f"model.layers.{L}.mlp.experts.down_proj.weight_q2_k",
+        f"layers.{L}.ffn.experts.routed_experts.gate_weight_iq2_xxs",
+        f"layers.{L}.ffn.experts.routed_experts.up_weight_iq2_xxs",
+        f"layers.{L}.ffn.experts.routed_experts.down_weight_q2_k",
     )
 
 
@@ -656,6 +663,15 @@ def main(argv: List[str] | None = None) -> int:
     p.add_argument("--validate-layers", type=int, default=None,
                    help="Number of layers to round-trip validate "
                         "(default: all converted layers).")
+    p.add_argument("--no-update-index", action="store_true",
+                   help="Do not update model.safetensors.index.json next "
+                        "to the IQ2 shard. By default the converter adds "
+                        "the IQ2 keys to the index so vLLM's auto-loader "
+                        "visits them; without this, the IQ2 params stay at "
+                        "their init zeros (silent zero MoE output).")
+    p.add_argument("--model-dir", default=None,
+                   help="Directory containing model.safetensors.index.json "
+                        "(default: same dir as --out).")
     args = p.parse_args(argv)
 
     if not os.path.exists(args.gguf):
@@ -727,6 +743,41 @@ def main(argv: List[str] | None = None) -> int:
                     if shown >= 5:
                         break
             print(f"[summary] total tensors: {len(list(sf.keys()))}")
+
+        # Update the model dir's safetensors index so vLLM's auto-loader
+        # actually visits the IQ2 shard. Without this, the loader iterates
+        # only the keys listed in model.safetensors.index.json and the IQ2
+        # params stay at their init zeros, surfacing much later as zero
+        # MoE output. Optional: pass --no-update-index to skip (e.g. the
+        # IQ2 file lives in a different dir than the FP8 shards).
+        if not args.no_update_index:
+            shard_name = os.path.basename(args.out)
+            # default: model dir = same dir as the IQ2 output
+            model_dir = args.model_dir or out_dir
+            idx_path = os.path.join(model_dir, "model.safetensors.index.json")
+            if os.path.exists(idx_path):
+                import json as _json
+                with open(idx_path) as _f:
+                    _idx = _json.load(_f)
+                _wm = _idx.get("weight_map", {})
+                before = sum(
+                    1 for _k in _wm if "iq2" in _k or "q2_k" in _k)
+                with safe_open(args.out, framework="pt") as _sf:
+                    for _k in _sf.keys():
+                        _wm[_k] = shard_name
+                _meta = _idx.get("metadata", {})
+                _meta["total_size"] = _meta.get("total_size", 0) + actual_size
+                _idx["metadata"] = _meta
+                with open(idx_path, "w") as _f:
+                    _json.dump(_idx, _f)
+                after = sum(
+                    1 for _k in _wm if "iq2" in _k or "q2_k" in _k)
+                print(f"[convert] index {idx_path}: iq2/q2_k keys "
+                      f"{before} -> {after}; total_size += {actual_size}")
+            else:
+                print(f"[convert] index {idx_path} not found; skipping "
+                      "update (the IQ2 shard won't be loaded by vLLM's "
+                      "auto-loader unless you set up the index manually).")
         return 0
     finally:
         gguf.close()
