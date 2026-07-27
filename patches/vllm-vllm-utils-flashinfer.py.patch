@@ -1,8 +1,8 @@
 diff --git a/vllm/utils/flashinfer.py b/vllm/utils/flashinfer.py
-index 998c3b6..00bec0b 100644
+index 998c3b6..8dcfaca 100644
 --- a/vllm/utils/flashinfer.py
 +++ b/vllm/utils/flashinfer.py
-@@ -153,11 +153,60 @@
+@@ -153,11 +153,62 @@
      "trtllm_batch_decode_with_kv_cache_mla",
      fallback_fn=_missing_sparse_mla,
  )
@@ -36,7 +36,9 @@ index 998c3b6..00bec0b 100644
 +            "the Triton port even where FlashInfer has native kernels.")
 +        return "triton-port"
 +    major, minor = torch.cuda.get_device_capability(device)
-+    if major in (10, 12):
++    if major in (10, 12) or (
++        major == 8 and minor == 9
++        and os.getenv("FLASHINFER_DISABLE_VERSION_CHECK", "0") == "1"):
 +        return "flashinfer"
 +    logger.warning_once(
 +        "DSv4 sparse MLA: FlashInfer's resolver has no sm_%d%d kernel "
@@ -64,7 +66,7 @@ index 998c3b6..00bec0b 100644
  
  
  # Special case for autotune since it returns a context manager
-@@ -214,7 +263,15 @@
+@@ -214,7 +265,15 @@
  
  @functools.cache
  def has_flashinfer_sparse_mla_sm120() -> bool:
@@ -81,7 +83,7 @@ index 998c3b6..00bec0b 100644
      if not has_flashinfer():
          return False
      try:
-@@ -224,6 +281,16 @@
+@@ -224,6 +283,16 @@
              trtllm_batch_decode_with_kv_cache_mla,
          )
      except ImportError:

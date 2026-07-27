@@ -182,7 +182,9 @@ def _dsv4_sparse_mla_route(device: torch.device) -> str:
             "the Triton port even where FlashInfer has native kernels.")
         return "triton-port"
     major, minor = torch.cuda.get_device_capability(device)
-    if major in (10, 12):
+    if major in (10, 12) or (
+        major == 8 and minor == 9
+        and os.getenv("FLASHINFER_DISABLE_VERSION_CHECK", "0") == "1"):
         return "flashinfer"
     logger.warning_once(
         "DSv4 sparse MLA: FlashInfer's resolver has no sm_%d%d kernel "
