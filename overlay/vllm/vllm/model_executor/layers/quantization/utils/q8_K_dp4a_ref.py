@@ -1,0 +1,511 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Numpy reference for the Q8_K + DP4A trajectory (matches antirez ``ds4_cuda.cu``).
+
+This is the ground-truth numerical trajectory the DSv4-Flash GGUF was authored
+against ("AProjQ8" -- Q8_K activations + DP4A ``int8 x int8 -> int32`` dot, with
+a *single* per-block fp32 scale fold at the end -- *not* the per-sub-block
+``sumi*ls/8`` integer truncation of the MMVQ Q8_1 path in vecdotq.cuh).
+
+Antirez CUDA functions replicated here (line-by-line arithmetic):
+
+  * ``q8_K_quantize_kernel``            (ds4_cuda.cu:17366)  -- per-256-block Q8_K quant
+  * ``dev_dot_iq2_xxs_q8_K_block``      (ds4_cuda.cu:16962)  -- IQ2_XXS x Q8_K dot
+  * ``dev_dot_q2_K_q8_K_block``         (ds4_cuda.cu:17239)  -- Q2_K x Q8_K dot
+  * ``dev_dot_q2_16``                   (ds4_cuda.cu:16897)  -- 16-elem Q2 DP4A helper
+
+These match the llama.cpp CPU references ``ggml_vec_dot_*_q8_K_generic``
+(ggml-cpu/quants.c:565,906) which use the SAME trajectory (the per-block
+``0.125`` fold is a single float multiply; the only integer truncation is the
+``roundf``/``lrintf`` in the Q8_K quantization itself).
+
+The crucial difference from the existing ``dequant_iq2_xxs`` + fp32-matmul
+trajectory (the bf16 kernel path):
+
+  * Activations are quantized to Q8_K (int8 + fp32 ``d`` per **256-element**
+    block + 16 ``bsums`` per 16-element sub-block).
+  * The dot is INTEGER (``int8 x int8 -> int32`` summed via DP4A), NOT
+    ``bf16 x bf16 -> fp32``.
+  * For IQ2_XXS: per-block ``bsum += sumi*ls`` accumulated in int32 across 8
+    sub-blocks, then ONE float fold ``0.125 * d_w * d_a * bsum``.
+  * For Q2_K: per-block ``isum`` (scale-folded code dot) and ``summs``
+    (min-folded bsums) in int32, then ``dall*isum - dmin*summs`` in float.
+
+The bf16 path rounds every one of the K=2048/4096 multiplies to bf16's 8-bit
+mantissa; DP4A is integer-exact inside each 32-element DP4A stripe.  Across 43
+layers x many tokens the bf16 rounding bias compounds and derails the 16K
+needle; the Q8_K trajectory is the one antirez/llama.cpp serve and the one the
+GGUF was authored against.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from typing import Tuple
+
+import numpy as np
+
+try:
+    from .iq2_xxs_ref import (
+        QK_K,
+        IQ2_XXS_BLOCK_BYTES,
+        Q2_K_BLOCK_BYTES,
+        _IQ2XXS_GRID,
+        _KSIGNS_IQ2XS,
+        _KMASK_IQ2XS,
+        f16_bits_to_f32,
+    )
+except ImportError:  # standalone execution
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from iq2_xxs_ref import (  # type: ignore[no-redef]
+        QK_K,
+        IQ2_XXS_BLOCK_BYTES,
+        Q2_K_BLOCK_BYTES,
+        _IQ2XXS_GRID,
+        _KSIGNS_IQ2XS,
+        _KMASK_IQ2XS,
+        f16_bits_to_f32,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-256-block Q8_K quantization (matches antirez q8_K_quantize_kernel /
+# ggml-quants.c:quantize_row_q8_K_ref).
+#
+# Block layout (cuda_block_q8_K):
+#   float   d              -- fp32 scale (= -max/127 in antirez; here +|max|/127)
+#   int8    qs[256]        -- quantized values
+#   int16   bsums[16]      -- per-16-element-sub-block sum (for Q2_K min fold)
+#
+# Antirez uses the ASYMMETRIC form: iscale = -127/max, qs = round(iscale*x),
+# d = 1/iscale = -max/127.  We use the mathematically-equivalent SYMMETRIC form
+# (d = |max|/127, qs = round(x/d)) -- the int8 values differ by a sign flip
+# (when max>0) but the products d*qs and d*sum(qs*w) are identical, so the dot
+# result is unchanged.  Verified by the symmetric/antisymmetric equivalence in
+# the module docstring.
+# ---------------------------------------------------------------------------
+def quantize_row_q8_K_ref(x_fp32: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per-256-block Q8_K quantization.
+
+    Args:
+      x_fp32: ``[..., n]`` fp32, where ``n % 256 == 0``.
+    Returns:
+      ``(qs, d, bsums)`` where
+        * ``qs``   is ``[..., n]`` int8.
+        * ``d``    is ``[..., n/256]`` fp32 per-256-block scale (= |max|/127).
+        * ``bsums``is ``[..., n/16]`` int16 per-16-sub-block sums.
+    """
+    shape = x_fp32.shape
+    n = shape[-1]
+    if n % QK_K != 0:
+        raise ValueError(f"last dim {n} must be a multiple of {QK_K}")
+    nb = n // QK_K
+    x = x_fp32.reshape(*shape[:-1], nb, QK_K)
+
+    abs_amax = np.abs(x).max(axis=-1).astype(np.float32)        # [..., nb]
+    is_zero = abs_amax == 0.0
+    safe_amax = np.where(is_zero, 1.0, abs_amax)
+    d = safe_amax / 127.0                                       # [..., nb] fp32, positive
+    # qs = round(a / d) = round(a * 127/amax).  inv = 127/amax (= 1/d).
+    inv = np.where(is_zero, 0.0, 127.0 / safe_amax).astype(np.float32)
+    # np.round = round-half-to-even, matches C lrintf default rounding mode.
+    qs_f = np.round(x * inv[..., None])
+    qs = np.clip(qs_f.astype(np.int32), -128, 127).astype(np.int8)
+    # Zero blocks: antirez zeroes qs and d.
+    qs = np.where(is_zero[..., None], qs * 0, qs)
+    d = np.where(is_zero, 0.0, d)
+
+    # bsums: 16 sums of 16 elements each, per 256-block.
+    qs16 = qs.reshape(*shape[:-1], nb, 16, 16)
+    bsums = qs16.sum(axis=-1).astype(np.int16)                  # [..., nb, 16]
+
+    return (
+        qs.reshape(*shape),
+        d.reshape(*shape[:-1], nb),
+        bsums.reshape(*shape[:-1], nb * 16),
+    )
+
+
+# ---------------------------------------------------------------------------
+# IQ2_XXS x Q8_K reference dot (matches dev_dot_iq2_xxs_q8_K_block).
+#
+# Per 256-element block:
+#   bsum = 0 (int32)
+#   for ib32 in 0..7:
+#     sumi = sum_{i in 32} (q8[i] * signed_grid[i])   (int32, via DP4A)
+#     bsum += sumi * ls[ib32]                          (int32)
+#   result_block = 0.125 * d_w * d_a * (float)bsum     (float)
+# Sum result_block across blocks (float).
+# ---------------------------------------------------------------------------
+def _iq2xxs_tables() -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    grid_u64 = np.asarray(_IQ2XXS_GRID, dtype=np.uint64)
+    shifts = np.arange(8, dtype=np.uint64) * np.uint64(8)
+    grid_bytes = (
+        (grid_u64[:, None] >> shifts) & np.uint64(0xff)
+    ).astype(np.uint8)                                            # (256, 8)
+    ksigns = np.asarray(_KSIGNS_IQ2XS, dtype=np.uint8)           # (128,)
+    kmask = np.asarray(_KMASK_IQ2XS, dtype=np.uint8)             # (8,)
+    return grid_bytes, ksigns, kmask
+
+
+def _decode_iq2_xxs_block_to_int8(block_bytes: bytes) -> Tuple[float, np.ndarray, np.ndarray]:
+    """Decode one 66-byte IQ2_XXS block to (d, ls[8], signed_int8[8, 32]).
+
+    The returned int8 values are the SIGNED grid values (grid_byte * sign),
+    BEFORE the d/ls/0.125 scale fold.  Each value is in {-43, -25, -8, 8, 25, 43}.
+    """
+    if len(block_bytes) != IQ2_XXS_BLOCK_BYTES:
+        raise ValueError(f"IQ2_XXS block must be {IQ2_XXS_BLOCK_BYTES} bytes")
+
+    grid, ksigns, kmask = _iq2xxs_tables()
+
+    # d: fp16 super-block scale.
+    d_u16 = int.from_bytes(block_bytes[0:2], "little")
+    d = float(f16_bits_to_f32(np.array([d_u16], dtype=np.uint16))[0])
+
+    # qs: 32 uint16 little-endian -> 8 sub-blocks of 4 uint16 each.
+    qs = np.frombuffer(block_bytes[2:2 + 64], dtype="<u2", count=32).astype(np.uint32)
+    qs32 = qs.reshape(8, 4)
+    aux0 = qs32[:, 0] | (qs32[:, 1] << np.uint32(16))            # (8,) 4 grid indices
+    aux1 = qs32[:, 2] | (qs32[:, 3] << np.uint32(16))            # (8,) sign idxs + ls
+
+    ls = (np.uint32(2) * (aux1 >> np.uint32(28)) + np.uint32(1)).astype(np.int32)
+
+    out = np.empty((8, 32), dtype=np.int8)
+    for k in range(4):
+        a_k = ((aux0 >> np.uint32(8 * k)) & np.uint32(0xff)).astype(np.int64)
+        sign_k = ((aux1 >> np.uint32(7 * k)) & np.uint32(0x7f)).astype(np.int64)
+        grid_vals = grid[a_k]                                     # (8, 8) uint8 in {8,25,43}
+        signs_mask = ksigns[sign_k]                              # (8,) uint8
+        sign_neg = (signs_mask[:, None] & kmask[None, :]) != 0   # (8, 8) bool
+        signed = grid_vals.astype(np.int32) * np.where(sign_neg, -1, 1)
+        out[:, k * 8:(k + 1) * 8] = signed.astype(np.int8)
+    return d, ls, out
+
+
+def iq2_xxs_q8_K_matmul_ref(
+    a_fp32: np.ndarray,
+    w_bytes: np.ndarray,
+    w_shape: Tuple[int, int],
+) -> np.ndarray:
+    """IQ2_XXS x Q8_K matmul: C = A @ W^T via the antirez trajectory.
+
+    Args:
+      a_fp32: ``[M, K]`` fp32 activations.
+      w_bytes: ``[N, BPR*66]`` uint8 (raw IQ2_XXS blocks).
+      w_shape: ``(N, K)``.
+    Returns: ``[M, N]`` fp32.
+    """
+    M, K = a_fp32.shape
+    N, Kw = w_shape
+    if K != Kw:
+        raise ValueError(f"K mismatch: A has {K}, W has {Kw}")
+    if K % QK_K != 0:
+        raise ValueError(f"K={K} must be a multiple of {QK_K}")
+    BPR = K // QK_K
+
+    qs_a, d_a, _ = quantize_row_q8_K_ref(a_fp32)                # [M,K] int8, [M,BPR] fp32
+    qs_a = qs_a.reshape(M, BPR, QK_K).astype(np.int32)
+
+    w_bytes = w_bytes.reshape(N, BPR, IQ2_XXS_BLOCK_BYTES)
+    acc = np.zeros((M, N), dtype=np.float32)
+    for kb in range(BPR):
+        qs_a_kb = qs_a[:, kb, :]                                # [M, 256] int32
+        d_a_kb = d_a[:, kb]                                     # [M] fp32
+
+        # Decode all N blocks' (d_w, ls[8], signed[8,32]) for this kb.
+        d_w_arr = np.zeros(N, dtype=np.float32)
+        ls_arr = np.zeros((N, 8), dtype=np.int32)
+        signed_arr = np.zeros((N, 8, 32), dtype=np.int32)
+        for n in range(N):
+            block = bytes(w_bytes[n, kb])
+            d_w, ls, signed = _decode_iq2_xxs_block_to_int8(block)
+            d_w_arr[n] = d_w
+            ls_arr[n] = ls
+            signed_arr[n] = signed.astype(np.int32)
+
+        # bsum[m, n] = sum over ib32 of (ls[n, ib32] * sumi[m, n, ib32])
+        # where sumi[m, n, ib32] = qs_a_kb[m, ib32*32:+32] . signed_arr[n, ib32]
+        bsum = np.zeros((M, N), dtype=np.int32)
+        for ib32 in range(8):
+            q_tile = qs_a_kb[:, ib32 * 32:(ib32 + 1) * 32]         # [M, 32]
+            w_tile = signed_arr[:, ib32, :]                         # [N, 32]
+            sumi = q_tile @ w_tile.T                                # [M, N] int32
+            bsum += sumi * ls_arr[:, ib32][None, :]
+        acc += (0.125 * d_w_arr[None, :] * d_a_kb[:, None]) * bsum.astype(np.float32)
+    return acc
+
+
+# ---------------------------------------------------------------------------
+# Q2_K x Q8_K reference dot (matches dev_dot_q2_K_q8_K_block).
+#
+# Per 256-element block:
+#   summs = sum over 16 sub-blocks of (bsums[is] * (scales[is] >> 4))   (int32)
+#   isum  = 0
+#   for k in 0,1:                                                    (256/128)
+#     shift = 0
+#     for j in 0..3:
+#       scale = scales[is++] & 0x0f
+#       isum += scale * sum_{i in 16}(q8[i] * ((qs[i] >> shift) & 3))
+#       scale = scales[is++] & 0x0f
+#       isum += scale * sum_{i in 16}(q8[i+16] * ((qs[i+16] >> shift) & 3))
+#       shift += 2
+#       q8 += 32
+#     qs += 32
+#   result_block = (d_a * d_w) * isum - (d_a * dmin_w) * summs
+# Sum across blocks.
+#
+# Our existing kernel's PAIR structure: pair ip covers 32 elements
+# (sub-blocks is0=2*ip, is1=2*ip+1), at shift=(ip%4)*2.  The two halves of the
+# pair are the two dev_dot_q2_16 calls in the inner loop.
+# ---------------------------------------------------------------------------
+def _decode_q2_k_block_fields(block_bytes: bytes) -> dict:
+    """Decode one 84-byte Q2_K block to its component fields.
+
+    Returns dict with:
+      codes[256]   -- raw 2-bit codes {0,1,2,3}, int8
+      scales[16]   -- per-sub-block scale byte (low nibble scale, high nibble min)
+      d, dmin      -- fp16 super-block scales
+    """
+    if len(block_bytes) != Q2_K_BLOCK_BYTES:
+        raise ValueError(f"Q2_K block must be {Q2_K_BLOCK_BYTES} bytes")
+    scales = np.frombuffer(block_bytes[0:16], dtype=np.uint8).copy()  # [16]
+    qs = np.frombuffer(block_bytes[16:80], dtype=np.uint8).copy()     # [64]
+    d_u16 = int.from_bytes(block_bytes[80:82], "little")
+    dmin_u16 = int.from_bytes(block_bytes[82:84], "little")
+    d = float(f16_bits_to_f32(np.array([d_u16], dtype=np.uint16))[0])
+    dmin = float(f16_bits_to_f32(np.array([dmin_u16], dtype=np.uint16))[0])
+
+    # Decode codes per sub-block is (0..15).
+    codes = np.empty(QK_K, dtype=np.int8)
+    for isub in range(16):
+        k = isub // 8
+        within = isub % 8
+        j = within // 2
+        half = within % 2
+        byte_base = k * 32 + half * 16
+        shift = j * 2
+        for i in range(16):
+            codes[isub * 16 + i] = (qs[byte_base + i] >> shift) & 0x3
+    return {"codes": codes, "scales": scales, "d": d, "dmin": dmin}
+
+
+def q2_k_q8_K_matmul_ref(
+    a_fp32: np.ndarray,
+    w_bytes: np.ndarray,
+    w_shape: Tuple[int, int],
+) -> np.ndarray:
+    """Q2_K x Q8_K matmul: C = A @ W^T via the antirez trajectory.
+
+    Args:
+      a_fp32: ``[M, K]`` fp32 activations.
+      w_bytes: ``[N, BPR*84]`` uint8 (raw Q2_K blocks).
+      w_shape: ``(N, K)``.
+    Returns: ``[M, N]`` fp32.
+    """
+    M, K = a_fp32.shape
+    N, Kw = w_shape
+    if K != Kw:
+        raise ValueError(f"K mismatch: A has {K}, W has {Kw}")
+    if K % QK_K != 0:
+        raise ValueError(f"K={K} must be a multiple of {QK_K}")
+    BPR = K // QK_K
+
+    qs_a, d_a, bsums_a = quantize_row_q8_K_ref(a_fp32)          # [M,K] int8, [M,BPR] fp32, [M, BPR*16] int16
+    qs_a = qs_a.reshape(M, BPR, QK_K).astype(np.int32)
+    bsums_a = bsums_a.reshape(M, BPR, 16).astype(np.int32)      # [M, BPR, 16]
+
+    w_bytes = w_bytes.reshape(N, BPR, Q2_K_BLOCK_BYTES)
+    acc = np.zeros((M, N), dtype=np.float32)
+    # Pre-compute per-sub-block element indices (constant).
+    isub_of_elem = np.empty(QK_K, dtype=np.int64)
+    for isub in range(16):
+        isub_of_elem[isub * 16:(isub + 1) * 16] = isub
+
+    for kb in range(BPR):
+        qs_a_kb = qs_a[:, kb, :]                                # [M, 256] int32
+        d_a_kb = d_a[:, kb]                                     # [M]
+        bsums_a_kb = bsums_a[:, kb, :]                          # [M, 16]
+
+        # Decode all N blocks for this kb.
+        codes_all = np.empty((N, QK_K), dtype=np.int32)
+        scales_all = np.empty((N, 16), dtype=np.uint8)
+        d_w_arr = np.zeros(N, dtype=np.float32)
+        dmin_w_arr = np.zeros(N, dtype=np.float32)
+        for n in range(N):
+            f = _decode_q2_k_block_fields(bytes(w_bytes[n, kb]))
+            codes_all[n] = f["codes"].astype(np.int32)
+            scales_all[n] = f["scales"]
+            d_w_arr[n] = f["d"]
+            dmin_w_arr[n] = f["dmin"]
+
+        # Min part: summs[m, n] = sum over 16 sub-blocks of (bsums_a[m, is] * mins[n, is])
+        mins_all = (scales_all >> 4).astype(np.int32)           # [N, 16]
+        summs = bsums_a_kb.astype(np.int32) @ mins_all.T        # [M, N] int32
+
+        # D part: pre-scale codes by per-sub-block scale (int32-safe: max 15*3=45).
+        # prescaled_codes[n, i] = (scales_all[n, isub_of_elem[i]] & 0xF) * codes_all[n, i]
+        scales_per_elem = (scales_all[:, isub_of_elem] & 0x0F).astype(np.int32)  # [N, 256]
+        prescaled_codes = scales_per_elem * codes_all           # [N, 256] int32 in [0, 45]
+        isum = qs_a_kb @ prescaled_codes.T                      # [M, N] int32
+
+        dall = d_a_kb[:, None] * d_w_arr[None, :]              # [M, N] fp32
+        dmin_arr = d_a_kb[:, None] * dmin_w_arr[None, :]       # [M, N] fp32
+        acc += dall * isum.astype(np.float32) - dmin_arr * summs.astype(np.float32)
+    return acc
+
+
+__all__ = [
+    "quantize_row_q8_K_ref",
+    "iq2_xxs_q8_K_matmul_ref",
+    "q2_k_q8_K_matmul_ref",
+    "_decode_iq2_xxs_block_to_int8",
+    "_decode_q2_k_block_fields",
+]
+
+
+# ---------------------------------------------------------------------------
+# Standalone self-test: random + (if available) real GGUF blocks.
+# Confirms the Q8_K trajectory produces finite, sane outputs and matches the
+# expected math (the bf16 trajectory up to Q8_K quantization noise).
+# ---------------------------------------------------------------------------
+def _make_random_iq2xxs_weights(n: int, k: int, seed: int = 0) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    bpr = k // QK_K
+    rb = bpr * IQ2_XXS_BLOCK_BYTES
+    nb = n * bpr
+    d_fp16 = rng.uniform(0.001, 1.0, size=nb).astype(np.float16)
+    d_bytes = d_fp16.view(np.uint8).reshape(nb, 2)
+    qs = rng.integers(0, 65536, size=(nb, 32), dtype=np.uint16)
+    qs_bytes = qs.view(np.uint8).reshape(nb, 64)
+    blocks = np.concatenate([d_bytes, qs_bytes], axis=1).reshape(n, bpr, IQ2_XXS_BLOCK_BYTES)
+    return blocks.reshape(n, rb)
+
+
+def _make_random_q2_k_weights(n: int, k: int, seed: int = 0) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    bpr = k // QK_K
+    rb = bpr * Q2_K_BLOCK_BYTES
+    nb = n * bpr
+    out = np.zeros((nb, Q2_K_BLOCK_BYTES), dtype=np.uint8)
+    out[:, 0:16] = rng.integers(0, 256, size=(nb, 16))
+    out[:, 16:80] = rng.integers(0, 256, size=(nb, 64))
+    d = rng.uniform(0.001, 1.0, size=nb).astype(np.float16)
+    dmin = rng.uniform(0.0, 0.5, size=nb).astype(np.float16)
+    out[:, 80:82] = d.view(np.uint8).reshape(nb, 2)
+    out[:, 82:84] = dmin.view(np.uint8).reshape(nb, 2)
+    return out.reshape(n, rb)
+
+
+def _compare(ref: np.ndarray, got: np.ndarray) -> Tuple[float, float, float]:
+    """Return (max_abs, worst_rel, rel_l2)."""
+    diff = np.abs(ref - got)
+    max_abs = float(diff.max()) if diff.size else 0.0
+    ref_abs_max = float(np.abs(ref).max()) if ref.size else 0.0
+    worst_rel = (max_abs / ref_abs_max) if ref_abs_max > 0 else 0.0
+    denom = float(np.linalg.norm(ref))
+    rel_l2 = float(np.linalg.norm(ref - got) / denom) if denom > 0 else 0.0
+    return max_abs, worst_rel, rel_l2
+
+
+def main(argv=None) -> int:
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from iq2_xxs_ref import dequant_iq2_xxs, dequant_q2_k  # type: ignore[no-redef]
+
+    print("=== Q8_K + DP4A reference self-test ===")
+    np.random.seed(0)
+    overall_pass = True
+    tol_rel = 5e-2  # Q8_K quantization noise vs the fp32/bf16 trajectory.
+
+    print("\n--- IQ2_XXS x Q8_K (random) ---")
+    for (M, N, K) in [(1, 8, 256), (4, 32, 256), (8, 64, 512), (8, 128, 2048)]:
+        w = _make_random_iq2xxs_weights(N, K, seed=0)
+        a = (np.random.randn(M, K) * 0.3).astype(np.float32)
+        got = iq2_xxs_q8_K_matmul_ref(a, w, (N, K))
+        w_fp32 = dequant_iq2_xxs(w.tobytes(), (N, K))
+        ref = a @ w_fp32.T  # bf16/fp32 trajectory
+        max_abs, worst_rel, rel_l2 = _compare(ref, got)
+        finite = bool(np.isfinite(got).all())
+        ok = finite and worst_rel < tol_rel
+        overall_pass = overall_pass and ok
+        print(f"  M={M:2d} N={N:3d} K={K:4d}  finite={finite}  "
+              f"max|out|={float(np.abs(got).max()):.3f}  "
+              f"worst_rel={worst_rel:.3e}  rel_L2={rel_l2:.3e}  "
+              f"{'PASS' if ok else 'FAIL'}")
+
+    print("\n--- Q2_K x Q8_K (random) ---")
+    for (M, N, K) in [(1, 8, 256), (4, 32, 256), (8, 64, 512), (8, 128, 4096)]:
+        w = _make_random_q2_k_weights(N, K, seed=1)
+        a = (np.random.randn(M, K) * 0.3).astype(np.float32)
+        got = q2_k_q8_K_matmul_ref(a, w, (N, K))
+        w_fp32 = dequant_q2_k(w.tobytes(), (N, K))
+        ref = a @ w_fp32.T
+        max_abs, worst_rel, rel_l2 = _compare(ref, got)
+        finite = bool(np.isfinite(got).all())
+        ok = finite and worst_rel < tol_rel
+        overall_pass = overall_pass and ok
+        print(f"  M={M:2d} N={N:3d} K={K:4d}  finite={finite}  "
+              f"max|out|={float(np.abs(got).max()):.3f}  "
+              f"worst_rel={worst_rel:.3e}  rel_L2={rel_l2:.3e}  "
+              f"{'PASS' if ok else 'FAIL'}")
+
+    # Real GGUF validation if available
+    gguf = os.environ.get("Q8K_REF_GGUF", "/root/antirez/ds4/ds4flash.gguf")
+    if os.path.exists(gguf):
+        print(f"\n--- Real GGUF validation ({gguf}) ---")
+        try:
+            from iq2_xxs_ref import parse_gguf_header, find_tensors_by_prefix  # type: ignore[no-redef]
+            import mmap
+            with open(gguf, "rb") as fh:
+                with mmap.mmap(fh.fileno(), 0, prot=mmap.PROT_READ) as mm:
+                    buf = bytes(mm[:64 * 1024 * 1024])
+                    tensors, data_off, _ = parse_gguf_header(buf)
+            # IQ2_XXS expert
+            from iq2_xxs_ref import GGUF_TYPE_IQ2_XXS, GGUF_TYPE_Q2_K  # type: ignore[no-redef]
+            for prefix, gtype, dequant_fn, label in [
+                ("blk.0.ffn_gate_exps.", GGUF_TYPE_IQ2_XXS, dequant_iq2_xxs, "IQ2_XXS"),
+                ("blk.0.ffn_down_exps.", GGUF_TYPE_Q2_K, dequant_q2_k, "Q2_K"),
+            ]:
+                cands = find_tensors_by_prefix(tensors, prefix, gtype)
+                if not cands:
+                    print(f"  [skip] no {label} tensor")
+                    continue
+                t = cands[0]
+                n, k = int(t.dims[0]), int(t.dims[1])
+                if k % QK_K != 0:
+                    n, k = int(t.dims[1]), int(t.dims[0])
+                bpr = k // QK_K
+                expert_bytes = n * bpr * (IQ2_XXS_BLOCK_BYTES if gtype == GGUF_TYPE_IQ2_XXS else Q2_K_BLOCK_BYTES)
+                abs_off = data_off + t.offset
+                with open(gguf, "rb") as bf:
+                    bf.seek(abs_off)
+                    raw = bf.read(expert_bytes)
+                w_np = np.frombuffer(raw, dtype=np.uint8).copy().reshape(n, bpr, -1).reshape(n, -1)
+                a = (np.random.randn(8, k) * 0.3).astype(np.float32)
+                if gtype == GGUF_TYPE_IQ2_XXS:
+                    got = iq2_xxs_q8_K_matmul_ref(a, w_np, (n, k))
+                else:
+                    got = q2_k_q8_K_matmul_ref(a, w_np, (n, k))
+                w_fp32 = dequant_fn(w_np.tobytes(), (n, k))
+                ref = a @ w_fp32.T
+                max_abs, worst_rel, rel_l2 = _compare(ref, got)
+                finite = bool(np.isfinite(got).all())
+                ok = finite and worst_rel < tol_rel
+                overall_pass = overall_pass and ok
+                print(f"  {label:9s} N={n} K={k}  finite={finite}  "
+                      f"max|out|={float(np.abs(got).max()):.3f}  "
+                      f"worst_rel={worst_rel:.3e}  rel_L2={rel_l2:.3e}  "
+                      f"{'PASS' if ok else 'FAIL'}")
+        except Exception as e:  # noqa: BLE001
+            print(f"  [error] GGUF validation failed: {e}")
+    else:
+        print(f"\n  [skip] GGUF not found at {gguf}")
+
+    print(f"\n=== OVERALL: {'PASS' if overall_pass else 'FAIL'} ===")
+    return 0 if overall_pass else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

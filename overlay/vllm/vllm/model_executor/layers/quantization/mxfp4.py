@@ -1128,13 +1128,23 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # Lazy imports keep static validation (no torch.distributed) working
         # and avoid importing Triton at module load.
         from vllm.model_executor.layers.quantization.utils import (
-            iq2_xxs_mm_triton, q2_k_mm_triton)
+            iq2_xxs_mm_triton, q2_k_mm_triton,
+            q8_k_quantize_triton)
 
         # NAN_CHECK: default ON for in-flight diagnostics (was opt-in). When
         # a per-expert GEMM emits non-finite values, CLAMP and log loudly so
         # the boot survives and the offending expert is identified. Set
         # VLLM_MOE_W2_IQ2_NAN_CHECK=0 to disable.
         _iq2_nan_check = os.getenv("VLLM_MOE_W2_IQ2_NAN_CHECK", "1") != "0"
+        # Q8_K+DP4A trajectory: when set, quantize the bf16 activations to Q8_K
+        # and use the int8 DP4A GEMMs (iq2_xxs_mm_q8k / q2_k_mm_q8k). This
+        # matches antirez/llama.cpp's production CUDA dot path bit-for-bit
+        # (dev_dot_iq2_xxs_q8_K_block / dev_dot_q2_K_q8_K_block) -- the
+        # trajectory the IQ2_XXS/Q2_K GGUF was calibrated against. The bf16
+        # path (default) is MORE fp32-accurate but DIVERGES from the
+        # calibration target; across 43 layers x long context this compounds
+        # into the 16K-needle failure. Set VLLM_MOE_W2_IQ2_Q8K=1 to enable.
+        _iq2_q8k = os.getenv("VLLM_MOE_W2_IQ2_Q8K", "0") == "1"
         # DIAG: log per-call stats for the first N calls per process so we
         # can inspect live activations + output without flooding logs.
         _iq2_diag = os.getenv("VLLM_MOE_W2_IQ2_DIAG", "0") == "1"
@@ -1280,10 +1290,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             tids_e = token_ids_s[s:e]
 
             # gate/up: IQ2_XXS fused dequant + dot.
-            gate_out = iq2_xxs_mm_triton.iq2_xxs_mm(
-                x_e, gate_w[expert_id], gate_shape, grid, ksigns)
-            up_out = iq2_xxs_mm_triton.iq2_xxs_mm(
-                x_e, up_w[expert_id], up_shape, grid, ksigns)
+            if _iq2_q8k:
+                # Q8_K-activation DP4A path (matches antirez trajectory).
+                x_qs, x_d, _ = q8_k_quantize_triton.quantize_q8_K(x_e)
+                gate_out = iq2_xxs_mm_triton.iq2_xxs_mm_q8k(
+                    x_qs, x_d, gate_w[expert_id], gate_shape, grid, ksigns)
+                up_out = iq2_xxs_mm_triton.iq2_xxs_mm_q8k(
+                    x_qs, x_d, up_w[expert_id], up_shape, grid, ksigns)
+            else:
+                gate_out = iq2_xxs_mm_triton.iq2_xxs_mm(
+                    x_e, gate_w[expert_id], gate_shape, grid, ksigns)
+                up_out = iq2_xxs_mm_triton.iq2_xxs_mm(
+                    x_e, up_w[expert_id], up_shape, grid, ksigns)
             # DSv4 SwiGLU matches fused_moe/utils.swiglu_limit_func: gate is
             # upper-clamped to +swiglu_limit (no lower bound -- negative gate
             # passes through to silu's near-zero output), up is clamped to
@@ -1298,8 +1316,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     up_out, min=-float(swiglu_limit), max=float(swiglu_limit))
             mid = torch.nn.functional.silu(gate_out) * up_out
             # down: Q2_K fused dequant + dot.
-            expert_out = q2_k_mm_triton.q2_k_mm(
-                mid, down_w[expert_id], down_shape)  # [M_e, hidden] bf16
+            if _iq2_q8k:
+                mid_qs, mid_d, mid_bs = q8_k_quantize_triton.quantize_q8_K(mid)
+                expert_out = q2_k_mm_triton.q2_k_mm_q8k(
+                    mid_qs, mid_d, mid_bs, down_w[expert_id], down_shape)
+            else:
+                expert_out = q2_k_mm_triton.q2_k_mm(
+                    mid, down_w[expert_id], down_shape)  # [M_e, hidden] bf16
 
             if _do_diag:
                 try:
