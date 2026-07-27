@@ -48,33 +48,36 @@ adjacent sub-blocks ``is0 = 2*ip`` and ``is1 = 2*ip+1`` share the same
 pair ``ip`` (0..7) the kernel loads ONE 32-byte qs window
 ``qs[k0*32 .. k0*32+32]``, shifts+masks all 32 codes at once, selects
 scale/min per half via ``tl.where(j >= 16)``, and emits ONE [BLOCK_N, 32]
-bf16 weight tile straight into a ``tl.dot`` with the matching [BLOCK_M, 32] A
-tile.  That is 8 bf16 MMAs per 256-K block -- exactly the IQ2_XXS kernel's
-contraction shape, just with the Q2_K dequant in place of the IQ2_XXS grid
-lookup.  No lookup tables are needed (raw codes), so the wrapper takes no LUT
-args.
+fp32 weight tile straight into a tf32 ``tl.dot`` (Ada tf32 tensor cores,
+10-bit mantissa) with the matching [BLOCK_M, 32] A tile.  That is 8 tf32
+MMAs per 256-K block -- exactly the IQ2_XXS kernel's contraction shape,
+just with the Q2_K dequant in place of the IQ2_XXS grid lookup.  No lookup
+tables are needed (raw codes), so the wrapper takes no LUT args.
 
 Why this kernel exists (the three de-risk questions, mirroring Step 4b):
 
   1. REGISTER / SHARED-MEMORY PRESSURE.  Per N-row, one 256-K Q2_K block is
      84 bytes of HBM (16 blocks per K=4096 row = 1344 bytes).  The kernel
-     decodes ONE 32-element pair at a time straight into a [BLOCK_N, 32] bf16
-     register tile (1 KiB at BLOCK_N=16), dots it, and folds the result into
-     the [BLOCK_M, BLOCK_N] fp32 accumulator -- live decoded footprint is
-     O(BLOCK_N * 32) bf16, not O(BLOCK_N * 256).  No LUT is touched (codes
-     are raw), so there is no grid L1 residency requirement at all.  -> fits
-     without spill cliffs (validated: compiles + runs at the speeds
-     reported by ``__main__``).
+     decodes ONE 32-element pair at a time straight into a [BLOCK_N, 32] fp32
+     register tile (2 KiB at BLOCK_N=16), dots it (tf32 MMA), and folds the
+     result into the [BLOCK_M, BLOCK_N] fp32 accumulator -- live decoded
+     footprint is O(BLOCK_N * 32) fp32, not O(BLOCK_N * 256).  No LUT is
+     touched (codes are raw), so there is no grid L1 residency requirement at
+     all.  -> fits without spill cliffs (validated: compiles + runs at the
+     speeds reported by ``__main__``).
 
   2. ACCURACY.  Decode happens in fp32 (matching the Step-0 reference) and is
-     cast to bf16 only at the ``tl.dot`` boundary, so the only loss vs the
-     fp32-dequant reference is bf16-MMA rounding (the same loss the IQ2_XXS
-     and {-4,-1,1,4} kernels accept).  ``__main__`` measures the gap vs the
-     CPU-reference dequant + torch fp32 matmul AND vs a bf16-GPU matmul
-     (which isolates the bf16-MMA accum-order gap).  A dedicated fp32 dequant
-     kernel (``_q2_k_dequant_kernel`` + ``q2_k_dequant``) proves the fp32
-     dequant arithmetic matches the reference bit-for-bit (modulo unavoidable
-     GPU-FMA vs CPU rounding on a handful of ULPs, far below the gate).
+     kept in fp32 at the ``tl.dot`` boundary (NO bf16 cast), so the only loss
+     vs the fp32-dequant reference is tf32-MMA rounding (10-bit mantissa on
+     Ada -- 3 more bits than the bf16-MMA the IQ2_XXS/{-4,-1,1,4} kernels
+     accept).  The earlier bf16 dot rounded the small dequanted weights
+     coarsely enough to fail the 16K needle; tf32 restores the precision.
+     ``__main__`` measures the gap vs the CPU-reference dequant + torch fp32
+     matmul AND vs a bf16-GPU matmul (which isolates the MMA accum-order
+     gap).  A dedicated fp32 dequant kernel (``_q2_k_dequant_kernel`` +
+     ``q2_k_dequant``) proves the fp32 dequant arithmetic matches the
+     reference bit-for-bit (modulo unavoidable GPU-FMA vs CPU rounding on a
+     handful of ULPs, far below the gate).
 
   3. PERFORMANCE.  The fused kernel reads 2.625 bits/element of weight HBM
      (84 B / 256 elems) instead of 16 bit/elem (bf16), so it is HBM-cheap
@@ -130,10 +133,10 @@ DEFAULT_GGUF = "/root/antirez/ds4/ds4flash.gguf"
 # Contraction strategy: iterate over K one Q2_K block (256 elems) at a time;
 # inside each block, static-unroll the 8 PAIRS of sub-blocks (pair ip covers
 # sub-blocks 2*ip and 2*ip+1 -> a contiguous 32-wide K-stripe), decoding each
-# 32-wide W stripe straight into a bf16 register tile and dotting it with the
-# matching [BLOCK_M, 32] A tile.  This mirrors the IQ2_XXS kernel's 32-group
-# contraction with the Q2_K dequant (scale/min + raw 2-bit codes) in place of
-# the IQ2_XXS codebook.
+# 32-wide W stripe straight into an fp32 register tile and dotting it (tf32
+# MMA) with the matching [BLOCK_M, 32] A tile.  This mirrors the IQ2_XXS
+# kernel's 32-group contraction with the Q2_K dequant (scale/min + raw 2-bit
+# codes) in place of the IQ2_XXS codebook.
 # ---------------------------------------------------------------------------
 @triton.jit
 def _q2_k_mm_kernel(
@@ -219,17 +222,24 @@ def _q2_k_mm_kernel(
             # Q2_K dequant: y = d * scale * code - dmin * min (fp32).
             y = d_fp32[:, None] * scale_vec * codes_f \
                 - dmin_fp32[:, None] * min_vec                      # [BLOCK_N, 32]
-            w_tile = y.to(tl.bfloat16)                              # [BLOCK_N, 32]
+            # KEEP fp32 -- do NOT cast to bf16.  bf16's 7-bit mantissa loses
+            # precision on the small dequanted weight values; across 43 layers
+            # x long context the rounding compounds (the 16K-needle failure
+            # mode).  fp32 operands feed tf32 tensor cores on Ada (10-bit
+            # mantissa via allow_tf32) -- 3 extra mantissa bits over bf16.
+            w_tile = y                                              # [BLOCK_N, 32] fp32
 
             # A tile [BLOCK_M, 32] for this pair's K-window.
             k_glob = kb * 256 + ip * 32 + i32                      # [32]
             a_tile = tl.load(
                 a_ptr + offs_m[:, None] * stride_am + k_glob[None, :] * stride_ak,
                 mask=mask_m[:, None], other=0.0,
-            ).to(tl.bfloat16)                                       # [BLOCK_M, 32]
+            ).to(tl.float32)                                        # [BLOCK_M, 32] fp32
 
-            # Fused bf16 dot, fp32 accumulate.
-            acc += tl.dot(a_tile, tl.trans(w_tile))
+            # Fused tf32 dot (fp32 operands -> Ada tf32 MMA, 10-bit mantissa),
+            # fp32 accumulate.  allow_tf32=True is the default on Ada but set
+            # explicitly here so the precision choice is obvious at the call.
+            acc += tl.dot(a_tile, tl.trans(w_tile), allow_tf32=True)
 
     tl.store(
         c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,

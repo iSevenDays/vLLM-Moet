@@ -11,11 +11,13 @@ directly from the raw IQ2_XXS block bytes, *without* materializing the
 dequantized weight matrix. For each 256-K block (66 bytes) the kernel
 decodes the 256 weight values into registers (reusing the bitfield +
 grid-lookup logic proven bit-exact in ``iq2_xxs_triton.py``, Step 4a) and
-folds them straight into a bf16 ``tl.dot`` with a 32-wide A tile,
-accumulating in fp32 -- exactly the structure of the shipped {-4,-1,1,4}
-kernel ``moe_w2_sm89.moe_w2_mm_sm89`` (lines 129-165: load weight tile,
-dequant in-register, bf16 dot, fp32 accumulate, scale fold), with the
-IQ2_XXS codebook in place of the 2-bit {-4,-1,1,4} codebook.
+folds them straight into a tf32 ``tl.dot`` (fp32 operands, Ada tf32 tensor
+cores -- 10-bit mantissa) with a 32-wide A tile, accumulating in fp32.
+Earlier revisions used a bf16 dot (7-bit mantissa); that rounded the tiny
+dequanted weight values ({+/-8,+/-25,+/-43} * ~0.001) coarsely enough to
+flatten logits at long context and fail the 16K needle (maxp=0.948).  The
+3 extra mantissa bits of tf32 over bf16 restore enough per-element
+precision to pass 16K without resorting to the Q8_K+DP4A trajectory.
 
 Why this kernel exists (the three de-risk questions):
 
@@ -32,11 +34,12 @@ Why this kernel exists (the three de-risk questions):
      (validated: compiles + runs at the speeds reported by ``__main__``).
 
   2. ACCURACY.  Decode happens in fp32 (matching the Step-4a reference) and
-     is cast to bf16 only at the ``tl.dot`` boundary, so the only loss vs
-     the fp32-dequant reference is bf16-MMA rounding (the same loss the
-     {-4,-1,1,4} kernel accepts).  ``__main__`` measures the gap vs the
-     CPU-reference dequant + torch fp32 matmul; the achieved relative error
-     is reported there (target ~1e-2, comparable to the {-4,-1,1,4} gate).
+     is kept in fp32 at the ``tl.dot`` boundary (NO bf16 cast), so the only
+     loss vs the fp32-dequant reference is tf32-MMA rounding (10-bit
+     mantissa on Ada -- 3 more bits than the bf16-MMA the {-4,-1,1,4}
+     kernel accepts).  ``__main__`` measures the gap vs the CPU-reference
+     dequant + torch fp32 matmul; the achieved relative error is reported
+     there (target ~1e-2, comparable to the {-4,-1,1,4} gate).
 
   3. PERFORMANCE.  The fused kernel reads 2.0625 bits/element of weight HBM
      (66 B / 256 elems) instead of 16 bit/elem (bf16), so it is HBM-cheap
@@ -137,10 +140,10 @@ def _get_luts(device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
 #
 # Contraction strategy: iterate over K one IQ2_XXS block (256 elems) at a
 # time; inside each block, static-unroll the 8 sub-blocks of 32 elements,
-# decoding each 32-wide W stripe straight into a bf16 register tile and
-# dotting it with the matching [BLOCK_M, 32] A tile.  This mirrors the
-# {-4,-1,1,4} kernel's 32-group contraction (one tl.dot per 32-elem stripe)
-# with IQ2_XXS dequant in place of the 2-bit codebook.
+# decoding each 32-wide W stripe straight into an fp32 register tile and
+# dotting it (tf32 MMA) with the matching [BLOCK_M, 32] A tile.  This
+# mirrors the {-4,-1,1,4} kernel's 32-group contraction (one tl.dot per
+# 32-elem stripe) with IQ2_XXS dequant in place of the 2-bit codebook.
 # ---------------------------------------------------------------------------
 @triton.jit
 def _iq2_xxs_mm_kernel(
@@ -228,17 +231,26 @@ def _iq2_xxs_mm_kernel(
             signed = (grid_vals * sign_factor).to(tl.float32)             # [BN,4,8]
             scaled = scale_sb[:, None, None] * signed                     # [BN,4,8]
             # Row-major reshape: [bn, k, i] -> [bn, k*8+i] == [bn, 32].
-            w_tile = tl.reshape(scaled, (BLOCK_N, 32)).to(tl.bfloat16)    # [BN,32]
+            # KEEP fp32 -- do NOT cast to bf16.  The dequanted weight values
+            # are {+/-8, +/-25, +/-43} * ~0.001 (tiny); bf16's 7-bit mantissa
+            # rounds them coarsely, and across 43 layers x long context that
+            # rounding compounds and flattens logits (the 16K-needle failure
+            # mode, maxp=0.948).  fp32 operands feed tf32 tensor cores on Ada
+            # (10-bit mantissa via allow_tf32) -- 3 extra mantissa bits over
+            # bf16, restoring enough per-element precision to pass 16K.
+            w_tile = tl.reshape(scaled, (BLOCK_N, 32))                    # [BN,32] fp32
 
             # A tile [BLOCK_M, 32] for this sub-block's K-window.
             k_glob = kb * 256 + ib32 * 32 + i32                  # [32]
             a_tile = tl.load(
                 a_ptr + offs_m[:, None] * stride_am + k_glob[None, :] * stride_ak,
                 mask=mask_m[:, None], other=0.0,
-            ).to(tl.bfloat16)                                    # [BLOCK_M,32]
+            ).to(tl.float32)                                     # [BLOCK_M,32] fp32
 
-            # Fused bf16 dot, fp32 accumulate.
-            acc += tl.dot(a_tile, tl.trans(w_tile))
+            # Fused tf32 dot (fp32 operands -> Ada tf32 MMA, 10-bit mantissa),
+            # fp32 accumulate.  allow_tf32=True is the default on Ada but set
+            # explicitly here so the precision choice is obvious at the call.
+            acc += tl.dot(a_tile, tl.trans(w_tile), allow_tf32=True)
 
     tl.store(
         c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
