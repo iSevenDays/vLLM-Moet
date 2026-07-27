@@ -77,7 +77,7 @@ except ImportError:  # standalone execution
 # ---------------------------------------------------------------------------
 @triton.jit
 def _q8_K_quantize_kernel(
-    x_ptr,         # *bf16 [M, K]
+    x_ptr,         # *bf16 OR *fp32 [M, K] (load + .to(fp32) is exact for both)
     qs_ptr,        # *int8 [M, K]
     d_ptr,         # *fp32 [M, K // 256]
     bsums_ptr,     # *int16 [M, K // 16]
@@ -153,10 +153,17 @@ def _q8_K_quantize_kernel(
 # Python wrapper.
 # ---------------------------------------------------------------------------
 def quantize_q8_K(x_bf16: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Quantize bf16 activations ``[M, K]`` to Q8_K format.
+    """Quantize bf16 or fp32 activations ``[M, K]`` to Q8_K format.
 
     Args:
-        x_bf16: bf16 activations ``[M, K]``. K must be a multiple of QK_K=256.
+        x_bf16: bf16 OR fp32 activations ``[M, K]``. K must be a multiple of
+            QK_K=256. The kernel loads the values and immediately casts to
+            fp32 (``.to(tl.float32)`` after load), which is exact for both
+            bf16 and fp32 inputs, so the produced Q8_K blocks are bit-identical
+            for the same logical value. Accepting fp32 lets the caller keep
+            the gate/up + SwiGLU math in fp32 and quantize from fp32 directly,
+            avoiding the bf16-then-Q8_K double-rounding that compounds across
+            43 layers (the 16K-needle failure mode).
 
     Returns:
         (qs, d, bsums):
@@ -165,8 +172,9 @@ def quantize_q8_K(x_bf16: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, tor
           - bsums: int16 ``[M, K // 16]`` per-16-block sums of qs.
       All on the same device as ``x_bf16``.
     """
-    if x_bf16.dtype != torch.bfloat16:
-        raise TypeError(f"x must be bf16, got {x_bf16.dtype}")
+    if x_bf16.dtype not in (torch.bfloat16, torch.float32):
+        raise TypeError(
+            f"x must be bf16 or fp32, got {x_bf16.dtype}")
     M, K = x_bf16.shape
     if K % QK_K != 0:
         raise ValueError(f"K={K} must be a multiple of {QK_K}")

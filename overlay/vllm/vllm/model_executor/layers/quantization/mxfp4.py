@@ -69,6 +69,10 @@ _Q2_K_BLOCK_BYTES = 84
 # kernel will read them (or fall back to its inlined copies).
 _IQ2_LUTS: dict[str, torch.Tensor] = {}
 
+# Process-wide one-shot for the IQ2 Q8_K kernel prewarm (Q1 fix). Toggled in
+# process_weights_after_loading so the JIT runs once across all layers.
+_IQ2_PREWARMED: bool = False
+
 
 def _iq2_enabled() -> bool:
     """VLLM_MOE_W2_IQ2=1 gates the IQ2_XXS/Q2_K weight-loading path."""
@@ -1013,6 +1017,23 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # (the Triton GEMM) will plug in here. For now we leave the raw
         # blocks as-is — the IQ2 kernel reads them directly.
         if self._iq2_active:
+            # Q1: JIT-compile the Q8_K kernels ONCE before the profiling
+            # forward so both TP ranks finish compilation before they reach
+            # the EP all-reduce. Without this, JIT fires concurrently during
+            # the first real forward and one rank stalls at the all-reduce
+            # while the other is still compiling -> the 11-min
+            # shm_broadcast stall. Gated by a module-level one-shot so the
+            # ~43 routed-expert layers trigger prewarm only once.
+            global _IQ2_PREWARMED
+            if (os.getenv("VLLM_MOE_W2_IQ2_Q8K", "0") == "1"
+                    and not _IQ2_PREWARMED):
+                _IQ2_PREWARMED = True
+                try:
+                    self._iq2_prewarm(layer)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "IQ2 prewarm failed (will JIT lazily on first "
+                        "forward): %s", e)
             return
         # VLLM_MOE_W2: build 2-bit tensor-sym planes; skip Marlin/other backends.
         from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
@@ -1084,6 +1105,76 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             "initialization logic. This function should not be called."
         )
 
+    def _iq2_prewarm(self, layer: RoutedExperts) -> None:
+        """JIT-compile the 3 Q8_K kernels (quantize_q8_K, iq2_xxs_mm_q8k,
+        q2_k_mm_q8k) BEFORE the profiling forward.
+
+        Why: under expert-parallel TP the two ranks independently JIT the same
+        Triton kernels during the first real forward. The compile is host-side
+        but interleaved with the dispatch loop, and the ranks reach the
+        end-of-forward TP all-reduce at different times -> the rank that
+        finishes first blocks on the shm_broadcast for ~11 min while the
+        other finishes compiling (the documented stall). Prewarming here,
+        during ``process_weights_after_loading`` (BEFORE any forward),
+        centralizes the JIT on each rank so both reach the all-reduce
+        together.
+
+        Specializations covered: M in {1, 16, 17}. M=1 is the prefill/decode
+        lower bound (single-token expert), M=16 is the kernel's BLOCK_M
+        (single-tile path), M=17 forces the M>BLOCK_M masking path. These
+        are the three distinct M-tiling shapes a real forward sees; warming
+        them covers every subsequent call without re-JIT.
+
+        Uses the layer's real IQ2/Q2_K weight bytes so the N, K, row_bytes
+        and LUT specializations match the production call exactly. The
+        expert-0 slabs are valid by construction (loaded from the GGUF), so
+        the dummy GEMMs produce finite output -- the only goal is to trigger
+        Triton's autotune/cache write for each kernel+constexpr tuple.
+
+        Fail-open: any error is logged by the caller and the kernels JIT
+        lazily as before (slower first forward, but correct).
+        """
+        from vllm.model_executor.layers.quantization.utils import (
+            iq2_xxs_mm_triton, q2_k_mm_triton, q8_k_quantize_triton)
+
+        gate_w = layer.gate_weight_iq2_xxs
+        up_w = layer.up_weight_iq2_xxs
+        down_w = layer.down_weight_q2_k
+
+        _, gate_n, gate_rb = gate_w.shape
+        _, up_n, up_rb = up_w.shape
+        _, dn_n, dn_rb = down_w.shape
+        gate_k = (gate_rb // _IQ2_XXS_BLOCK_BYTES) * _QK_K
+        up_k = (up_rb // _IQ2_XXS_BLOCK_BYTES) * _QK_K
+        dn_k = (dn_rb // _Q2_K_BLOCK_BYTES) * _QK_K
+        device = gate_w.device
+
+        grid, ksigns = iq2_xxs_mm_triton._get_luts(device)
+        gate_shape = (gate_n, gate_k)
+        up_shape = (up_n, up_k)
+        down_shape = (dn_n, dn_k)
+
+        for M in (1, 16, 17):
+            # x_bf16 -> Q8_K (gate/up activations, K = hidden).
+            x_dummy = torch.zeros(
+                M, gate_k, dtype=torch.bfloat16, device=device)
+            x_qs, x_d, _ = q8_k_quantize_triton.quantize_q8_K(x_dummy)
+            # gate/up with out_fp32=False (production path -- bf16 mid, see
+            # the Q3(a) revert note in _iq2_forward).
+            _ = iq2_xxs_mm_triton.iq2_xxs_mm_q8k(
+                x_qs, x_d, gate_w[0], gate_shape, grid, ksigns)
+            _ = iq2_xxs_mm_triton.iq2_xxs_mm_q8k(
+                x_qs, x_d, up_w[0], up_shape, grid, ksigns)
+            # mid (bf16) -> Q8_K (down activations, K = intermediate).
+            mid_dummy = torch.zeros(
+                M, dn_k, dtype=torch.bfloat16, device=device)
+            mid_qs, mid_d, mid_bs = q8_k_quantize_triton.quantize_q8_K(
+                mid_dummy)
+            _ = q2_k_mm_triton.q2_k_mm_q8k(
+                mid_qs, mid_d, mid_bs, down_w[0], down_shape)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+
     def _iq2_forward(
         self,
         layer: RoutedExperts,
@@ -1131,11 +1222,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             iq2_xxs_mm_triton, q2_k_mm_triton,
             q8_k_quantize_triton)
 
-        # NAN_CHECK: default ON for in-flight diagnostics (was opt-in). When
-        # a per-expert GEMM emits non-finite values, CLAMP and log loudly so
-        # the boot survives and the offending expert is identified. Set
-        # VLLM_MOE_W2_IQ2_NAN_CHECK=0 to disable.
-        _iq2_nan_check = os.getenv("VLLM_MOE_W2_IQ2_NAN_CHECK", "1") != "0"
+        # NAN_CHECK: default OFF. The per-expert non-finite check forces a
+        # host<->GPU sync (`.item()` on a GPU bool) every iteration, which
+        # costs ~5500 syncs/forward under DSv4 (43 layers x ~128 experts).
+        # That sync churn is a diagnostic -- not needed for production or
+        # needle runs. Re-enable with VLLM_MOE_W2_IQ2_NAN_CHECK=1 when
+        # investigating a NaN/Inf regression.
+        _iq2_nan_check = os.getenv("VLLM_MOE_W2_IQ2_NAN_CHECK", "0") == "1"
         # Q8_K+DP4A trajectory: when set, quantize the bf16 activations to Q8_K
         # and use the int8 DP4A GEMMs (iq2_xxs_mm_q8k / q2_k_mm_q8k). This
         # matches antirez/llama.cpp's production CUDA dot path bit-for-bit
@@ -1263,6 +1356,20 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         apply_router_weight_on_input = getattr(
             layer, "apply_router_weight_on_input", False)
 
+        # ---- Q1 hoist: ONE quantize_q8_K for the whole batch ---------------
+        # Per-row Q8_K blocks are along K -- each row is quantized
+        # independently by _q8_K_quantize_kernel (one program per
+        # (M-block, kb)). So quantize-then-gather is BIT-IDENTICAL to
+        # gather-then-quantize, and we can quantize the full [num_dispatches,
+        # hidden] batch ONCE here (1 kernel launch) instead of per expert
+        # (~128 launches/forward under DSv4). The per-expert loop just slices
+        # the precomputed Q8_K tiles by [s:e].
+        if _iq2_q8k and x_per_slot.shape[0] > 0:
+            x_qs_all, x_d_all, _ = q8_k_quantize_triton.quantize_q8_K(
+                x_per_slot)
+        else:
+            x_qs_all = x_d_all = None
+
         # ---- Per-expert gate/up SwiGLU down + weighted combine ------------
         uniq, counts = torch.unique_consecutive(
             local_ids_s, return_counts=True)
@@ -1270,6 +1377,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             torch.zeros(1, dtype=torch.long, device=device),
             counts.cumsum(0).to(torch.long),
         ])
+
+        # DSv4 SwiGLU clamp thresholds (constant across experts). Hoisted out
+        # of the loop (getattr was per-iteration before; behavior identical).
+        swiglu_limit = getattr(layer, "swiglu_limit", None)
+        swiglu_hi = float(swiglu_limit) if swiglu_limit else None
+        swiglu_lo = -float(swiglu_limit) if swiglu_limit else None
 
         # Hoist the GPU→CPU syncs OUT of the per-expert loop. Under EP each
         # rank owns different experts/tokens, so per-iteration .item() syncs
@@ -1292,7 +1405,22 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # gate/up: IQ2_XXS fused dequant + dot.
             if _iq2_q8k:
                 # Q8_K-activation DP4A path (matches antirez trajectory).
-                x_qs, x_d, _ = q8_k_quantize_triton.quantize_q8_K(x_e)
+                # Slice the hoisted full-batch Q8_K tiles (Q1 hoist).
+                #
+                # NOTE: out_fp32=True (gate/up -> fp32 -> fp32 SwiGLU ->
+                # quantize mid from fp32) was tested as the Q3(a) fix for the
+                # 16K-needle gap and REGRESSED: 8K went PASS(0.996)->FAIL(0.831)
+                # and 16K went FAIL(0.889)->FAIL(0.381, 1-token EOS collapse).
+                # The Q8_K calibration target for this checkpoint evidently
+                # matches the bf16-mid trajectory, NOT the antirez fp32-mid
+                # trajectory (the bf16 mid rounding appears to compensate for
+                # another imprecision in the path). Keep out_fp32=False
+                # (bf16 gate/up + bf16 mid + quantize from bf16) as the
+                # production path. The fp32-mid path remains available via
+                # the kernels' out_fp32 kwarg + quantize_q8_K's fp32 input
+                # support for future experimentation.
+                x_qs = x_qs_all[s:e]
+                x_d = x_d_all[s:e]
                 gate_out = iq2_xxs_mm_triton.iq2_xxs_mm_q8k(
                     x_qs, x_d, gate_w[expert_id], gate_shape, grid, ksigns)
                 up_out = iq2_xxs_mm_triton.iq2_xxs_mm_q8k(
@@ -1309,11 +1437,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # path applies this via the FusedMoE config (config.swiglu_limit
             # = 10.0 for DSv4-Flash); the per-expert Python loop must apply
             # the same clamp or long-context outputs drift (16K needle).
-            swiglu_limit = getattr(layer, "swiglu_limit", None)
-            if swiglu_limit:
-                gate_out = torch.clamp(gate_out, max=float(swiglu_limit))
-                up_out = torch.clamp(
-                    up_out, min=-float(swiglu_limit), max=float(swiglu_limit))
+            if swiglu_hi is not None:
+                gate_out = torch.clamp(gate_out, max=swiglu_hi)
+                up_out = torch.clamp(up_out, min=swiglu_lo, max=swiglu_hi)
             mid = torch.nn.functional.silu(gate_out) * up_out
             # down: Q2_K fused dequant + dot.
             if _iq2_q8k:

@@ -725,7 +725,7 @@ def _iq2_xxs_mm_q8k_kernel(
     w_ptr,         # *uint8 [N, BLOCKS_PER_ROW * 66]
     grid_ptr,      # *uint8 [2048]
     ksigns_ptr,    # *uint8 [128]
-    c_ptr,         # *bf16 [M, N]
+    c_ptr,         # *bf16 [M, N] or *fp32 [M, N] (selected by OUT_FP32)
     M, N_RUNTIME,
     stride_aqm, stride_aqk,
     stride_adm,
@@ -736,6 +736,7 @@ def _iq2_xxs_mm_q8k_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_BYTES: tl.constexpr,
+    OUT_FP32: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
     pid_m = tl.program_id(1)
@@ -814,11 +815,22 @@ def _iq2_xxs_mm_q8k_kernel(
         scale = 0.125 * d_fp16[None, :] * a_d[:, None]            # [BLOCK_M, BLOCK_N] fp32
         acc_f32 += scale * acc_i32.to(tl.float32)
 
-    tl.store(
-        c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
-        acc_f32.to(tl.bfloat16),
-        mask=mask_m[:, None] & mask_n[None, :],
-    )
+    if OUT_FP32:
+        # Keep the fp32 accumulator (no bf16 cast).  Used for the gate/up
+        # GEMMs so SwiGLU runs in fp32 and quantize_q8_K sees fp32 values,
+        # avoiding the bf16-then-Q8_K double-rounding that compounds across
+        # 43 layers (the 16K-needle failure mode, maxp=0.889).
+        tl.store(
+            c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+            acc_f32,
+            mask=mask_m[:, None] & mask_n[None, :],
+        )
+    else:
+        tl.store(
+            c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+            acc_f32.to(tl.bfloat16),
+            mask=mask_m[:, None] & mask_n[None, :],
+        )
 
 
 def iq2_xxs_mm_q8k(
@@ -832,6 +844,7 @@ def iq2_xxs_mm_q8k(
     block_m: int = 16,
     block_n: int = 16,
     num_warps: int = 2,
+    out_fp32: bool = False,
 ) -> torch.Tensor:
     """Fused IQ2_XXS GEMM with Q8_K activations (matches antirez DP4A math).
 
@@ -845,9 +858,15 @@ def iq2_xxs_mm_q8k(
         w_iq2xxs_bytes: uint8 raw IQ2_XXS blocks (same layout as ``iq2_xxs_mm``).
         w_shape: ``(N, K)`` logical weight shape. K must be a multiple of 256.
         grid, ksigns: IQ2 lookup tables (same as ``iq2_xxs_mm``).
+        out_fp32: when True, return fp32 ``[M, N]`` (skip the bf16 epilogue
+            cast). Use this for the gate/up GEMMs so SwiGLU runs in fp32 and
+            the downstream ``quantize_q8_K`` sees fp32 values -- avoids the
+            bf16-then-Q8_K double-rounding that compounds across 43 layers
+            (the 16K-needle failure mode).
 
     Returns:
-        bf16 ``[M, N]`` on the same device as ``a_qs``.
+        ``[M, N]`` tensor -- fp32 if ``out_fp32`` else bf16, on the same
+        device as ``a_qs``.
     """
     if a_qs.dtype != torch.int8:
         raise TypeError(f"a_qs must be int8, got {a_qs.dtype}")
@@ -878,7 +897,9 @@ def iq2_xxs_mm_q8k(
     ksigns = ksigns.reshape(-1).contiguous().to(device)
     a_d = a_d.contiguous().to(device)
 
-    c = torch.empty((M, N), dtype=torch.bfloat16, device=device)
+    c = torch.empty(
+        (M, N), dtype=torch.float32 if out_fp32 else torch.bfloat16,
+        device=device)
     grid_dim = (triton.cdiv(N, block_n), triton.cdiv(M, block_m))
     _iq2_xxs_mm_q8k_kernel[grid_dim](
         a_qs, a_d, w, grid, ksigns, c,
@@ -892,6 +913,7 @@ def iq2_xxs_mm_q8k(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_BYTES=IQ2_XXS_BLOCK_BYTES,
+        OUT_FP32=out_fp32,
         num_warps=num_warps,
     )
     return c

@@ -879,7 +879,7 @@ def _q2_k_mm_q8k_kernel(
     a_d_ptr,       # *fp32 [M, K // 256]  per-block Q8_K scales
     a_bsums_ptr,   # *int16 [M, K // 16]  per-16-sub-block sums of qs
     w_ptr,         # *uint8 [N, BLOCKS_PER_ROW * 84]
-    c_ptr,         # *bf16 [M, N]
+    c_ptr,         # *bf16 [M, N] or *fp32 [M, N] (selected by OUT_FP32)
     M, N_RUNTIME,
     stride_aqm, stride_aqk,
     stride_adm,
@@ -891,6 +891,7 @@ def _q2_k_mm_q8k_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_BYTES: tl.constexpr,
+    OUT_FP32: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
     pid_m = tl.program_id(1)
@@ -985,11 +986,18 @@ def _q2_k_mm_q8k_kernel(
         dmin_arr = a_d[:, None] * dmin_fp32[None, :]                 # [BLOCK_M, BLOCK_N]
         acc_f32 += dall * isum.to(tl.float32) - dmin_arr * summs.to(tl.float32)
 
-    tl.store(
-        c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
-        acc_f32.to(tl.bfloat16),
-        mask=mask_m[:, None] & mask_n[None, :],
-    )
+    if OUT_FP32:
+        tl.store(
+            c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+            acc_f32,
+            mask=mask_m[:, None] & mask_n[None, :],
+        )
+    else:
+        tl.store(
+            c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+            acc_f32.to(tl.bfloat16),
+            mask=mask_m[:, None] & mask_n[None, :],
+        )
 
 
 def q2_k_mm_q8k(
@@ -1002,6 +1010,7 @@ def q2_k_mm_q8k(
     block_m: int = 16,
     block_n: int = 16,
     num_warps: int = 2,
+    out_fp32: bool = False,
 ) -> torch.Tensor:
     """Fused Q2_K GEMM with Q8_K activations (matches antirez DP4A math).
 
@@ -1015,9 +1024,14 @@ def q2_k_mm_q8k(
         a_bsums: int16 ``[M, K // 16]`` per-16-sub-block sums of qs.
         w_q2k_bytes: uint8 raw Q2_K blocks (same layout as ``q2_k_mm``).
         w_shape: ``(N, K)``. K must be a multiple of 256.
+        out_fp32: when True, return fp32 ``[M, N]`` (skip the bf16 epilogue
+            cast). The production call passes ``out_fp32=False`` for the down
+            GEMM (its output is cast back to fp32 in the weighted combine);
+            ``True`` is supported for symmetry + testing.
 
     Returns:
-        bf16 ``[M, N]`` on the same device as ``a_qs``.
+        ``[M, N]`` tensor -- fp32 if ``out_fp32`` else bf16, on the same
+        device as ``a_qs``.
     """
     if a_qs.dtype != torch.int8:
         raise TypeError(f"a_qs must be int8, got {a_qs.dtype}")
@@ -1051,7 +1065,9 @@ def q2_k_mm_q8k(
     a_d = a_d.contiguous().to(device)
     a_bsums = a_bsums.contiguous().to(device)
 
-    c = torch.empty((M, N), dtype=torch.bfloat16, device=device)
+    c = torch.empty(
+        (M, N), dtype=torch.float32 if out_fp32 else torch.bfloat16,
+        device=device)
     grid_dim = (triton.cdiv(N, block_n), triton.cdiv(M, block_m))
     _q2_k_mm_q8k_kernel[grid_dim](
         a_qs, a_d, a_bsums, w, c,
@@ -1066,6 +1082,7 @@ def q2_k_mm_q8k(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_BYTES=Q2_K_BLOCK_BYTES,
+        OUT_FP32=out_fp32,
         num_warps=num_warps,
     )
     return c
