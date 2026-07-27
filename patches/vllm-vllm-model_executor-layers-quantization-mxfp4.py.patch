@@ -1,5 +1,5 @@
 diff --git a/vllm/model_executor/layers/quantization/mxfp4.py b/vllm/model_executor/layers/quantization/mxfp4.py
-index 5ef5fd4..2a6d1ab 100644
+index 5ef5fd4..7352f31 100644
 --- a/vllm/model_executor/layers/quantization/mxfp4.py
 +++ b/vllm/model_executor/layers/quantization/mxfp4.py
 @@ -1,5 +1,7 @@
@@ -358,7 +358,7 @@ index 5ef5fd4..2a6d1ab 100644
          w1_bias = getattr(layer, "w13_bias", None)
          w2_bias = getattr(layer, "w2_bias", None)
          swiglu_limit = getattr(layer, "swiglu_limit", None)
-@@ -776,6 +1084,302 @@
+@@ -776,6 +1084,312 @@
              "initialization logic. This function should not be called."
          )
  
@@ -562,8 +562,18 @@ index 5ef5fd4..2a6d1ab 100644
 +                x_e, gate_w[expert_id], gate_shape, grid, ksigns)
 +            up_out = iq2_xxs_mm_triton.iq2_xxs_mm(
 +                x_e, up_w[expert_id], up_shape, grid, ksigns)
-+            # SwiGLU = SiLU(gate) * up (DSv4 routed experts use plain silu;
-+            # the clamped variant is shared-experts only).
++            # DSv4 SwiGLU matches fused_moe/utils.swiglu_limit_func: gate is
++            # upper-clamped to +swiglu_limit (no lower bound -- negative gate
++            # passes through to silu's near-zero output), up is clamped to
++            # +/-swiglu_limit, then mid = silu(gate) * up. The modular-kernel
++            # path applies this via the FusedMoE config (config.swiglu_limit
++            # = 10.0 for DSv4-Flash); the per-expert Python loop must apply
++            # the same clamp or long-context outputs drift (16K needle).
++            swiglu_limit = getattr(layer, "swiglu_limit", None)
++            if swiglu_limit:
++                gate_out = torch.clamp(gate_out, max=float(swiglu_limit))
++                up_out = torch.clamp(
++                    up_out, min=-float(swiglu_limit), max=float(swiglu_limit))
 +            mid = torch.nn.functional.silu(gate_out) * up_out
 +            # down: Q2_K fused dequant + dot.
 +            expert_out = q2_k_mm_triton.q2_k_mm(
@@ -661,7 +671,7 @@ index 5ef5fd4..2a6d1ab 100644
      def apply(
          self,
          layer: RoutedExperts,
-@@ -785,6 +1389,25 @@
+@@ -785,6 +1399,25 @@
          shared_experts: SharedExperts | None,
          shared_experts_input: torch.Tensor | None,
      ) -> torch.Tensor:

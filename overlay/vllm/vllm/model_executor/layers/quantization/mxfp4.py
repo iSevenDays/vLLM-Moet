@@ -1284,8 +1284,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 x_e, gate_w[expert_id], gate_shape, grid, ksigns)
             up_out = iq2_xxs_mm_triton.iq2_xxs_mm(
                 x_e, up_w[expert_id], up_shape, grid, ksigns)
-            # SwiGLU = SiLU(gate) * up (DSv4 routed experts use plain silu;
-            # the clamped variant is shared-experts only).
+            # DSv4 SwiGLU matches fused_moe/utils.swiglu_limit_func: gate is
+            # upper-clamped to +swiglu_limit (no lower bound -- negative gate
+            # passes through to silu's near-zero output), up is clamped to
+            # +/-swiglu_limit, then mid = silu(gate) * up. The modular-kernel
+            # path applies this via the FusedMoE config (config.swiglu_limit
+            # = 10.0 for DSv4-Flash); the per-expert Python loop must apply
+            # the same clamp or long-context outputs drift (16K needle).
+            swiglu_limit = getattr(layer, "swiglu_limit", None)
+            if swiglu_limit:
+                gate_out = torch.clamp(gate_out, max=float(swiglu_limit))
+                up_out = torch.clamp(
+                    up_out, min=-float(swiglu_limit), max=float(swiglu_limit))
             mid = torch.nn.functional.silu(gate_out) * up_out
             # down: Q2_K fused dequant + dot.
             expert_out = q2_k_mm_triton.q2_k_mm(
