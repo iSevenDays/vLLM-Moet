@@ -1356,15 +1356,23 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     expert_out = torch.nan_to_num(expert_out)
 
             if apply_router_weight_on_input:
-                contrib = expert_out
+                # Router weight was already folded into x at input; just
+                # contribute expert_out (converted to fp32 to preserve
+                # precision in the fp32 accumulator below).
+                contrib_fp32 = expert_out.to(torch.float32)
             else:
-                w_e = weights_s[s:e].to(expert_out.dtype)
-                contrib = expert_out * w_e.unsqueeze(-1)
+                # Combine in FP32 (matches fused_moe/fused_moe.py:1776
+                # "finalize_weighted_expert_output" + llama.cpp's fp32 MoE
+                # combine). The earlier bf16 multiply expert_out * w_e
+                # truncated w_e to bf16 mantissa, losing router-weight
+                # precision at long context (compounds across 43 layers).
+                w_e = weights_s[s:e].to(torch.float32)
+                contrib_fp32 = expert_out.to(torch.float32) * w_e.unsqueeze(-1)
             # index_add_ handles the same token dispatched to this expert in
             # multiple slots (weights sum) and to different experts (partial
             # sums across the loop). fp32 accumulation matches the reference
             # combine precision.
-            out.index_add_(0, tids_e, contrib.to(torch.float32))
+            out.index_add_(0, tids_e, contrib_fp32)
 
         # EP all-reduce note: under expert-parallel TP each rank computed
         # ONLY its local experts' contributions (non-local experts map to -1
