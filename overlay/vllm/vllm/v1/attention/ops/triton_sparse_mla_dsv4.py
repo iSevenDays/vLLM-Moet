@@ -242,7 +242,7 @@ def _sparse_mla_dsv4_kernel(
             k = k.to(tl.bfloat16)
             s = tl.dot(q, tl.trans(k)) * qk_scale
         else:
-            s = tl.dot(q.to(tl.float32), tl.trans(k)) * qk_scale
+            s = tl.dot(q.to(tl.float32), tl.trans(k), allow_tf32=True) * qk_scale
         s = tl.where(valid[None, :], s, -1.0e30)
         m_new = tl.maximum(m, tl.max(s, axis=1))
         alpha = tl.exp2(m - m_new)
@@ -251,7 +251,7 @@ def _sparse_mla_dsv4_kernel(
         if DOT_BF16:
             acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), k)
         else:
-            acc = acc * alpha[:, None] + tl.dot(p, k)
+            acc = acc * alpha[:, None] + tl.dot(p, k, allow_tf32=True)
         m = m_new
 
     if HAS_EXTRA:
@@ -275,7 +275,7 @@ def _sparse_mla_dsv4_kernel(
                 k = k.to(tl.bfloat16)
                 s = tl.dot(q, tl.trans(k)) * qk_scale
             else:
-                s = tl.dot(q.to(tl.float32), tl.trans(k)) * qk_scale
+                s = tl.dot(q.to(tl.float32), tl.trans(k), allow_tf32=True) * qk_scale
             s = tl.where(valid[None, :], s, -1.0e30)
             m_new = tl.maximum(m, tl.max(s, axis=1))
             alpha = tl.exp2(m - m_new)
@@ -284,7 +284,7 @@ def _sparse_mla_dsv4_kernel(
             if DOT_BF16:
                 acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), k)
             else:
-                acc = acc * alpha[:, None] + tl.dot(p, k)
+                acc = acc * alpha[:, None] + tl.dot(p, k, allow_tf32=True)
             m = m_new
 
     if HAS_SINK:
@@ -598,7 +598,7 @@ def triton_sparse_mla_dsv4(
             IS_PACKED=packed_main,
             EXTRA_IS_PACKED=packed_extra,
             BLOCK_H=block_h,
-            BLOCK_N=32,
+            BLOCK_N=16,
             D=_D,
             D_NOPE=_D_NOPE,
             QUANT_TILE=_QUANT_TILE,
@@ -607,7 +607,7 @@ def triton_sparse_mla_dsv4(
             # (f32 operand tiles measured 295 KiB via AOT compile). The
             # interpreter tier validates semantics in f32; the init-time
             # self-test validates the shipped bf16 path on real silicon.
-            DOT_BF16=not _IS_INTERPRET,
+            DOT_BF16=False,  # force fp32 attention dot (bf16's 7.2e-3/layer compounds at long context)
             num_warps=4,
             num_stages=1,
         )
