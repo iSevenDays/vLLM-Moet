@@ -278,6 +278,7 @@ fi
 docker run -d --name "$NAME" --restart "$RESTART" --gpus "$GPUS" --network "$NETWORK" $IPCARGS \
   --memory "${MEM_GB}g" --memory-swap "$((MEM_GB + 2))g" \
   -v "$MODEL":/model:ro \
+  -v /root/models/DeepSeek-V4-Flash-IQ2:/root/models/DeepSeek-V4-Flash-IQ2:ro \
   -v "$CACHE/$PLANES_SUBDIR":/plane-cache \
   -v "$CACHE/jit":/root/.cache \
   $RESVOL \
