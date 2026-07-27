@@ -241,6 +241,25 @@ def get_max_prefill_buffer_size(vllm_config: VllmConfig):
     return max_model_len * 40
 
 
+def _uses_deep_gemm_scheduler_metadata() -> bool:
+    """Whether to build DeepGEMM paged-MQA scheduler metadata on this device.
+
+    Replaces the bare ``has_deep_gemm()`` presence check: DeepGEMM's paged-MQA
+    kernel is arch-gated, so on silicon where it cannot run (e.g. Ada sm_89,
+    where the indexer falls back to the Triton/torch ports) we must not emit
+    the DeepGEMM scheduler metadata either. SM12x is probed via the dedicated
+    ``is_sm120_deep_gemm_paged_mqa_supported`` gate; everything else defers to
+    the arch-aware ``is_deep_gemm_supported``.
+    """
+    if not current_platform.is_cuda():
+        return False
+    if current_platform.is_device_capability_family(120):
+        from vllm.utils.deep_gemm import is_sm120_deep_gemm_paged_mqa_supported
+        return is_sm120_deep_gemm_paged_mqa_supported()
+    from vllm.utils.deep_gemm import is_deep_gemm_supported
+    return is_deep_gemm_supported()
+
+
 class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
     reorder_batch_threshold: int = 1
 
@@ -810,7 +829,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 seq_lens = seq_lens.unsqueeze(-1)
 
             # DeepGEMM is required for the paged MQA logits on CUDA devices
-            if current_platform.is_cuda() and has_deep_gemm():
+            if _uses_deep_gemm_scheduler_metadata():
                 self.scheduler_metadata_buffer[:] = get_paged_mqa_logits_metadata(
                     seq_lens,
                     self.kv_cache_spec.storage_block_size,

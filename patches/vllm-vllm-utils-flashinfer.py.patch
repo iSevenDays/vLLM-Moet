@@ -1,8 +1,16 @@
 diff --git a/vllm/utils/flashinfer.py b/vllm/utils/flashinfer.py
-index 998c3b6..00bec0b 100644
+index 998c3b6..6a81ed6 100644
 --- a/vllm/utils/flashinfer.py
 +++ b/vllm/utils/flashinfer.py
-@@ -153,11 +153,60 @@
+@@ -9,6 +9,7 @@
+ import functools
+ import importlib
+ import importlib.util
++import inspect
+ import os
+ import shutil
+ from collections.abc import Callable
+@@ -153,11 +154,60 @@
      "trtllm_batch_decode_with_kv_cache_mla",
      fallback_fn=_missing_sparse_mla,
  )
@@ -64,7 +72,7 @@ index 998c3b6..00bec0b 100644
  
  
  # Special case for autotune since it returns a context manager
-@@ -214,7 +263,15 @@
+@@ -214,7 +264,15 @@
  
  @functools.cache
  def has_flashinfer_sparse_mla_sm120() -> bool:
@@ -81,11 +89,10 @@ index 998c3b6..00bec0b 100644
      if not has_flashinfer():
          return False
      try:
-@@ -224,6 +281,16 @@
-             trtllm_batch_decode_with_kv_cache_mla,
+@@ -225,11 +283,42 @@
          )
      except ImportError:
-+        return False
+         return False
 +    import inspect
 +    if "swa_topk_lens" not in inspect.signature(
 +            trtllm_batch_decode_sparse_mla_dsv4).parameters:
@@ -95,6 +102,33 @@ index 998c3b6..00bec0b 100644
 +            "vllm requirements pin 0.6.13 predates the DSV4 SWA kwargs) "
 +            "- sparse MLA decode disabled. Install flashinfer-python"
 +            "==0.6.14 (+ the matching jit-cache wheel).")
-         return False
++        return False
      return (
          callable(trtllm_batch_decode_sparse_mla_dsv4)
+         and callable(trtllm_batch_decode_with_kv_cache_mla)
+         and callable(autotune)
+     )
++
++
++@functools.cache
++def has_flashinfer_sparse_mla_sm89() -> bool:
++    """Return ``True`` if FlashInfer sparse MLA decode runs natively on sm_89.
++
++    Gates on FlashInfer's deepest arch resolver
++    (``_resolve_dsv4_sparse_mla_backend``) actually returning ``"sparse"`` for
++    this device: the import/signature probes above the resolver have lied
++    before (Ada passed both and then died at decode graph capture). On a stock
++    FlashInfer build the resolver refuses pre-SM100 and this returns ``False``;
++    the DSV4 backend then falls back to vLLM's Triton sparse-MLA port instead.
++    """
++    if not has_flashinfer_sparse_mla_sm120():
++        return False
++    try:
++        from flashinfer.mla._core import _resolve_dsv4_sparse_mla_backend
++        device = torch.device("cuda", torch.accelerator.current_device_index())
++        return _resolve_dsv4_sparse_mla_backend(device) == "sparse"
++    except (ImportError, AttributeError, RuntimeError, TypeError, ValueError):
++        return False
+ 
+ 
+ @functools.cache

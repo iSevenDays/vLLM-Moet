@@ -9,6 +9,7 @@ import contextlib
 import functools
 import importlib
 import importlib.util
+import inspect
 import os
 import shutil
 from collections.abc import Callable
@@ -297,6 +298,27 @@ def has_flashinfer_sparse_mla_sm120() -> bool:
         and callable(trtllm_batch_decode_with_kv_cache_mla)
         and callable(autotune)
     )
+
+
+@functools.cache
+def has_flashinfer_sparse_mla_sm89() -> bool:
+    """Return ``True`` if FlashInfer sparse MLA decode runs natively on sm_89.
+
+    Gates on FlashInfer's deepest arch resolver
+    (``_resolve_dsv4_sparse_mla_backend``) actually returning ``"sparse"`` for
+    this device: the import/signature probes above the resolver have lied
+    before (Ada passed both and then died at decode graph capture). On a stock
+    FlashInfer build the resolver refuses pre-SM100 and this returns ``False``;
+    the DSV4 backend then falls back to vLLM's Triton sparse-MLA port instead.
+    """
+    if not has_flashinfer_sparse_mla_sm120():
+        return False
+    try:
+        from flashinfer.mla._core import _resolve_dsv4_sparse_mla_backend
+        device = torch.device("cuda", torch.accelerator.current_device_index())
+        return _resolve_dsv4_sparse_mla_backend(device) == "sparse"
+    except (ImportError, AttributeError, RuntimeError, TypeError, ValueError):
+        return False
 
 
 @functools.cache

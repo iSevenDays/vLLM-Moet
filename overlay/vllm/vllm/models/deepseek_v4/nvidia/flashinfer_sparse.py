@@ -147,15 +147,21 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4FlashMLABackend):
                         "FlashInfer's sparse MLA decode API"
                     )
             else:
-                # Ada: FlashInfer's resolver refuses SM89, so decode and
-                # prefill route to vLLM's Triton sparse-MLA port instead
-                # (same cache layout and call surface). Needs Triton only.
+                # Ada (sm_89): probe FlashInfer's native sparse MLA first
+                # (has_flashinfer_sparse_mla_sm89 asks the deepest arch
+                # resolver for an sm_89 kernel). On a stock FlashInfer build
+                # the resolver refuses pre-SM100 and the native probe is
+                # False; decode/prefill then route to vLLM's Triton
+                # sparse-MLA port (same cache layout and call surface), so
+                # either path satisfying is sufficient.
                 from vllm.triton_utils import HAS_TRITON
+                from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm89
 
-                if not HAS_TRITON:
+                if not has_flashinfer_sparse_mla_sm89() and not HAS_TRITON:
                     return (
-                        "FLASHINFER_MLA_SPARSE_DSV4 on sm_89 uses vLLM's "
-                        "Triton sparse-MLA port and requires Triton"
+                        "FLASHINFER_MLA_SPARSE_DSV4 on sm_89 requires "
+                        "FlashInfer's native sparse MLA or vLLM's Triton "
+                        "sparse-MLA port"
                     )
             return None
         return "FLASHINFER_MLA_SPARSE_DSV4 requires SM10x, SM12x or SM8.9"

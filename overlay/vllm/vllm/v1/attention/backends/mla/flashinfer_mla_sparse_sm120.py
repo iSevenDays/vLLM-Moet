@@ -100,9 +100,27 @@ class FlashInferMLASparseSM120Impl(SparseMLAAttentionImpl[FlashInferMLASparseMet
             if indexer is not None
             else mla_args.get("topk_indices_buffer")
         )
-        from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
+        from vllm.platforms import current_platform
+        from vllm.utils.flashinfer import (
+            has_flashinfer_sparse_mla_sm89,
+            has_flashinfer_sparse_mla_sm120,
+        )
 
-        if not has_flashinfer_sparse_mla_sm120():
+        # Capability-aware probe: on sm_89 ask the resolver-backed probe
+        # (has_flashinfer_sparse_mla_sm89); elsewhere use the SM120
+        # signature probe (has_flashinfer_sparse_mla_sm120).
+        device_capability = current_platform.get_device_capability()
+        is_sm89 = (
+            device_capability is not None
+            and device_capability.major == 8
+            and device_capability.minor == 9
+        )
+        sparse_mla_ok = (
+            has_flashinfer_sparse_mla_sm89()
+            if is_sm89
+            else has_flashinfer_sparse_mla_sm120()
+        )
+        if not sparse_mla_ok:
             raise RuntimeError(
                 "FLASHINFER_MLA_SPARSE_SM120 requires FlashInfer's "
                 "sparse MLA decode API."

@@ -1,5 +1,5 @@
 diff --git a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
-index 97778df..37e4ea6 100644
+index 97778df..98120a4 100644
 --- a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
 +++ b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
 @@ -151,6 +151,7 @@
@@ -10,7 +10,17 @@ index 97778df..37e4ea6 100644
      ]
  
      @staticmethod
-@@ -202,6 +203,7 @@
+@@ -171,7 +172,8 @@
+ 
+     @classmethod
+     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
+-        return capability.major == 12
++        return capability.major == 12 or (
++            capability.major == 8 and capability.minor == 9)
+ 
+     @classmethod
+     def supports_combination(
+@@ -202,6 +204,7 @@
              "fp8",
              "fp8_e4m3",
              "fp8_ds_mla",
@@ -18,7 +28,7 @@ index 97778df..37e4ea6 100644
          ):
              return "kv_cache_dtype not supported"
          vllm_config = get_current_vllm_config()
-@@ -228,6 +230,10 @@
+@@ -228,6 +231,10 @@
          head_size: int,
          cache_dtype_str: str = "auto",
      ) -> tuple[int, ...]:
