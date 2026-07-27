@@ -35,6 +35,8 @@ vllm-vllm-model_executor-layers-quantization-utils-moe_w2_sm89.py.patch
 vllm-vllm-model_executor-layers-quantization-utils-moe_w2_store.py.patch
 vllm-vllm-model_executor-layers-quantization-utils-prefill_timers.py.patch
 vllm-vllm-model_executor-layers-quantization-utils-q2_k_mm_triton.py.patch
+vllm-vllm-model_executor-layers-quantization-utils-q8_K_dp4a_ref.py.patch
+vllm-vllm-model_executor-layers-quantization-utils-q8_k_quantize_triton.py.patch
 vllm-vllm-model_executor-layers-sparse_attn_indexer.py.patch
 vllm-vllm-model_executor-models-deepseek_mtp.py.patch
 vllm-vllm-model_executor-models-qwen3_dspark.py.patch

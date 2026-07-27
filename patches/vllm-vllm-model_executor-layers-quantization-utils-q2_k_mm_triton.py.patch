@@ -1,9 +1,9 @@
 diff --git a/vllm/model_executor/layers/quantization/utils/q2_k_mm_triton.py b/vllm/model_executor/layers/quantization/utils/q2_k_mm_triton.py
 new file mode 100644
-index 0000000..5e7c976 100644
+index 0000000..5e47aa2 100644
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/q2_k_mm_triton.py
-@@ -0,0 +1,833 @@
+@@ -0,0 +1,1065 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Fused Q2_K dequant + dot GEMM (Triton) -- Step 4c de-risking slice.
@@ -833,6 +833,238 @@ index 0000000..5e7c976 100644
 +
 +    print(f"\n=== OVERALL: {'PASS' if overall_pass else 'FAIL'} ===")
 +    return 0 if overall_pass else 1
++
++
++# ===========================================================================
++# Q8_K-activation DP4A variant.
++#
++# Matches antirez's ``dev_dot_q2_K_q8_K_block`` (ds4_cuda.cu:17239) exactly:
++# int8 activations (Q8_K-quantized) DP4A int8 codes (pre-scaled by per-sub-block
++# 4-bit scale; codes 0..3 x scale 0..15 = 0..45, fits int8) -> int32 accumulate
++# -> fp32 fold with ``dall*isum - dmin*summs`` (the Q2_K d/min decomposition).
++#
++# This is the trajectory the IQ2_XXS/Q2_K quantization was calibrated against.
++# The bf16 variant above produces a slightly different result that diverges
++# from the calibration target; across 43 layers x long context this compounds
++# and degrades needle accuracy (the 16K-needle failure mode).
++#
++# Antirez's per-block math (dev_dot_q2_K_q8_K_block, ds4_cuda.cu:17239):
++#   summs = sum over 16 sub-blocks of (q8_K.bsums[is] * (scales[is] >> 4))  int32
++#   isum  = 0
++#   for k in 0,1:
++#     shift = 0
++#     for j in 0..3:
++#       scale = scales[is++] & 0x0f
++#       isum += scale * sum_{i in 16}(q8[i] * ((qs[i] >> shift) & 3))
++#       scale = scales[is++] & 0x0f
++#       isum += scale * sum_{i in 16}(q8[i+16] * ((qs[i+16] >> shift) & 3))
++#       shift += 2; q8 += 32
++#     qs += 32
++#   return dall*isum - dmin*summs   where dall = d_a*d_w, dmin = d_a*dmin_w
++#
++# Pair structure: pairs ip=0..7 cover 32 elements = sub-blocks (is0=2*ip,
++# is1=2*ip+1) at shift=(ip%4)*2.  We PRE-SCALE the codes by per-half scale
++# (scale0 for first 16, scale1 for last 16) -> int8 in [0, 45], then do ONE
++# K=32 DP4A dot per pair.  The min contribution uses the precomputed Q8_K
++# ``bsums`` (sums of 16 qs each) via a 3D-broadcast outer-product accumulation
++# (avoids the unsupported K=16 tl.dot).
++# ===========================================================================
++@triton.jit
++def _q2_k_mm_q8k_kernel(
++    a_qs_ptr,      # *int8 [M, K]  Q8_K-quantized activations
++    a_d_ptr,       # *fp32 [M, K // 256]  per-block Q8_K scales
++    a_bsums_ptr,   # *int16 [M, K // 16]  per-16-sub-block sums of qs
++    w_ptr,         # *uint8 [N, BLOCKS_PER_ROW * 84]
++    c_ptr,         # *bf16 [M, N]
++    M, N_RUNTIME,
++    stride_aqm, stride_aqk,
++    stride_adm,
++    stride_abm,    # stride (per-row) of a_bsums; inner stride is 1
++    stride_wn,
++    stride_cm, stride_cn,
++    BLOCKS_PER_ROW: tl.constexpr,
++    K: tl.constexpr,
++    BLOCK_M: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_BYTES: tl.constexpr,
++):
++    pid_n = tl.program_id(0)
++    pid_m = tl.program_id(1)
++
++    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    mask_m = offs_m < M
++    mask_n = offs_n < N_RUNTIME
++
++    i32 = tl.arange(0, 32)
++    is_half1 = i32 >= 16                                # [32] constexpr bool
++
++    acc_f32 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++
++    for kb in range(BLOCKS_PER_ROW):
++        # ---- Q2_K block base + d (fp16) + dmin (fp16) ---------------------
++        block_base = offs_n * stride_wn + kb * BLOCK_BYTES         # [BLOCK_N]
++
++        d_lo = tl.load(w_ptr + block_base + 80, mask=mask_n, other=0).to(tl.uint32)
++        d_hi = tl.load(w_ptr + block_base + 81, mask=mask_n, other=0).to(tl.uint32)
++        d_fp32 = ((d_lo | (d_hi << 8)).to(tl.uint16)).to(tl.float16, bitcast=True).to(tl.float32)
++        dm_lo = tl.load(w_ptr + block_base + 82, mask=mask_n, other=0).to(tl.uint32)
++        dm_hi = tl.load(w_ptr + block_base + 83, mask=mask_n, other=0).to(tl.uint32)
++        dmin_fp32 = ((dm_lo | (dm_hi << 8)).to(tl.uint16)).to(tl.float16, bitcast=True).to(tl.float32)
++
++        # ---- per-M-row Q8_K scale for this kb ----------------------------
++        a_d = tl.load(a_d_ptr + offs_m * stride_adm + kb, mask=mask_m, other=0.0)  # [BLOCK_M]
++
++        # ---- D-part: 8 pairs, each -> K=32 DP4A dot ----------------------
++        isum = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
++
++        for ip in tl.static_range(8):
++            is0 = 2 * ip
++            is1 = 2 * ip + 1
++            k0 = is0 // 8                # 0 for ip<4, 1 for ip>=4
++            shift = (ip % 4) * 2         # 0,2,4,6,0,2,4,6
++
++            # Per-half scale (low nibble) -- load the 2 scale bytes directly.
++            s0_byte = tl.load(w_ptr + block_base + is0, mask=mask_n, other=0).to(tl.uint32)
++            s1_byte = tl.load(w_ptr + block_base + is1, mask=mask_n, other=0).to(tl.uint32)
++            scale0 = (s0_byte & 0xF).to(tl.int32)                    # [BLOCK_N]
++            scale1 = (s1_byte & 0xF).to(tl.int32)                    # [BLOCK_N]
++
++            # qs window: 32 bytes at offset 16 + k0*32 (both halves of this k-group)
++            qs_offs = 16 + k0 * 32 + i32                              # [32]
++            qs_window = tl.load(
++                w_ptr + block_base[:, None] + qs_offs[None, :],
++                mask=mask_n[:, None], other=0,
++            ).to(tl.uint32)                                          # [BLOCK_N, 32]
++            codes = ((qs_window >> shift) & 0x3).to(tl.int32)        # [BLOCK_N, 32] in 0..3
++
++            # Per-half scale vector: [BLOCK_N, 32], first 16 = scale0, last 16 = scale1.
++            scale_vec = tl.where(
++                is_half1[None, :], scale1[:, None], scale0[:, None]
++            )                                                        # [BLOCK_N, 32]
++
++            # Pre-scale codes (max 15*3=45, fits int8) and cast for DP4A.
++            prescaled = (scale_vec * codes).to(tl.int8)              # [BLOCK_N, 32]
++
++            # Load int8 activations for this pair's K-window.
++            k_glob = kb * 256 + ip * 32 + i32                        # [32]
++            a_tile = tl.load(
++                a_qs_ptr + offs_m[:, None] * stride_aqm + k_glob[None, :] * stride_aqk,
++                mask=mask_m[:, None], other=0,
++            ).to(tl.int8)                                            # [BLOCK_M, 32]
++
++            # DP4A int8 x int8 -> int32 (IMMA on sm_89).
++            sumi = tl.dot(a_tile, tl.trans(prescaled), out_dtype=tl.int32)  # [BLOCK_M, BLOCK_N]
++            isum += sumi
++
++        # ---- Min-part: summs[m,n] = sum over 16 sub-blocks of ------------
++        # ----          (a_bsums[m,is] * mins[n,is])               int32 ----
++        # (mins = high nibble of scales).  Load full scales[16] tile and
++        # a_bsums[16] per-M-row tile, then 3D-broadcast outer-product sum.
++        scales_tile = tl.load(
++            w_ptr + block_base[:, None] + tl.arange(0, 16)[None, :],
++            mask=mask_n[:, None], other=0,
++        ).to(tl.uint32)                                              # [BLOCK_N, 16]
++        mins_tile = (scales_tile >> 4).to(tl.int32)                  # [BLOCK_N, 16]
++
++        bsums_tile = tl.load(
++            a_bsums_ptr + offs_m[:, None] * stride_abm + (kb * 16 + tl.arange(0, 16))[None, :],
++            mask=mask_m[:, None], other=0,
++        ).to(tl.int32)                                              # [BLOCK_M, 16]
++
++        # 3D broadcast outer-product accumulation (validated: bit-exact).
++        summs_3d = bsums_tile[:, None, :] * mins_tile[None, :, :]    # [BLOCK_M, BLOCK_N, 16]
++        summs = tl.sum(summs_3d, axis=2)                             # [BLOCK_M, BLOCK_N]
++
++        # ---- Float fold: dall*isum - dmin*summs (per-kb) -----------------
++        dall = a_d[:, None] * d_fp32[None, :]                        # [BLOCK_M, BLOCK_N]
++        dmin_arr = a_d[:, None] * dmin_fp32[None, :]                 # [BLOCK_M, BLOCK_N]
++        acc_f32 += dall * isum.to(tl.float32) - dmin_arr * summs.to(tl.float32)
++
++    tl.store(
++        c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
++        acc_f32.to(tl.bfloat16),
++        mask=mask_m[:, None] & mask_n[None, :],
++    )
++
++
++def q2_k_mm_q8k(
++    a_qs: torch.Tensor,
++    a_d: torch.Tensor,
++    a_bsums: torch.Tensor,
++    w_q2k_bytes: torch.Tensor,
++    w_shape: Tuple[int, int],
++    *,
++    block_m: int = 16,
++    block_n: int = 16,
++    num_warps: int = 2,
++) -> torch.Tensor:
++    """Fused Q2_K GEMM with Q8_K activations (matches antirez DP4A math).
++
++    Computes the Q2_K x Q8_K dot product using int8 codes (pre-scaled by the
++    per-sub-block 4-bit scale) DP4A'd against Q8_K-quantized int8 activations,
++    with the min contribution folded in via the precomputed Q8_K ``bsums``.
++
++    Args:
++        a_qs: int8 ``[M, K]`` Q8_K-quantized activations.
++        a_d: fp32 ``[M, K // 256]`` per-256-block Q8_K scales.
++        a_bsums: int16 ``[M, K // 16]`` per-16-sub-block sums of qs.
++        w_q2k_bytes: uint8 raw Q2_K blocks (same layout as ``q2_k_mm``).
++        w_shape: ``(N, K)``. K must be a multiple of 256.
++
++    Returns:
++        bf16 ``[M, N]`` on the same device as ``a_qs``.
++    """
++    if a_qs.dtype != torch.int8:
++        raise TypeError(f"a_qs must be int8, got {a_qs.dtype}")
++    if a_d.dtype != torch.float32:
++        raise TypeError(f"a_d must be fp32, got {a_d.dtype}")
++    if a_bsums.dtype != torch.int16:
++        raise TypeError(f"a_bsums must be int16, got {a_bsums.dtype}")
++    if w_q2k_bytes.dtype != torch.uint8:
++        raise TypeError(f"W bytes must be uint8, got {w_q2k_bytes.dtype}")
++    M, K_a = a_qs.shape
++    N, K = w_shape
++    if K != K_a:
++        raise ValueError(f"K mismatch: a_qs has K={K_a}, w_shape has K={K}")
++    if K % QK_K != 0:
++        raise ValueError(f"K={K} must be a multiple of {QK_K}")
++    if a_d.shape != (M, K // QK_K):
++        raise ValueError(f"a_d shape {a_d.shape} != ({M}, {K // QK_K})")
++    if a_bsums.shape != (M, K // 16):
++        raise ValueError(f"a_bsums shape {a_bsums.shape} != ({M}, {K // 16})")
++    blocks_per_row = K // QK_K
++    row_bytes = blocks_per_row * Q2_K_BLOCK_BYTES
++
++    device = a_qs.device
++    a_qs = a_qs.contiguous()
++    w = w_q2k_bytes.reshape(-1).contiguous().to(device)
++    if w.numel() != N * row_bytes:
++        raise ValueError(
++            f"W bytes: have {w.numel()}, expected {N * row_bytes}"
++        )
++    w = w.reshape(N, row_bytes)
++    a_d = a_d.contiguous().to(device)
++    a_bsums = a_bsums.contiguous().to(device)
++
++    c = torch.empty((M, N), dtype=torch.bfloat16, device=device)
++    grid_dim = (triton.cdiv(N, block_n), triton.cdiv(M, block_m))
++    _q2_k_mm_q8k_kernel[grid_dim](
++        a_qs, a_d, a_bsums, w, c,
++        M, N,
++        a_qs.stride(0), a_qs.stride(1),
++        a_d.stride(0),
++        a_bsums.stride(0),
++        w.stride(0),
++        c.stride(0), c.stride(1),
++        BLOCKS_PER_ROW=blocks_per_row,
++        K=K,
++        BLOCK_M=block_m,
++        BLOCK_N=block_n,
++        BLOCK_BYTES=Q2_K_BLOCK_BYTES,
++        num_warps=num_warps,
++    )
++    return c
 +
 +
 +if __name__ == "__main__":

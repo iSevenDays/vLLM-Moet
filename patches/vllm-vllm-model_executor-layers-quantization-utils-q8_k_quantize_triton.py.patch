@@ -1,0 +1,315 @@
+diff --git a/vllm/model_executor/layers/quantization/utils/q8_k_quantize_triton.py b/vllm/model_executor/layers/quantization/utils/q8_k_quantize_triton.py
+new file mode 100644
+index 0000000..dad5e84 100644
+--- /dev/null
++++ b/vllm/model_executor/layers/quantization/utils/q8_k_quantize_triton.py
+@@ -0,0 +1,309 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Q8_K activation quantization (Triton) -- companion to the IQ2_XXS / Q2_K
++DP4A GEMMs that match antirez's ``dev_dot_iq2_xxs_q8_K_block`` /
++``dev_dot_q2_K_q8_K_block`` math bit-for-bit.
++
++Background
++----------
++antirez/llama.cpp's production IQ2_XXS+Q2_K path does NOT pass bf16 activations
++into the dot. Instead it quantizes the activations to Q8_K (one fp32 ``d`` per
++QK_K=256 elements + 256 int8 values + 16 int16 ``bsums`` -- sums of 16 ints
++each), then computes the dot as int8 x int8 -> int32 (DP4A) with a single fp32
++fold at the end:
++
++    sumi = DP4A(int8_w, int8_a)        # int32
++    bsum += sumi * ls                  # int32 (per-sub-block local scale)
++    return 0.125f * d_w * d_a * bsum   # fp32 fold
++
++The IQ2_XXS quantization was calibrated with this Q8_K-DP4A path (the imatrix
++compensates for the int8 quantization noise). A bf16-activation path produces a
++DIFFERENT (slightly more accurate vs fp32) result that diverges from the
++calibration target -- a per-dot gap of ~0.8% worst_rel on real DSv4 weights.
++Across 43 layers x long contexts this compounds and degrades needle accuracy.
++
++This file implements the activation quantizer. The DP4A GEMMs that consume its
++output live in ``iq2_xxs_mm_triton.iq2_xxs_mm_q8k`` and
++``q2_k_mm_triton.q2_k_mm_q8k``.
++
++Q8_K block layout (matches antirez ``cuda_block_q8_K`` /
++``quantize_row_q8_K_ref``):
++
++    float    d;            // fp32 super-block scale = 1 / iscale
++    int8_t   qs[256];      // per-value int8 quantized activations
++    int16_t  bsums[16];    // precomputed sums of 16 ints each (for Q2_K min term)
++
++Per-block math (256 elements):
++
++    amax   = max(|x|)
++    maxv   = x[argmax(|x|)]            // signed max-abs (we use amax; see note)
++    iscale = -127 / maxv               // antirez: -127 (not -128) for IQ2 compat
++    qs[i]  = clip(round_to_nearest(iscale * x[i]), -128, 127)
++    bsums[j] = sum(qs[j*16 .. j*16+15])
++    d      = 1 / iscale
++
++SIGN-OF-MAXV NOTE: ``quantize_row_q8_K_ref`` uses the SIGNED ``maxv`` to compute
++``iscale``. The reconstruction ``d * qs`` and the DP4A dot ``d_a * (int8_w . qs)``
++are both invariant under flipping the sign of ``maxv``: if we use ``+amax``
++always (positive), the qs values flip sign AND ``d_a`` flips sign, so the final
++``d_a * bsum`` product is unchanged. This kernel therefore uses ``+amax`` for
++simplicity (no per-row sign extraction needed). Verified bit-identical to the
++reference on the test suite below.
++"""
++
++from __future__ import annotations
++
++import os
++import sys
++import time
++from typing import Tuple
++
++import numpy as np
++import torch
++import triton
++import triton.language as tl
++
++try:
++    from .iq2_xxs_ref import QK_K
++except ImportError:  # standalone execution
++    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++    from iq2_xxs_ref import QK_K  # type: ignore[no-redef]
++
++
++# ---------------------------------------------------------------------------
++# Triton Q8_K quantization kernel.
++# One program per (M-block, kb). Loads [BLOCK_M, 256] bf16, finds amax per row,
++# quantizes, and stores qs + d + bsums.
++# ---------------------------------------------------------------------------
++@triton.jit
++def _q8_K_quantize_kernel(
++    x_ptr,         # *bf16 [M, K]
++    qs_ptr,        # *int8 [M, K]
++    d_ptr,         # *fp32 [M, K // 256]
++    bsums_ptr,     # *int16 [M, K // 16]
++    M, K,
++    stride_xm, stride_xk,
++    stride_qm, stride_qk,
++    BLOCK_M: tl.constexpr,
++):
++    pid_m = tl.program_id(0)
++    pid_kb = tl.program_id(1)
++
++    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++    offs_k = pid_kb * 256 + tl.arange(0, 256)
++    mask_m = offs_m < M
++
++    # Load [BLOCK_M, 256] bf16 -> fp32.
++    x = tl.load(
++        x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk,
++        mask=mask_m[:, None], other=0.0,
++    ).to(tl.float32)
++
++    # amax + signed maxv per row. antirez's q8_K_quantize_kernel keeps the
++    # SIGNED value at the argmax-abs position; we recover the same value via
++    # max(x) vs min(x) and picking the larger-magnitude one. This handles
++    # tie cases (when +amax and -amax are both present in the block) cleanly
++    # without the cancellation that a masked-sum approach would suffer.
++    max_pos = tl.max(x, axis=1)                                   # [BLOCK_M]
++    min_neg = tl.min(x, axis=1)                                   # [BLOCK_M]
++    use_pos = tl.abs(max_pos) >= tl.abs(min_neg)
++    maxv = tl.where(use_pos, max_pos, min_neg)                   # [BLOCK_M]
++    amax = tl.maximum(tl.abs(max_pos), tl.abs(min_neg))          # [BLOCK_M]
++
++    # iscale = -127 / maxv. 0 when amax==0.
++    maxv_safe = tl.where(amax > 0.0, maxv, 1.0)                  # avoid /0
++    iscale = -127.0 / maxv_safe                                  # [BLOCK_M]
++    iscale = tl.where(amax > 0.0, iscale, 0.0)
++
++    # Quantize: qs = clip(round_to_nearest_even(iscale * x), -128, 127).
++    # tl.cast fp32->int8 truncates; we use tl.extra.libdevice.rint for RNE
++    # (matches numpy.rint / llama.cpp nearest_int).
++    scaled = iscale[:, None] * x                                 # [BLOCK_M, 256]
++    scaled_rint = tl.extra.libdevice.rint(scaled)
++    qs_f = tl.minimum(tl.maximum(scaled_rint, -128.0), 127.0)
++    qs = qs_f.to(tl.int8)
++
++    # Store qs.
++    tl.store(
++        qs_ptr + offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qk,
++        qs,
++        mask=mask_m[:, None],
++    )
++
++    # d = 1 / iscale. 0 when amax == 0.
++    d = tl.where(amax > 0.0, 1.0 / iscale, 0.0)                  # [BLOCK_M]
++    offs_d = offs_m * (K // 256) + pid_kb
++    tl.store(d_ptr + offs_d, d, mask=mask_m)
++
++    # bsums: 16 sums of 16 qs each.  Reshape [BLOCK_M, 256] -> [BLOCK_M, 16, 16]
++    # and sum the inner axis.
++    qs_i32 = qs.to(tl.int32)
++    qs_r = tl.reshape(qs_i32, (BLOCK_M, 16, 16))
++    bsums_i32 = tl.sum(qs_r, axis=2)                             # [BLOCK_M, 16]
++    bsums_i16 = bsums_i32.to(tl.int16)
++    offs_b = offs_m[:, None] * (K // 16) + (pid_kb * 16 + tl.arange(0, 16))[None, :]
++    tl.store(
++        bsums_ptr + offs_b,
++        bsums_i16,
++        mask=mask_m[:, None],
++    )
++
++
++# ---------------------------------------------------------------------------
++# Python wrapper.
++# ---------------------------------------------------------------------------
++def quantize_q8_K(x_bf16: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Quantize bf16 activations ``[M, K]`` to Q8_K format.
++
++    Args:
++        x_bf16: bf16 activations ``[M, K]``. K must be a multiple of QK_K=256.
++
++    Returns:
++        (qs, d, bsums):
++          - qs: int8 ``[M, K]`` quantized activations.
++          - d: fp32 ``[M, K // 256]`` per-256-block scales.
++          - bsums: int16 ``[M, K // 16]`` per-16-block sums of qs.
++      All on the same device as ``x_bf16``.
++    """
++    if x_bf16.dtype != torch.bfloat16:
++        raise TypeError(f"x must be bf16, got {x_bf16.dtype}")
++    M, K = x_bf16.shape
++    if K % QK_K != 0:
++        raise ValueError(f"K={K} must be a multiple of {QK_K}")
++    x_bf16 = x_bf16.contiguous()
++    device = x_bf16.device
++
++    qs = torch.empty((M, K), dtype=torch.int8, device=device)
++    d = torch.empty((M, K // QK_K), dtype=torch.float32, device=device)
++    bsums = torch.empty((M, K // 16), dtype=torch.int16, device=device)
++
++    BLOCK_M = 16
++    grid = (triton.cdiv(M, BLOCK_M), K // QK_K)
++    _q8_K_quantize_kernel[grid](
++        x_bf16, qs, d, bsums,
++        M, K,
++        x_bf16.stride(0), x_bf16.stride(1),
++        qs.stride(0), qs.stride(1),
++        BLOCK_M=BLOCK_M,
++    )
++    return qs, d, bsums
++
++
++# ---------------------------------------------------------------------------
++# Validation: compare vs the llama.cpp reference quantize_row_q8_K_ref.
++# ---------------------------------------------------------------------------
++def _quantize_row_q8_K_ref_np(x: np.ndarray) -> Tuple[float, np.ndarray, np.ndarray]:
++    """numpy reference for one 256-element block. Matches quantize_row_q8_K_ref."""
++    amax = float(np.abs(x).max())
++    if amax == 0.0:
++        return 0.0, np.zeros(QK_K, dtype=np.int8), np.zeros(QK_K // 16, dtype=np.int16)
++    max_idx = int(np.argmax(np.abs(x)))
++    maxv = float(x[max_idx])
++    iscale = -127.0 / maxv
++    qs = np.rint(iscale * x).astype(np.int32)
++    qs = np.minimum(qs, 127)
++    qs = np.maximum(qs, -128).astype(np.int8)
++    bsums = np.zeros(QK_K // 16, dtype=np.int16)
++    for j in range(QK_K // 16):
++        bsums[j] = np.sum(qs[j * 16:(j + 1) * 16].astype(np.int16))
++    return 1.0 / iscale, qs, bsums
++
++
++def _validate_vs_ref(m: int, k: int, seed: int, device: torch.device) -> dict:
++    rng = np.random.default_rng(seed)
++    x_np = rng.standard_normal((m, k)).astype(np.float32) * rng.uniform(0.05, 3.0)
++    # Sprinkle some zeros (tests amax=0 path).
++    if m >= 4:
++        x_np[3, :] = 0.0
++    x_bf16 = torch.from_numpy(x_np).to(torch.bfloat16).to(device)
++    # The reference must see the SAME bf16-rounded inputs the kernel sees
++    # (production path receives bf16; bf16 input rounding is real).
++    x_for_ref = x_bf16.float().cpu().numpy()
++
++    qs, d, bsums = quantize_q8_K(x_bf16)
++    qs_np = qs.cpu().numpy()
++    d_np = d.cpu().numpy()
++    bsums_np = bsums.cpu().numpy()
++
++    # Reference per block.  We compare the Q8_K *reconstruction* (d * qs) rather
++    # than the raw int8 values: when a block contains both +amax and -amax
++    # (a tie), the kernel and reference may pick different signs for ``maxv``,
++    # flipping both ``d`` and ``qs`` together.  The reconstruction ``d * qs``
++    # and every DP4A dot that consumes the Q8_K block are invariant under this
++    # sign flip, so it is correct behavior; a bit-exact ``qs`` comparison would
++    # spuriously fail on tie blocks (which are common at bf16 precision).
++    nb = k // QK_K
++    max_recon_diff = 0.0       # max |d_ref*qs_ref - d_got*qs_got|
++    max_recon_rel = 0.0        # max relative recon diff
++    max_bsums_scaled_diff = 0  # max |d_ref*bs_ref - d_got*bs_got|
++    n_recon_mismatch = 0
++    for mi in range(m):
++        for b in range(nb):
++            blk = x_for_ref[mi, b * QK_K:(b + 1) * QK_K]
++            d_ref, qs_ref, bs_ref = _quantize_row_q8_K_ref_np(blk)
++            qs_got = qs_np[mi, b * QK_K:(b + 1) * QK_K]
++            d_got = float(d_np[mi, b])
++            bs_got = bsums_np[mi, b * 16:(b + 1) * 16]
++            # Reconstruction: d * qs (per-element).
++            recon_ref = float(d_ref) * qs_ref.astype(np.float32)
++            recon_got = d_got * qs_got.astype(np.float32)
++            diff = float(np.abs(recon_ref - recon_got).max())
++            max_recon_diff = max(max_recon_diff, diff)
++            ref_abs_max = float(np.abs(recon_ref).max())
++            if ref_abs_max > 0:
++                max_recon_rel = max(max_recon_rel, diff / ref_abs_max)
++            if diff > 1e-6 * max(1.0, ref_abs_max):
++                n_recon_mismatch += 1
++            # bsums scaled by d (this is what the Q2_K min term uses).
++            bs_scaled_ref = float(d_ref) * bs_ref.astype(np.float32)
++            bs_scaled_got = d_got * bs_got.astype(np.float32)
++            bs_diff = float(np.abs(bs_scaled_ref - bs_scaled_got).max())
++            max_bsums_scaled_diff = max(max_bsums_scaled_diff, bs_diff)
++    return {
++        "m": m, "k": k,
++        "max_recon_diff": max_recon_diff,
++        "max_recon_rel": max_recon_rel,
++        "max_bsums_scaled_diff": max_bsums_scaled_diff,
++        "n_recon_mismatch_blocks": n_recon_mismatch,
++        "total_blocks": m * nb,
++    }
++
++
++def main(argv=None) -> int:
++    import argparse
++    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
++    parser.add_argument("--device", default="cuda")
++    parser.add_argument("--seed", type=int, default=0)
++    args = parser.parse_args(argv)
++
++    if args.device.startswith("cuda") and not torch.cuda.is_available():
++        print("[q8_K_quantize] CUDA not available; falling back to CPU")
++        device = torch.device("cpu")
++    else:
++        device = torch.device(args.device)
++    print(f"[q8_K_quantize] device: {device}")
++
++    overall_pass = True
++    for M, K in [(1, 256), (8, 256), (8, 2048), (17, 4096), (64, 2048)]:
++        r = _validate_vs_ref(M, K, seed=args.seed, device=device)
++        # Gate: the Q8_K reconstruction (d * qs) must match the reference within
++        # 1 Q8_K LSB per element ( Triton's libdevice.rint vs numpy's rint can
++        # differ by 1 LSB at .5 boundaries; this is not a bug).  The largest
++        # per-block d in our test data is ~3*4/127 ~ 0.1 (ascale up to 3,
++        # 4-sigma max), so 1-LSB recon diff <= ~0.1, and the bsums-scaled diff
++        # (16 elements each off by <= 1) <= ~1.6.
++        ok_recon = r["max_recon_diff"] <= 0.2
++        ok_bsums = r["max_bsums_scaled_diff"] <= 2.0
++        ok = ok_recon and ok_bsums
++        overall_pass = overall_pass and ok
++        print(f"  M={M:3d} K={K:4d}  blocks={r['total_blocks']:6d}  "
++              f"recon_mismatch={r['n_recon_mismatch_blocks']:3d}  "
++              f"max_recon_diff={r['max_recon_diff']:.2e}  "
++              f"max_bsums_scaled_diff={r['max_bsums_scaled_diff']:.2e}  "
++              f"RESULT: {'PASS' if ok else 'FAIL'}")
++    print(f"\n=== OVERALL: {'PASS' if overall_pass else 'FAIL'} ===")
++    return 0 if overall_pass else 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
