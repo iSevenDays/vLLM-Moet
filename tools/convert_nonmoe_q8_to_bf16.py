@@ -579,7 +579,7 @@ def update_config_json(
             print(f"[config] {config_path}: ignored_layers already complete "
                   f"({len(existing)} entries)")
             return
-        qc["ignored_layers"] = list(existing) | set(ignored_layers)
+        qc["ignored_layers"] = sorted(list(set(existing) | set(ignored_layers)))
     else:
         qc["ignored_layers"] = list(ignored_layers)
     cfg["quantization_config"] = qc
