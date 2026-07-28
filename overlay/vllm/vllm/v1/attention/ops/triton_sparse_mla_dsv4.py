@@ -1066,18 +1066,23 @@ def overwrite_nope_int8_dsv4(
     scale_byte = (exponent + 127).clamp(0, 254).to(torch.uint8)
     nope_u8 = q.reshape(slots.numel(), _D_NOPE).view(torch.uint8)
 
-    # Flat byte offsets within the page (the physical layout is
-    # [data-block of pbs*576 bytes][scale-block of pbs*8 bytes] per page;
-    # see _dsv4_gather_k + pack_dsv4_reference_cache).
+    # Page/token deinterleave, then a 2-D advanced-index scatter straight into
+    # the live kv_cache_2d ([num_pages, pbs*584] uint8). Indexing (page,
+    # byte-in-page) writes THROUGH via strides regardless of contiguity -- the
+    # earlier `.view(-1)` flatten crashed on the production cache's
+    # non-contiguous layout (RuntimeError "view size not compatible... Use
+    # .reshape"), and `.reshape(-1)` would COPY (silently losing the scatter,
+    # so the decode would read the C++ op's E4M3 bytes). Physical layout per
+    # page: [data-block pbs*576 B][scale-block pbs*8 B] (7 scales + 1 pad per
+    # token) -- see _dsv4_gather_k + pack_dsv4_reference_cache.
     page = slots // pbs
     tok = slots % pbs
-    page_byte_stride = int(kv_cache_2d.stride(0))  # == pbs*584 when contiguous
-    page_off = page * page_byte_stride
-    nope_off = page_off + tok * _TOKEN_DATA_BYTES  # tok*576
-    scale_off = page_off + pbs * _TOKEN_DATA_BYTES + tok * _SCALE_BYTES
-
-    flat = kv_cache_2d.view(-1)  # in-place: contiguous 2D -> 1D byte view
-    col_n = torch.arange(_D_NOPE, device=flat.device)
-    col_s = torch.arange(_NUM_SCALES, device=flat.device)
-    flat[nope_off.unsqueeze(1) + col_n] = nope_u8
-    flat[scale_off.unsqueeze(1) + col_s] = scale_byte
+    dev = kv_cache_2d.device
+    col_n = torch.arange(_D_NOPE, device=dev)
+    col_s = torch.arange(_NUM_SCALES, device=dev)
+    nope_byte_off = tok.unsqueeze(1) * _TOKEN_DATA_BYTES + col_n              # [N,448]
+    scale_byte_off = (pbs * _TOKEN_DATA_BYTES + tok.unsqueeze(1) * _SCALE_BYTES
+                     + col_s)                                                  # [N,7]
+    page_idx = page.unsqueeze(1)
+    kv_cache_2d[page_idx.expand(-1, _D_NOPE), nope_byte_off] = nope_u8
+    kv_cache_2d[page_idx.expand(-1, _NUM_SCALES), scale_byte_off] = scale_byte
