@@ -1,0 +1,52 @@
+diff --git a/vllm/models/deepseek_v4/compressor.py b/vllm/models/deepseek_v4/compressor.py
+index 24838c2..040fe07 100644
+--- a/vllm/models/deepseek_v4/compressor.py
++++ b/vllm/models/deepseek_v4/compressor.py
+@@ -1,11 +1,18 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import os
+ from dataclasses import dataclass
+ from typing import Any, ClassVar, cast
+ 
+ import torch
+ from torch import nn
++
++# VLLM_DSV4_KV_INT8: route the head=512 compressed-cache write to the Triton
++# writer (which has an int8 arm) instead of cutedsl, so the compressed
++# (long-range) cache matches the _dsv4_gather_k NOPE_INT8 reader. See
++# fused_compress_quant_cache.py::_NOPE_INT8.
++_KV_INT8 = os.getenv("VLLM_DSV4_KV_INT8", "0") == "1"
+ 
+ from vllm.config import VllmConfig, get_current_vllm_config
+ from vllm.forward_context import get_forward_context
+@@ -350,7 +357,16 @@
+         # cutedsl (head=512) accepts the full-cache flags; triton (indexer/AMD)
+         # does not, so the two callables have different signatures.
+         compress_norm_rope_store_fn: Any
+-        if current_platform.is_cuda() and self.head_dim == 512:
++        # VLLM_DSV4_KV_INT8: the compressed (long-range) cache must be written
++        # int8 to match the _dsv4_gather_k NOPE_INT8 reader (which decodes
++        # both SWA and compressed caches via one global flag). cutedsl has no
++        # int8 arm, so route head=512 to the Triton writer when int8 KV is on.
++        # On the fp8_ds_mla uint8 path the cutedsl-only flags
++        # (store_full_kv/store_full_fp8/fp8_scale) are all False/None, so the
++        # Triton signature (extra_kwargs={}) reconciles. The fp8 baseline is
++        # untouched (the condition still picks cutedsl when _KV_INT8 is off).
++        if (current_platform.is_cuda() and self.head_dim == 512
++                and not _KV_INT8):
+             from .nvidia.ops.sparse_attn_compress_cutedsl import (
+                 compress_norm_rope_store_cutedsl,
+             )
+@@ -365,7 +381,9 @@
+                 fp8_scale=fp8_scale,
+             )
+         else:
+-            # Indexer path (head_dim == 128) or non-CUDA GPUs (AMD, XPU, etc.).
++            # Indexer path (head_dim == 128), non-CUDA GPUs (AMD, XPU, etc.),
++            # or head=512 with VLLM_DSV4_KV_INT8=1 (int8 compressed cache via
++            # the Triton writer's NOPE_INT8 arm).
+             compress_norm_rope_store_fn = compress_norm_rope_store_triton
+             extra_kwargs = {}
+ 
