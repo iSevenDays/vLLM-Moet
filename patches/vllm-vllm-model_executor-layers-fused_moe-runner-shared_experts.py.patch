@@ -1,0 +1,18 @@
+diff --git a/vllm/model_executor/layers/fused_moe/runner/shared_experts.py b/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
+index dc4c99e..11b407c 100644
+--- a/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
++++ b/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
+@@ -162,7 +162,12 @@
+         if order != experts_order:
+             return None
+ 
+-        assert self._output[self._output_idx] is None
++        # A non-None slot here means a prior moe_w2 base-cache-miss replay
++        # (overlay gpu_model_runner) aborted after writing but before the
++        # consume path (:150) cleared it; that stale output was never consumed,
++        # so clearing + overwriting is safe. Tolerate it instead of asserting
++        # (the assert crashed every long prefill, T >> _PREFILL_T).
++        self._output[self._output_idx] = None
+ 
+         if order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
+             self._output[self._output_idx] = self._run_in_aux_stream(

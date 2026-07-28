@@ -52,6 +52,15 @@ Env knobs (read once, at first use):
   silicon). Read by ``vllm/utils/flashinfer.py``.
 * ``VLLM_DSV4_SPARSE_MLA_SELFTEST=0``     - skip the init-time on-device
   self-test (triage escape hatch; the test costs < 100 ms once).
+* ``VLLM_DSV4_KV_INT8=1`` - encode/decode the 448-B NoPE latent as signed
+  INT8 against the SAME per-64-tile UE8M0 power-of-two scale (the scale
+  byte IS the exponent, the int8 is the 7-bit+sign mantissa), instead of
+  FP8-E4M3. Same 584 B/token layout, same scale slots -> zero extra VRAM,
+  ~7 effective bits vs E4M3's ~3. This is the higher-fidelity swap for
+  the long-context needle-retrieval regression (default OFF; the stock
+  FP8-E4M3 path is unchanged). Read once at import into ``_KV_INT8`` and
+  threaded as a Triton ``NOPE_INT8`` constexpr to the gather/reader kernel
+  + the torch reference writer/reader.
 """
 
 import functools
@@ -82,6 +91,13 @@ _LOG2E = 1.4426950408889634
 # Set once at import: TRITON_INTERPRET is read by Triton itself at import
 # time, so a consistent snapshot here is correct by construction.
 _IS_INTERPRET = os.getenv("TRITON_INTERPRET", "0") == "1"
+
+# Set once at import: VLLM_DSV4_KV_INT8 selects the signed-INT8 NoPE
+# encode/decode (7 effective bits + sign vs FP8-E4M3's ~3 mantissa bits)
+# at identical byte cost (the UE8M0 tile scale is the shared exponent).
+# Default OFF -> stock FP8-E4M3 path. Captured at import (not re-read per
+# launch) so a Triton kernel recompile is triggered only once on toggle.
+_KV_INT8 = os.getenv("VLLM_DSV4_KV_INT8", "0") == "1"
 
 
 @functools.cache
@@ -115,6 +131,7 @@ def _dsv4_gather_k(
     D: tl.constexpr,
     D_NOPE: tl.constexpr,
     QUANT_TILE: tl.constexpr,
+    NOPE_INT8: tl.constexpr,
 ):
     """Gather a [BLOCK_N, D] fp32 K/V tile from a paged DSv4 cache."""
     if IS_PACKED:
@@ -124,20 +141,36 @@ def _dsv4_gather_k(
         data_base = page_base + tok * 576  # [BLOCK_N]
         is_nope = d_offs < D_NOPE  # [D]
 
-        # FP8-E4M3 nope bytes, decoded with integer math (portable to the
-        # Triton interpreter; the writer saturates so 0x7F/0xFF never occur).
+        # NoPE bytes, decoded with portable integer math (the Triton
+        # interpreter runs this verbatim on CPU). Two encodings share the
+        # SAME byte slot and the SAME UE8M0 tile scale (the scale byte is
+        # the shared power-of-two exponent):
+        #   * FP8-E4M3 (stock):     3 mantissa bits + sign.
+        #   * signed INT8 (KV_INT8): 7 bits + sign, ~5x the effective
+        #     resolution at identical byte cost (zero extra VRAM). The
+        #     higher-fidelity swap for the needle-retrieval regression.
         nope_addr = data_base[:, None] + d_offs[None, :]
         nope_mask = valid[:, None] & is_nope[None, :]
         b = tl.load(kv_ptr + nope_addr, mask=nope_mask, other=0).to(tl.uint32)
-        sign = (b >> 7) & 1
-        expo = ((b >> 3) & 0xF).to(tl.float32)
-        mant = (b & 0x7).to(tl.float32)
-        mag = tl.where(
-            expo == 0.0,
-            mant * 0.001953125,  # subnormal: mant/8 * 2^-6 = mant * 2^-9
-            tl.exp2(expo - 7.0) * (1.0 + mant * 0.125),
-        )
-        nope_f32 = tl.where(sign == 1, -mag, mag)
+        if NOPE_INT8:
+            # Two's-complement signed int8 (writer saturates so -128 / 0x80
+            # never occurs); mag-128 recovers the negative arm. The loaded
+            # value IS the quantized int8 mantissa; the UE8M0 scale below is
+            # the exponent applied to it.
+            sign = (b >> 7) & 1
+            mag = b & 0x7F
+            nope_f32 = tl.where(sign == 1, mag - 128, mag).to(tl.float32)
+        else:
+            # FP8-E4M3 (writer saturates so 0x7F/0xFF never occur).
+            sign = (b >> 7) & 1
+            expo = ((b >> 3) & 0xF).to(tl.float32)
+            mant = (b & 0x7).to(tl.float32)
+            mag = tl.where(
+                expo == 0.0,
+                mant * 0.001953125,  # subnormal: mant/8 * 2^-6 = mant * 2^-9
+                tl.exp2(expo - 7.0) * (1.0 + mant * 0.125),
+            )
+            nope_f32 = tl.where(sign == 1, -mag, mag)
 
         # UE8M0 tile scales from the page footer, gathered per column.
         tile_id = tl.minimum(d_offs // QUANT_TILE, 6)
@@ -202,6 +235,7 @@ def _sparse_mla_dsv4_kernel(
     D_NOPE: tl.constexpr,
     QUANT_TILE: tl.constexpr,
     DOT_BF16: tl.constexpr,
+    NOPE_INT8: tl.constexpr,
 ):
     t = tl.program_id(0)
     hb = tl.program_id(1)
@@ -237,7 +271,7 @@ def _sparse_mla_dsv4_kernel(
         valid = in_len & (idx >= 0)
         idx0 = tl.where(valid, idx, 0).to(tl.int64)
         k = _dsv4_gather_k(kv_ptr, idx0, valid, pbs, page_stride, d_offs,
-                           IS_PACKED, D, D_NOPE, QUANT_TILE)
+                           IS_PACKED, D, D_NOPE, QUANT_TILE, NOPE_INT8)
         if DOT_BF16:
             k = k.to(tl.bfloat16)
             s = tl.dot(q, tl.trans(k)) * qk_scale
@@ -270,7 +304,8 @@ def _sparse_mla_dsv4_kernel(
             idx0 = tl.where(valid, idx, 0).to(tl.int64)
             k = _dsv4_gather_k(extra_kv_ptr, idx0, valid, extra_pbs,
                                extra_page_stride, d_offs,
-                               EXTRA_IS_PACKED, D, D_NOPE, QUANT_TILE)
+                               EXTRA_IS_PACKED, D, D_NOPE, QUANT_TILE,
+                               NOPE_INT8)
             if DOT_BF16:
                 k = k.to(tl.bfloat16)
                 s = tl.dot(q, tl.trans(k)) * qk_scale
@@ -549,7 +584,7 @@ def triton_sparse_mla_dsv4(
     logger.info_once(
         "DSv4 sparse-MLA Triton port geometry: q%s %s, swa cache %s %s "
         "(pbs=%d, packed=%s, page_stride=%d), K_main=%d, extra=%s, "
-        "K_extra=%s, extra_page_stride=%d, sinks=%s",
+        "K_extra=%s, extra_page_stride=%d, sinks=%s, nope_int8=%s",
         tuple(query_flat.shape),
         query.dtype,
         tuple(swa_kv_cache.shape),
@@ -562,6 +597,7 @@ def triton_sparse_mla_dsv4(
         idx_extra.shape[-1] if has_extra else 0,
         page_stride_extra,
         sinks is not None,
+        _KV_INT8,
     )
 
     block_h = 16
@@ -608,6 +644,7 @@ def triton_sparse_mla_dsv4(
             # interpreter tier validates semantics in f32; the init-time
             # self-test validates the shipped bf16 path on real silicon.
             DOT_BF16=False,  # force fp32 attention dot (bf16's 7.2e-3/layer compounds at long context)
+            NOPE_INT8=_KV_INT8,
             num_warps=4,
             num_stages=1,
         )
@@ -615,19 +652,32 @@ def triton_sparse_mla_dsv4(
 
 
 def dequant_dsv4_packed_cache(kv_cache: torch.Tensor,
-                              pbs: int) -> torch.Tensor:
+                              pbs: int,
+                              int8: bool | None = None) -> torch.Tensor:
     """Decode a packed fp8_ds_mla cache to f32 rows ``[pages*pbs, 512]``.
 
     Reference-path helper (tests, self-test, torch fallback). Operates on
     the byte container in its NATIVE storage layout - data first, scale
     footer last - before any logical reshape.
+
+    ``int8`` selects the NoPE decode: signed INT8 x UE8M0 scale when True,
+    FP8-E4M3 x UE8M0 scale when False. Defaults to the module-level
+    ``_KV_INT8`` selection so callers that built the cache with
+    ``pack_dsv4_reference_cache()`` (no explicit flag) decode it back the
+    same way.
     """
+    if int8 is None:
+        int8 = _KV_INT8
     pages = kv_cache.shape[0]
     flat = kv_cache.reshape(pages, -1)
     assert flat.shape[1] == pbs * _BPT_PACKED
     data = flat[:, :pbs * _TOKEN_DATA_BYTES].reshape(pages, pbs,
                                                      _TOKEN_DATA_BYTES)
-    nope = data[..., :_D_NOPE].view(torch.float8_e4m3fn).to(torch.float32)
+    if int8:
+        # Signed INT8 (two's-complement) x the same UE8M0 tile scale.
+        nope = data[..., :_D_NOPE].view(torch.int8).to(torch.float32)
+    else:
+        nope = data[..., :_D_NOPE].view(torch.float8_e4m3fn).to(torch.float32)
     rope = data[..., _D_NOPE:].contiguous().view(torch.bfloat16).to(
         torch.float32)
     scales = (flat[:, pbs * _TOKEN_DATA_BYTES:].reshape(
@@ -713,6 +763,59 @@ def sparse_mla_dsv4_torch_ref(
         out.copy_(result)
         return out
     return result
+
+
+def _nope_quant_fidelity(device: torch.device) -> tuple[float, float]:
+    """Direct numeric A/B of the two NoPE encodings over the SAME input.
+
+    Encodes random NoPE tiles (448-dim, per-64-tile) BOTH ways against the
+    SAME UE8M0 slot, decodes both, and returns
+    ``(e4m3_worst_rel, int8_worst_rel)`` - worst-case per-tile relative
+    reconstruction error (``|x - dequant(encode(x))|`` over the tile amax).
+
+    This is the load-bearing measurement for the long-context needle fix:
+    int8 (7 effective bits + sign) must reconstruct strictly better than
+    FP8-E4M3 (~3 mantissa bits + sign) at the IDENTICAL byte cost. The
+    self-test asserts int8_worst_rel < e4m3_worst_rel; the gap is the
+    fidelity headroom recovered for zero extra VRAM.
+
+    Runs on GPU (CUDA available) or CPU (TRITON_INTERPRET CI tier); it is
+    pure torch, so the result is bit-identical across both.
+    """
+    torch.manual_seed(1)
+    # Full _D-wide rows so pack_dsv4_reference_cache accepts them (it
+    # asserts shape[-1] == _D). The NoPE region is 448 = 7 per-64 tiles;
+    # RoPE is zero (not scored - it is stored BF16 in both paths, so it is
+    # outside the A/B).
+    n_rows = 4096
+    nope = torch.randn(n_rows, _D_NOPE, device=device,
+                       dtype=torch.float32) * 2.0
+    # Sprinkle a large outlier in ~10% of rows so a per-tile amax is set
+    # by a single big element (the regime where E4M3's 3 mantissa bits
+    # hurt the most: the small elements in the tile share the big
+    # element's exponent).
+    big = torch.randn(n_rows, device=device, dtype=torch.float32) > 1.28
+    nope[big, 0] = torch.randn(int(big.sum()), device=device,
+                                dtype=torch.float32) * 64.0
+    rope = torch.zeros(n_rows, _D - _D_NOPE, device=device,
+                       dtype=torch.float32)
+    rows = torch.cat([nope, rope], dim=-1)
+    # Reference for the relative error: the per-row NoPE amax. Scoring
+    # against the row amax (vs the per-64-tile amax the encoders actually
+    # use) is conservative and stable across runs.
+    row_amax = nope.abs().amax(dim=-1, keepdim=True).clamp_min(1.0)
+
+    def recon(int8: bool) -> float:
+        # Encode -> decode the SAME rows both ways. The writer/reader pair
+        # is the exact code the kernel uses (the kernel decode is the
+        # integer-math mirror of dequant_dsv4_packed_cache; bit-exactness
+        # is verified separately by _self_test_case's kernel-vs-ref run).
+        packed = pack_dsv4_reference_cache(rows, pbs=n_rows, int8=int8)
+        decoded = dequant_dsv4_packed_cache(packed, pbs=n_rows, int8=int8)
+        recon_nope = decoded[:, :_D_NOPE]
+        return ((nope - recon_nope).abs() / row_amax).max().item()
+
+    return recon(int8=False), recon(int8=True)
 
 
 def _self_test_case(device: torch.device) -> float:
@@ -813,12 +916,22 @@ def dsv4_sparse_mla_self_test() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     worst_row_rel = _self_test_case(device)
     cap = torch.cuda.get_device_capability(device)
+
+    # Direct A/B of NoPE quantization fidelity: signed INT8 vs FP8-E4M3 over
+    # the SAME tiles, both against the SAME UE8M0 scale slot. This is the
+    # load-bearing measurement for the long-context needle fix and runs on
+    # every boot (pure torch, cheap). The gap is the recovered headroom.
+    e4m3_worst_rel, int8_worst_rel = _nope_quant_fidelity(device)
+
     logger.info(
         "DSv4 sparse-MLA Triton port self-test on sm_%d%d (%s): "
         "worst_row_rel=%.3e vs torch reference (expected ~1e-2 for the "
-        "bf16 path; module build %s, torch %s, triton %s)",
+        "bf16 path; module build %s, torch %s, triton %s). NoPE quant "
+        "fidelity A/B over the same tiles: E4M3 worst_rel=%.3e, "
+        "INT8 worst_rel=%.3e (int8 selected=%s; lower is better).",
         cap[0], cap[1], torch.cuda.get_device_name(device), worst_row_rel,
-        _module_build_id(), torch.__version__, triton.__version__)
+        _module_build_id(), torch.__version__, triton.__version__,
+        e4m3_worst_rel, int8_worst_rel, _KV_INT8)
     if worst_row_rel > 3e-2:
         raise RuntimeError(
             f"DSv4 sparse-MLA Triton port self-test FAILED on this device: "
@@ -827,28 +940,69 @@ def dsv4_sparse_mla_self_test() -> None:
             f"{_module_build_id()}). This is a codegen/driver regression, "
             f"not a model problem. Set VLLM_DSV4_SPARSE_MLA_SELFTEST=0 "
             f"only to triage.")
+    # The fidelity A/B must confirm int8 reconstructs the NoPE latent at
+    # least as well as E4M3 (the hypothesis for the needle fix). A loss
+    # here means the encode math is wrong; a win is the expected ~5x
+    # resolution gain at identical byte cost.
+    if int8_worst_rel >= e4m3_worst_rel:
+        raise RuntimeError(
+            f"DSv4 NoPE INT8 fidelity regression: INT8 worst_rel="
+            f"{int8_worst_rel:.3e} >= E4M3 worst_rel={e4m3_worst_rel:.3e} "
+            f"(int8 MUST be the higher-fidelity encoding at the same byte "
+            f"cost). Encode math is wrong; module build "
+            f"{_module_build_id()}.")
 
 
 def pack_dsv4_reference_cache(kv_rows: torch.Tensor,
-                              pbs: int) -> torch.Tensor:
+                              pbs: int,
+                              int8: bool | None = None) -> torch.Tensor:
     """Encode f32 rows ``[pages*pbs, 512]`` into the packed fp8_ds_mla
     byte layout (reference writer for tests/self-test; mirrors
     ``fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu``: per-64-tile
-    power-of-two UE8M0 scales, FP8-E4M3 saturating quant, BF16 rope)."""
+    power-of-two UE8M0 scales, FP8-E4M3 saturating quant, BF16 rope).
+
+    ``int8`` selects the NoPE encode (default: module-level ``_KV_INT8``):
+
+    * ``False`` (stock) - FP8-E4M3 saturating quant. The UE8M0 scale is
+      ``ceil(log2(amax/448)) + 127`` (448 = E4M3 max-normal magnitude);
+      ~3 mantissa bits.
+    * ``True``  - signed INT8 quant against the SAME UE8M0 slot. The
+      scale is ``ceil(log2(amax/127)) + 127`` (127 = int8 max-magnitude);
+      ``q = round(x * 2^-(s-127))`` clipped to [-127, 127]. The scale byte
+      IS the exponent; the int8 is the 7-bit+sign mantissa. ~7 effective
+      bits - strictly higher fidelity than E4M3 in the SAME 448+7 bytes
+      (zero extra VRAM). Decode is the exact inverse: ``x ~= q*2^(s-127)``.
+    """
+    if int8 is None:
+        int8 = _KV_INT8
     assert kv_rows.shape[-1] == _D and kv_rows.shape[0] % pbs == 0
     pages = kv_rows.shape[0] // pbs
     nope = kv_rows[:, :_D_NOPE].reshape(-1, _NUM_SCALES, _QUANT_TILE)
     amax = nope.abs().amax(dim=-1).clamp_min(2.0**-126)
-    # Power-of-two scale covering amax/448 (mirror exp2f(ceil(log2)))
-    exponent = torch.ceil(torch.log2(amax / 448.0))
-    scale_byte = (exponent + 127).clamp(0, 254).to(torch.uint8)
-    inv_scale = torch.exp2(-exponent)
-    quant = (nope * inv_scale[..., None]).clamp(-448, 448).to(
-        torch.float8_e4m3fn)
+    if int8:
+        # Signed INT8: the UE8M0 byte is the power-of-two exponent for a
+        # 7-bit+sign magnitude (max 127). round() + power-of-two scale =
+        # deterministic, bit-exact reversible within int8 precision
+        # (decode recovers q exactly; |x - q*2^exp| <= 0.5 * 2^exp).
+        exponent = torch.ceil(torch.log2(amax / 127.0))
+        scale_byte = (exponent + 127).clamp(0, 254).to(torch.uint8)
+        inv_scale = torch.exp2(-exponent)
+        quant = (nope * inv_scale[..., None]).round().clamp(
+            -127, 127).to(torch.int8)
+    else:
+        # FP8-E4M3: power-of-two scale covering amax/448
+        # (mirror exp2f(ceil(log2))); ~3 mantissa bits + sign.
+        exponent = torch.ceil(torch.log2(amax / 448.0))
+        scale_byte = (exponent + 127).clamp(0, 254).to(torch.uint8)
+        inv_scale = torch.exp2(-exponent)
+        quant = (nope * inv_scale[..., None]).clamp(-448, 448).to(
+            torch.float8_e4m3fn)
     rope = kv_rows[:, _D_NOPE:].to(torch.bfloat16)
 
     # Assemble per-page byte regions, then concatenate: [data | footer].
     # (Slice-views of the final tensor are non-contiguous; build forward.)
+    # Both int8 and fp8_e4m3fn are 1-byte dtypes; .view(uint8) reinterprets
+    # the storage bytes (two's-complement for int8, IEEE for e4m3) in place.
     quant_u8 = quant.reshape(pages, pbs, _D_NOPE).view(torch.uint8)
     rope_u8 = rope.reshape(pages, pbs, _D_ROPE).contiguous().view(torch.uint8)
     data_bytes = torch.cat([quant_u8, rope_u8],
@@ -860,3 +1014,67 @@ def pack_dsv4_reference_cache(kv_rows: torch.Tensor,
         dim=-1).reshape(pages, pbs * _SCALE_BYTES)
     return torch.cat([data_bytes, footer_bytes],
                      dim=1).view(pages, pbs, _BPT_PACKED)
+
+
+def overwrite_nope_int8_dsv4(
+    kv_nope: torch.Tensor,
+    kv_cache_2d: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_size: int,
+) -> None:
+    """In-place overwrite of the NoPE (448 B) + UE8M0 scale (7 B) bytes of
+    a packed fp8_ds_mla cache with signed-INT8, leaving the BF16 RoPE bytes
+    untouched. The production two-pass encode for ``VLLM_DSV4_KV_INT8=1``:
+    the fused C++ quant-insert op has already written the full 584 B row
+    (E4M3 nope + bf16 rope + UE8M0 scale) AND returned the bit-exact padded
+    query; this call rewrites only the nope data bytes + scale bytes with
+    the higher-fidelity int8 encoding (same layout, zero extra VRAM).
+
+    Mirrors the int8 branch of :func:`pack_dsv4_reference_cache` (the
+    layout source of truth) but scatters into a live paged cache.
+
+    Args:
+        kv_nope: ``[num_tokens, 448]`` - the ORIGINAL kv NoPE slice (not
+            RoPE'd; only the rope 64 dims are). Any compute dtype; cast to
+            fp32 for the quant math.
+        kv_cache_2d: ``[num_pages, block_size*584]`` uint8 - the 2-D view
+            of ``swa_kv_cache`` (``swa_kv_cache.view(shape[0], -1)``), the
+            same tensor the C++ op wrote into. Must be contiguous so the
+            1-D byte view writes through in place.
+        slot_mapping: ``[num_tokens]`` int32/int64 - flat token slot
+            ``page*block_size + tok`` per token. ``-1`` slots (padded
+            tokens) are skipped, matching the C++ op.
+        block_size: tokens per page (``pbs``).
+    """
+    pbs = int(block_size)
+    valid = slot_mapping >= 0
+    if not bool(valid.any()):
+        return
+    slots = slot_mapping[valid].to(torch.int64)
+    # Per-64-tile int8 quant (identical math to pack_dsv4_reference_cache
+    # int8=True): exponent = ceil(log2(amax/127)); q = round(x*2^-exp)
+    # clamped to [-127,127]; scale_byte = (exp+127) in [0,254].
+    nope = kv_nope[valid].to(torch.float32).reshape(-1, _NUM_SCALES,
+                                                     _QUANT_TILE)
+    amax = nope.abs().amax(dim=-1).clamp_min(2.0**-126)
+    exponent = torch.ceil(torch.log2(amax / 127.0))
+    inv_scale = torch.exp2(-exponent)
+    q = (nope * inv_scale[..., None]).round().clamp(-127, 127).to(torch.int8)
+    scale_byte = (exponent + 127).clamp(0, 254).to(torch.uint8)
+    nope_u8 = q.reshape(slots.numel(), _D_NOPE).view(torch.uint8)
+
+    # Flat byte offsets within the page (the physical layout is
+    # [data-block of pbs*576 bytes][scale-block of pbs*8 bytes] per page;
+    # see _dsv4_gather_k + pack_dsv4_reference_cache).
+    page = slots // pbs
+    tok = slots % pbs
+    page_byte_stride = int(kv_cache_2d.stride(0))  # == pbs*584 when contiguous
+    page_off = page * page_byte_stride
+    nope_off = page_off + tok * _TOKEN_DATA_BYTES  # tok*576
+    scale_off = page_off + pbs * _TOKEN_DATA_BYTES + tok * _SCALE_BYTES
+
+    flat = kv_cache_2d.view(-1)  # in-place: contiguous 2D -> 1D byte view
+    col_n = torch.arange(_D_NOPE, device=flat.device)
+    col_s = torch.arange(_NUM_SCALES, device=flat.device)
+    flat[nope_off.unsqueeze(1) + col_n] = nope_u8
+    flat[scale_off.unsqueeze(1) + col_s] = scale_byte

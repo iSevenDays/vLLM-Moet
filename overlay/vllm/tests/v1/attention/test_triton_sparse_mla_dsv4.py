@@ -22,7 +22,9 @@ import torch
 from vllm.v1.attention.ops.triton_sparse_mla_dsv4 import (
     _BPT_PACKED,
     _D,
+    _D_NOPE,
     dequant_dsv4_packed_cache,
+    overwrite_nope_int8_dsv4,
     pack_dsv4_reference_cache,
     sparse_mla_dsv4_torch_ref,
     triton_sparse_mla_dsv4,
@@ -156,6 +158,213 @@ def test_packed_cache_roundtrip_cpu():
     tile_amax = nope.abs().amax(dim=-1, keepdim=True)
     rel = ((dec_nope - nope).abs() / tile_amax.clamp_min(1e-6)).max()
     assert rel <= 0.13, f"fp8 tile-relative roundtrip err {rel}"
+
+
+def test_packed_cache_int8_roundtrip_and_fidelity_cpu():
+    """The VLLM_DSV4_KV_INT8 NoPE path: signed INT8 against the SAME UE8M0
+    tile scale. Must (a) round-trip, (b) reuse the identical 584 B/token
+    layout, and (c) reconstruct the NoPE latent strictly better than
+    FP8-E4M3 at the same byte cost - the load-bearing claim of the
+    long-context needle fix."""
+    torch.manual_seed(0)
+    pbs = 64
+    rows = torch.randn(4 * pbs, _D) * 3.0
+
+    packed_i8 = pack_dsv4_reference_cache(rows, pbs, int8=True)
+    packed_e4 = pack_dsv4_reference_cache(rows, pbs, int8=False)
+    # (b) identical byte layout / row width / dtype (zero extra VRAM).
+    assert packed_i8.shape == packed_e4.shape == (4, pbs, _BPT_PACKED)
+    assert packed_i8.dtype == packed_e4.dtype == torch.uint8
+
+    decoded = dequant_dsv4_packed_cache(packed_i8.reshape(4, -1), pbs,
+                                        int8=True)
+    # (a) rope is stored bf16 (shared with the e4m3 path) -> exact-ish.
+    rope_rel = ((decoded[:, 448:] - rows[:, 448:]).abs() /
+                rows[:, 448:].abs().clamp_min(1e-3)).max()
+    assert rope_rel <= 2.0**-8, f"rope bf16 roundtrip rel err {rope_rel}"
+
+    # (c) NoPE fidelity: int8 (7 bits + sign) vs e4m3 (~3 mantissa bits +
+    # sign), both per-64-tile, scored tile-relative. int8 must win.
+    nope = rows[:, :448].reshape(-1, 7, 64)
+    tile_amax = nope.abs().amax(dim=-1, keepdim=True).clamp_min(1e-6)
+    dec_i8 = decoded[:, :448].reshape(-1, 7, 64)
+    dec_e4 = dequant_dsv4_packed_cache(
+        packed_e4.reshape(4, -1), pbs, int8=False)[:, :448].reshape(-1, 7, 64)
+    rel_i8 = ((dec_i8 - nope).abs() / tile_amax).max()
+    rel_e4 = ((dec_e4 - nope).abs() / tile_amax).max()
+    assert rel_i8 < rel_e4, (
+        f"int8 NoPE fidelity {rel_i8} must beat e4m3 {rel_e4} at the same "
+        f"byte cost (the needle-fix hypothesis)")
+    # int8 carries ~7 effective bits: worst-case tile-relative err <= 1/127
+    # rounded up generously (half-ULP over the 127-step range).
+    assert rel_i8 <= 0.02, f"int8 tile-relative roundtrip err {rel_i8}"
+
+
+def test_overwrite_nope_int8_scatter_offsets_and_rope_untouched_cpu():
+    """Production two-pass encode: overwrite_nope_int8_dsv4 scatters signed
+    INT8 NoPE + UE8M0 scale bytes into a live packed cache (the bytes the
+    fused C++ op already wrote) at the correct 584 B/token offsets, and
+    leaves the BF16 RoPE bytes + all non-scattered tokens untouched.
+
+    Uses pack_dsv4_reference_cache / dequant_dsv4_packed_cache as the
+    layout source of truth (the same layout _dsv4_gather_k reads)."""
+    torch.manual_seed(2)
+    pbs = 64
+    pages = 3
+    rows = torch.randn(pages * pbs, _D, dtype=torch.float32) * 3.0
+
+    # Simulate the C++ op's write: a full E4M3 packed cache.
+    cache = pack_dsv4_reference_cache(rows, pbs, int8=False).contiguous()
+    before = cache.clone()  # byte snapshot before the int8 overwrite
+    cache_2d = cache.view(cache.shape[0], -1)
+
+    # Slot mapping spanning multiple pages + a -1 (padded token) that must
+    # be skipped. slot = page*pbs + tok.
+    slots = torch.tensor(
+        [0,              # page 0, tok 0
+         pbs * 1 + 7,    # page 1, tok 7
+         pbs * 2 + 40,   # page 2, tok 40
+         -1,             # padded -> skipped
+         pbs * 0 + 63],  # page 0, tok 63
+        dtype=torch.int32)
+
+    # Per-token NoPE batch aligned with slots (mirrors production: kv is
+    # [num_tokens, 512], slot_mapping is [num_tokens]). Token i's NoPE is
+    # quantized and scattered to slot slots[i]. Here each token's nope is
+    # the row already living at its target slot, so after the overwrite
+    # slot s decodes back to rows[s] (within int8 precision).
+    kv_nope_batch = rows[slots.clamp(min=0).to(torch.int64)][:, :_D_NOPE]
+
+    overwrite_nope_int8_dsv4(kv_nope_batch, cache_2d, slots, pbs)
+
+    valid = slots >= 0
+    valid_slots = slots[valid].to(torch.int64)
+
+    # (a) The scattered tokens now decode (int8) back to the original nope
+    # within int8 precision. Decode the WHOLE cache as int8 (non-scattered
+    # tokens decode as their still-E4M3 bytes, which is fine - we only
+    # score the scattered slots).
+    dec_i8 = dequant_dsv4_packed_cache(cache.reshape(pages, -1), pbs,
+                                       int8=True)
+    nope_t = rows[valid_slots, :_D_NOPE].reshape(-1, 7, 64)
+    tile_amax = nope_t.abs().amax(dim=-1, keepdim=True).clamp_min(1e-6)
+    got_nope = dec_i8[valid_slots, :_D_NOPE].reshape(-1, 7, 64)
+    rel = ((got_nope - nope_t).abs() / tile_amax).max()
+    assert rel <= 0.02, f"scattered int8 nope rel err {rel}"
+
+    # (b) Rope bytes of scattered tokens are UNCHANGED vs the C++ op's write.
+    for s in valid_slots.tolist():
+        page, tok = s // pbs, s % pbs
+        base = page * (pbs * _BPT_PACKED) + tok * 576
+        rope_after = cache.reshape(-1)[base + _D_NOPE: base + 576]
+        rope_before = before.reshape(-1)[base + _D_NOPE: base + 576]
+        assert torch.equal(rope_after, rope_before), (
+            f"rope bytes changed for slot {s}")
+
+    # (c) Scale bytes of scattered tokens ARE overwritten (differ from E4M3).
+    for s in valid_slots.tolist():
+        page, tok = s // pbs, s % pbs
+        scale_base = page * (pbs * _BPT_PACKED) + pbs * 576 + tok * 8
+        scale_after = cache.reshape(-1)[scale_base: scale_base + 7]
+        scale_before = before.reshape(-1)[scale_base: scale_base + 7]
+        assert not torch.equal(scale_after, scale_before), (
+            f"scale bytes not overwritten for slot {s}")
+
+    # (d) Every token NOT in the slot mapping is entirely unchanged (still
+    # the C++ op's E4M3 write): compare full 584-B rows.
+    flat_after = cache.reshape(-1)
+    flat_before = before.reshape(-1)
+    scattered_pages = {int(s // pbs) for s in valid_slots.tolist()}
+    for p in range(pages):
+        if p not in scattered_pages:
+            row = slice(p * (pbs * _BPT_PACKED), (p + 1) * (pbs * _BPT_PACKED))
+            assert torch.equal(flat_after[row], flat_before[row]), (
+                f"non-scattered page {p} changed")
+    # Within a scattered page, only the touched token's nope+scale differ;
+    # other tokens in that page are unchanged row-for-row. Check page 0
+    # (touches tok 0 and tok 63 only).
+    p0_base = 0
+    for tok in range(pbs):
+        if tok in (0, 63):
+            continue
+        d0 = p0_base + tok * 576
+        assert torch.equal(flat_after[d0: d0 + 576],
+                           flat_before[d0: d0 + 576]), (
+            f"untouched tok {tok} in scattered page 0 changed")
+    # pad byte at the very end of each token's 8-B footer is never touched.
+    for p in range(pages):
+        for tok in range(pbs):
+            pad_off = p * (pbs * _BPT_PACKED) + pbs * 576 + tok * 8 + 7
+            assert flat_after[pad_off].item() == flat_before[pad_off].item() == 0
+
+
+def test_overwrite_nope_int8_matches_reference_pack_cpu():
+    """The bytes overwrite_nope_int8_dsv4 writes for a token are IDENTICAL
+    to pack_dsv4_reference_cache(int8=True) for the same nope - i.e. the
+    scatter produces the same on-disk bytes as the reference writer."""
+    torch.manual_seed(3)
+    pbs = 8
+    rows = torch.randn(pbs, _D, dtype=torch.float32) * 3.0
+    # Reference: pack the same rows int8, read token 3's bytes.
+    ref = pack_dsv4_reference_cache(rows, pbs, int8=True)
+    flat_ref = ref.reshape(-1)
+    page, tok = 0, 3
+    base = page * (pbs * _BPT_PACKED) + tok * 576
+    ref_nope = flat_ref[base: base + _D_NOPE].clone()
+    ref_scale = flat_ref[page * (pbs * _BPT_PACKED) + pbs * 576 + tok * 8:
+                        page * (pbs * _BPT_PACKED) + pbs * 576 + tok * 8 + 7].clone()
+
+    # Scatter: start from an E4M3 cache, overwrite all tokens with int8.
+    cache = pack_dsv4_reference_cache(rows, pbs, int8=False).contiguous()
+    slots = torch.arange(pbs, dtype=torch.int32)
+    overwrite_nope_int8_dsv4(rows[:, :_D_NOPE], cache.view(cache.shape[0], -1),
+                             slots, pbs)
+    flat = cache.reshape(-1)
+    got_nope = flat[base: base + _D_NOPE]
+    got_scale = flat[page * (pbs * _BPT_PACKED) + pbs * 576 + tok * 8:
+                     page * (pbs * _BPT_PACKED) + pbs * 576 + tok * 8 + 7]
+    assert torch.equal(got_nope, ref_nope), "scatter nope != reference pack"
+    assert torch.equal(got_scale, ref_scale), "scatter scale != reference pack"
+
+
+def test_fused_qnorm_rope_kv_insert_int8_gate_structure():
+    """Source-level guard (runs in any tier that can import the attention
+    module; skipped otherwise). Proves the production encode overlay:
+
+    * The stock uint8 path is REFACTORED, not replaced: the fused C++ op
+      is still called with identical args and its return (``q_padded``) is
+      returned - so ``VLLM_DSV4_KV_INT8=0`` is byte-identical to stock.
+    * The int8 overwrite is gated behind ``if _KV_INT8:`` and delegates to
+      ``overwrite_nope_int8_dsv4`` (the scatter validated above).
+    * The module-level ``_KV_INT8`` flag reads ``VLLM_DSV4_KV_INT8``.
+
+    The behavioral byte correctness is covered by the scatter tests above;
+    this asserts the wiring in DeepseekV4Attention so the two-pass cannot
+    silently regress to a different call/return shape.
+    """
+    att = pytest.importorskip("vllm.models.deepseek_v4.attention")
+    import inspect
+
+    # Flag wiring.
+    assert att._KV_INT8 == (os.getenv("VLLM_DSV4_KV_INT8", "0") == "1")
+
+    src = inspect.getsource(
+        att.DeepseekV4Attention._fused_qnorm_rope_kv_insert)
+    # The fused C++ quant-insert op is still the Q-side producer + full-row
+    # writer; its result is captured (not returned inline) so the two-pass
+    # can return the SAME bit-exact padded query.
+    assert ("q_padded = torch.ops._C."
+            "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(" in src), (
+        "overlay must capture the C++ op result into q_padded")
+    assert "return q_padded" in src, "overlay must return the C++ op result"
+    # The int8 overwrite is guarded + delegates to the scatter helper.
+    assert "if _KV_INT8:" in src, "two-pass must be gated on _KV_INT8"
+    assert "overwrite_nope_int8_dsv4(" in src, (
+        "two-pass must call overwrite_nope_int8_dsv4")
+    # The nope slice passed to the scatter is the ORIGINAL kv nope (not
+    # RoPE'd), quantized from kv[:, :self.nope_head_dim].
+    assert "kv[:, :self.nope_head_dim]" in src, (
+        "scatter must quantize the original kv nope slice")
 
 
 def test_ref_all_masked_token_is_zero_cpu():

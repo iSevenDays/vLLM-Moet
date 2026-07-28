@@ -1,0 +1,71 @@
+diff --git a/vllm/models/deepseek_v4/attention.py b/vllm/models/deepseek_v4/attention.py
+index 5628a6d..af74404 100644
+--- a/vllm/models/deepseek_v4/attention.py
++++ b/vllm/models/deepseek_v4/attention.py
+@@ -7,6 +7,7 @@
+ from abc import ABC, abstractmethod
+ from collections.abc import Callable
+ from typing import TYPE_CHECKING, Any, ClassVar, cast
++import os
+ 
+ import torch
+ import torch.nn as nn
+@@ -63,6 +64,18 @@
+ )
+ 
+ logger = init_logger(__name__)
++
++# Two-pass NoPE INT8 encode gate (read once at import, mirroring
++# vllm/v1/attention/ops/triton_sparse_mla_dsv4.py:_KV_INT8). When True,
++# _fused_qnorm_rope_kv_insert calls the fused C++ quant-insert op
++# UNCHANGED (bit-exact Q-side return + full 584 B row write: E4M3 nope +
++# bf16 rope + UE8M0 scales), then OVERWRITES only the 448-B nope data
++# bytes + the 7-B UE8M0 scale bytes in those same rows with signed-INT8
++# (7 effective bits + sign vs E4M3's ~3 mantissa bits). The bf16 rope
++# bytes are left untouched (the C++ op already RoPE'd them). Same 584
++# B/token layout, zero extra VRAM. Default OFF -> the stock E4M3 path is
++# byte-identical (the overwrite branch is skipped entirely).
++_KV_INT8 = os.getenv("VLLM_DSV4_KV_INT8", "0") == "1"
+ 
+ 
+ def _resolve_dsv4_kv_cache_dtype(
+@@ -551,7 +564,7 @@
+             #            the padded q tensor.
+             #   KV side: GPT-J RoPE + UE8M0 FP8 quant + paged cache insert.
+             swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
+-            return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
++            q_padded = torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+                 q,
+                 kv,
+                 swa_kv_cache_2d,
+@@ -562,6 +575,30 @@
+                 self.eps,
+                 swa_metadata.block_size,
+             )
++            if _KV_INT8:
++                # Two-pass NoPE INT8 overwrite (VLLM_DSV4_KV_INT8=1).
++                # The C++ op above produced the bit-exact padded query
++                # (q_padded, returned below) AND wrote the full 584 B row
++                # (E4M3 nope + bf16 rope + UE8M0 scales) at slot_mapping.
++                # Now overwrite ONLY the 448-B nope data bytes and the 7-B
++                # UE8M0 scale bytes in those same rows with signed-INT8
++                # (~7 effective bits vs E4M3's ~3; identical byte layout,
++                # zero extra VRAM). The bf16 rope bytes stay as the C++ op
++                # wrote them (already RoPE'd). The int8 nope is quantized
++                # from the ORIGINAL kv nope slice (nope is NOT RoPE'd -
++                # only the rope 64 dims are), reusing the proven per-64-tile
++                # math. The Triton reader's NOPE_INT8 arm then decodes
++                # exactly what is written here.
++                from vllm.v1.attention.ops.triton_sparse_mla_dsv4 import (
++                    overwrite_nope_int8_dsv4,
++                )
++                overwrite_nope_int8_dsv4(
++                    kv[:, :self.nope_head_dim],
++                    swa_kv_cache_2d,
++                    swa_metadata.slot_mapping,
++                    swa_metadata.block_size,
++                )
++            return q_padded
+ 
+         # Plain-row path: the [num_blocks, block_size, 512] cache stores the KV
+         # row in its element dtype (no Q padding). bf16 rewrites q in place;
