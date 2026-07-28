@@ -153,12 +153,15 @@ def _dsv4_gather_k(
         nope_mask = valid[:, None] & is_nope[None, :]
         b = tl.load(kv_ptr + nope_addr, mask=nope_mask, other=0).to(tl.uint32)
         if NOPE_INT8:
-            # Two's-complement signed int8 (writer saturates so -128 / 0x80
-            # never occurs); mag-128 recovers the negative arm. The loaded
-            # value IS the quantized int8 mantissa; the UE8M0 scale below is
-            # the exponent applied to it.
+            # Two's-complement signed int8. CRITICAL: cast mag to a SIGNED
+            # int32 BEFORE the subtract -- `mag - 128` in uint32 underflows on
+            # GPU (the negative arm becomes ~4.29e9, hence the 3.5e8 boot
+            # self-test failure). Triton CPU interpret (TRITON_INTERPRET=1)
+            # masks this because Python ints don't underflow, so the CPU
+            # self-test passed but the GPU boot died. The loaded value IS the
+            # quantized int8 mantissa; the UE8M0 scale below is the exponent.
             sign = (b >> 7) & 1
-            mag = b & 0x7F
+            mag = (b & 0x7F).to(tl.int32)
             nope_f32 = tl.where(sign == 1, mag - 128, mag).to(tl.float32)
         else:
             # FP8-E4M3 (writer saturates so 0x7F/0xFF never occur).
