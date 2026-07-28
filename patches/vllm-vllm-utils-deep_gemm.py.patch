@@ -1,8 +1,35 @@
 diff --git a/vllm/utils/deep_gemm.py b/vllm/utils/deep_gemm.py
-index 0a1644b..296bc79 100644
+index 0a1644b..cbaead1 100644
 --- a/vllm/utils/deep_gemm.py
 +++ b/vllm/utils/deep_gemm.py
-@@ -453,7 +453,211 @@
+@@ -97,6 +97,26 @@
+     """
+     is_supported_arch = current_platform.support_deep_gemm()
+     return envs.VLLM_USE_DEEP_GEMM and has_deep_gemm() and is_supported_arch
++
++
++@functools.cache
++def is_sm120_deep_gemm_paged_mqa_supported() -> bool:
++    """Return ``True`` if DeepGEMM's paged MQA logits kernel is usable on SM12x.
++
++    The indexer's scheduler-metadata path is DeepGEMM paged-MQA specific and
++    must be gated on both the SM12x family and the presence of the resolved
++    ``fp8_fp4_paged_mqa_logits`` symbol, rather than the generic
++    ``is_deep_gemm_supported`` arch check.
++    """
++    if not (
++        current_platform.is_cuda()
++        and current_platform.is_device_capability_family(120)
++    ):
++        return False
++    if not (envs.VLLM_USE_DEEP_GEMM and has_deep_gemm()):
++        return False
++    _lazy_init()
++    return _fp8_fp4_paged_mqa_logits_impl is not None
+ 
+ 
+ @functools.cache
+@@ -453,7 +473,211 @@
      return _fp8_gemm_nt_impl(*args, disable_ue8m0_cast=not use_ue8m0, **kwargs)
  
  
@@ -214,7 +241,7 @@ index 0a1644b..296bc79 100644
      _lazy_init()
      if _fp8_einsum_impl is None:
          return _missing(*args, **kwargs)
-@@ -528,6 +732,9 @@
+@@ -528,6 +752,9 @@
      Returns:
          Logits tensor of shape [M, N], dtype `torch.float32`.
      """
@@ -224,7 +251,7 @@ index 0a1644b..296bc79 100644
      _lazy_init()
      if _fp8_fp4_mqa_logits_impl is None:
          return _missing()
-@@ -556,6 +763,11 @@
+@@ -556,6 +783,11 @@
          Backend-specific tensor consumed by `fp8_fp4_paged_mqa_logits` to
          schedule work across SMs.
      """
@@ -236,7 +263,7 @@ index 0a1644b..296bc79 100644
      _lazy_init()
      if _get_paged_mqa_logits_metadata_impl is None:
          return _missing()
-@@ -600,6 +812,25 @@
+@@ -600,6 +832,25 @@
          Logits tensor of shape [B * next_n, max_model_len], dtype
          `torch.float32`.
      """
@@ -262,3 +289,11 @@ index 0a1644b..296bc79 100644
      _lazy_init()
      if _fp8_fp4_paged_mqa_logits_impl is None:
          return _missing()
+@@ -733,6 +984,7 @@
+     "per_block_cast_to_fp8",
+     "is_deep_gemm_e8m0_used",
+     "is_deep_gemm_supported",
++    "is_sm120_deep_gemm_paged_mqa_supported",
+     "get_num_sms",
+     "set_num_sms",
+     "should_use_deepgemm_for_fp8_linear",

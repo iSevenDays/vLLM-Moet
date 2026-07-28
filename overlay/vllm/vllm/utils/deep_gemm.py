@@ -100,6 +100,26 @@ def is_deep_gemm_supported() -> bool:
 
 
 @functools.cache
+def is_sm120_deep_gemm_paged_mqa_supported() -> bool:
+    """Return ``True`` if DeepGEMM's paged MQA logits kernel is usable on SM12x.
+
+    The indexer's scheduler-metadata path is DeepGEMM paged-MQA specific and
+    must be gated on both the SM12x family and the presence of the resolved
+    ``fp8_fp4_paged_mqa_logits`` symbol, rather than the generic
+    ``is_deep_gemm_supported`` arch check.
+    """
+    if not (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
+    ):
+        return False
+    if not (envs.VLLM_USE_DEEP_GEMM and has_deep_gemm()):
+        return False
+    _lazy_init()
+    return _fp8_fp4_paged_mqa_logits_impl is not None
+
+
+@functools.cache
 def is_deep_gemm_e8m0_used() -> bool:
     """Return `True` if vLLM is configured to use DeepGEMM "
     "E8M0 scale on a Hopper or Blackwell-class GPU.
@@ -964,6 +984,7 @@ __all__ = [
     "per_block_cast_to_fp8",
     "is_deep_gemm_e8m0_used",
     "is_deep_gemm_supported",
+    "is_sm120_deep_gemm_paged_mqa_supported",
     "get_num_sms",
     "set_num_sms",
     "should_use_deepgemm_for_fp8_linear",
