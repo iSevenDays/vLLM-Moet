@@ -1025,7 +1025,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # shm_broadcast stall. Gated by a module-level one-shot so the
             # ~43 routed-expert layers trigger prewarm only once.
             global _IQ2_PREWARMED
-            if (os.getenv("VLLM_MOE_W2_IQ2_Q8K", "0") == "1"
+            if ((os.getenv("VLLM_MOE_W2_IQ2_Q8K", "0") == "1"
+                    or os.getenv("VLLM_MOE_W2_IQ2_FUSED", "0") == "1")
                     and not _IQ2_PREWARMED):
                 _IQ2_PREWARMED = True
                 try:
@@ -1154,24 +1155,61 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         up_shape = (up_n, up_k)
         down_shape = (dn_n, dn_k)
 
-        for M in (1, 16, 17):
-            # x_bf16 -> Q8_K (gate/up activations, K = hidden).
+        if os.getenv("VLLM_MOE_W2_IQ2_Q8K", "0") == "1":
+            for M in (1, 16, 17):
+                # x_bf16 -> Q8_K (gate/up activations, K = hidden).
+                x_dummy = torch.zeros(
+                    M, gate_k, dtype=torch.bfloat16, device=device)
+                x_qs, x_d, _ = q8_k_quantize_triton.quantize_q8_K(x_dummy)
+                # gate/up with out_fp32=False (production path -- bf16 mid,
+                # see the Q3(a) revert note in _iq2_forward).
+                _ = iq2_xxs_mm_triton.iq2_xxs_mm_q8k(
+                    x_qs, x_d, gate_w[0], gate_shape, grid, ksigns)
+                _ = iq2_xxs_mm_triton.iq2_xxs_mm_q8k(
+                    x_qs, x_d, up_w[0], up_shape, grid, ksigns)
+                # mid (bf16) -> Q8_K (down activations, K = intermediate).
+                mid_dummy = torch.zeros(
+                    M, dn_k, dtype=torch.bfloat16, device=device)
+                mid_qs, mid_d, mid_bs = q8_k_quantize_triton.quantize_q8_K(
+                    mid_dummy)
+                _ = q2_k_mm_triton.q2_k_mm_q8k(
+                    mid_qs, mid_d, mid_bs, down_w[0], down_shape)
+
+        if os.getenv("VLLM_MOE_W2_IQ2_FUSED", "0") == "1":
+            # Fused-path prewarm: the fused kernels take M at runtime, so
+            # ONE call per kernel covers every subsequent shape. Constexprs
+            # (TOP_K, HAS_CLAMP, MUL_WEIGHT, ...) must match production --
+            # use the layer's real top_k / swiglu_limit. Route the dummy
+            # dispatch to a global expert this rank owns so the warm GEMMs
+            # execute (host syncs are fine here, before any capture).
+            from vllm.model_executor.layers.quantization.utils import (
+                fused_iq2_moe_triton)
+            top_k = int(getattr(layer, "top_k", 1))
+            expert_map = getattr(layer, "expert_map", None)
+            if expert_map is not None:
+                owned = (expert_map >= 0).nonzero(as_tuple=False)
+                global_eid = int(owned[0]) if owned.numel() else 0
+            else:
+                global_eid = 0
+            swiglu_limit = getattr(layer, "swiglu_limit", None)
             x_dummy = torch.zeros(
-                M, gate_k, dtype=torch.bfloat16, device=device)
-            x_qs, x_d, _ = q8_k_quantize_triton.quantize_q8_K(x_dummy)
-            # gate/up with out_fp32=False (production path -- bf16 mid, see
-            # the Q3(a) revert note in _iq2_forward).
-            _ = iq2_xxs_mm_triton.iq2_xxs_mm_q8k(
-                x_qs, x_d, gate_w[0], gate_shape, grid, ksigns)
-            _ = iq2_xxs_mm_triton.iq2_xxs_mm_q8k(
-                x_qs, x_d, up_w[0], up_shape, grid, ksigns)
-            # mid (bf16) -> Q8_K (down activations, K = intermediate).
-            mid_dummy = torch.zeros(
-                M, dn_k, dtype=torch.bfloat16, device=device)
-            mid_qs, mid_d, mid_bs = q8_k_quantize_triton.quantize_q8_K(
-                mid_dummy)
-            _ = q2_k_mm_triton.q2_k_mm_q8k(
-                mid_qs, mid_d, mid_bs, down_w[0], down_shape)
+                2, gate_k, dtype=torch.bfloat16, device=device)
+            tw = torch.full((2, top_k), 1.0 / top_k, dtype=torch.float32,
+                            device=device)
+            ti = torch.full((2, top_k), global_eid, dtype=torch.int32,
+                            device=device)
+            _ = fused_iq2_moe_triton.fused_iq2_moe_forward(
+                x_dummy, tw, ti, gate_w, up_w, down_w, grid, ksigns,
+                global_num_experts=layer.global_num_experts,
+                expert_map=expert_map,
+                swiglu_limit=float(swiglu_limit) if swiglu_limit else None,
+                apply_router_weight_on_input=getattr(
+                    layer, "apply_router_weight_on_input", False),
+                mid_fp32=os.getenv(
+                    "VLLM_MOE_W2_IQ2_FUSED_MID_FP32", "0") == "1",
+                loop_parity=os.getenv(
+                    "VLLM_MOE_W2_IQ2_FUSED_LOOP_PARITY", "0") == "1",
+            )
         if device.type == "cuda":
             torch.cuda.synchronize()
 
@@ -1547,6 +1585,43 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 pass
         return out.to(torch.bfloat16)
 
+    def _iq2_forward_fused(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Step 4d fused sorted-dispatch forward (VLLM_MOE_W2_IQ2_FUSED=1).
+
+        Same contract as ``_iq2_forward`` (routed output only, bf16,
+        per-rank partial under EP), but 3 launches/layer, no host syncs,
+        CUDA-graph capturable, and a single bf16 rounding inside the MoE
+        block (fp32 clamp/SwiGLU in-kernel, fp32 atomic combine). See
+        ``fused_iq2_moe_triton`` for the precision contract and knobs.
+        """
+        from vllm.model_executor.layers.quantization.utils import (
+            fused_iq2_moe_triton, iq2_xxs_mm_triton)
+
+        grid, ksigns = iq2_xxs_mm_triton._get_luts(x.device)
+        swiglu_limit = getattr(layer, "swiglu_limit", None)
+        return fused_iq2_moe_triton.fused_iq2_moe_forward(
+            x, topk_weights, topk_ids,
+            layer.gate_weight_iq2_xxs,
+            layer.up_weight_iq2_xxs,
+            layer.down_weight_q2_k,
+            grid, ksigns,
+            global_num_experts=layer.global_num_experts,
+            expert_map=getattr(layer, "expert_map", None),
+            swiglu_limit=float(swiglu_limit) if swiglu_limit else None,
+            apply_router_weight_on_input=getattr(
+                layer, "apply_router_weight_on_input", False),
+            mid_fp32=os.getenv(
+                "VLLM_MOE_W2_IQ2_FUSED_MID_FP32", "0") == "1",
+            loop_parity=os.getenv(
+                "VLLM_MOE_W2_IQ2_FUSED_LOOP_PARITY", "0") == "1",
+        )
+
     def apply(
         self,
         layer: RoutedExperts,
@@ -1558,9 +1633,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     ) -> torch.Tensor:
         # VLLM_MOE_W2_IQ2=1: IQ2_XXS / Q2_K routed-expert forward. The
         # proven Step 4b/4c Triton GEMMs are wired in as a per-expert
-        # Python-loop MoE forward (correctness-first; the fused fast path is
-        # later work). Shared experts stay orchestrated by the MoE runner.
+        # Python-loop MoE forward (correctness-first). Shared experts stay
+        # orchestrated by the MoE runner.
+        # VLLM_MOE_W2_IQ2_FUSED=1 additionally selects the Step 4d fused
+        # sorted-dispatch path (fused_iq2_moe_triton): 3 launches/layer,
+        # sync-free, CUDA-graph capturable (no ENFORCE_EAGER), and one bf16
+        # rounding inside the MoE block instead of the loop's four.
         if self._iq2_active:
+            if os.getenv("VLLM_MOE_W2_IQ2_FUSED", "0") == "1":
+                return self._iq2_forward_fused(layer, x, topk_weights,
+                                               topk_ids)
             return self._iq2_forward(layer, x, topk_weights, topk_ids)
         # VLLM_MOE_W2 routed-expert path (cubit moe_w2_mm, 2-bit planes).
         # Shared experts are orchestrated by the MoE runner (pre/post

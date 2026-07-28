@@ -53,10 +53,11 @@ Knobs (wrapper kwargs; the mxfp4 integration maps env vars onto them):
                            bf16-mid trajectory measured best (0.966 @16K);
                            the fp32-mid Q8K experiment regressed (see the
                            Q3(a) note in mxfp4._iq2_forward).
-* ``round_gate_up=True``-- reproduce the Python loop's exact rounding
+* ``loop_parity=True``  -- reproduce the Python loop's exact rounding
                            sequence (bf16 gate/up -> clamp -> bf16 silu ->
-                           bf16 mul) for A/B triage against the loop.
-                           Default False (single mid rounding).
+                           bf16 mul -> bf16 expert_out) for A/B triage
+                           against the loop.  Default False (single mid
+                           rounding).
 
 Contract (same as ``_iq2_forward``): returns ONLY the routed-expert output
 (bf16 ``[T, hidden]``); shared experts and the EP/TP all-reduce stay with
@@ -290,6 +291,7 @@ def _fused_q2_k_down_combine_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_BYTES: tl.constexpr,      # 84
     MUL_WEIGHT: tl.constexpr,
+    ROUND_OUT: tl.constexpr,        # emulate the loop's bf16 expert_out
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -370,6 +372,10 @@ def _fused_q2_k_down_combine_kernel(
 
             acc += tl.dot(a_tile, tl.trans(w_tile), allow_tf32=True)
 
+    if ROUND_OUT:
+        # Loop parity: q2_k_mm rounds expert_out to bf16 before the fp32
+        # weight multiply + index_add combine.
+        acc = acc.to(tl.bfloat16).to(tl.float32)
     if MUL_WEIGHT:
         w = tl.load(topk_weights_ptr + offs_token, mask=token_mask,
                     other=0.0).to(tl.float32)
@@ -400,7 +406,7 @@ def fused_iq2_moe_forward(
     swiglu_limit: float | None = None,
     apply_router_weight_on_input: bool = False,
     mid_fp32: bool = False,
-    round_gate_up: bool = False,
+    loop_parity: bool = False,
     block_m: int = 16,
     block_n: int = 16,
     num_warps: int = 2,
@@ -424,8 +430,8 @@ def fused_iq2_moe_forward(
             (topk=1 fast path); skip the combine multiply.
         mid_fp32: keep the kernel-boundary mid in fp32 (antirez
             trajectory) instead of the default bf16.
-        round_gate_up: reproduce the Python loop's bf16 gate/up/silu
-            roundings exactly (A/B triage knob).
+        loop_parity: reproduce the Python loop's bf16 gate/up/silu/
+            expert_out roundings exactly (A/B triage knob).
 
     Returns:
         bf16 ``[T, hidden]`` routed-expert output (partial under EP).
@@ -452,6 +458,10 @@ def fused_iq2_moe_forward(
     if dn_k != n_inter:
         raise RuntimeError(
             f"fused IQ2 down K ({dn_k}) != intermediate ({n_inter})")
+    if expert_map is None and e_local != global_num_experts:
+        raise RuntimeError(
+            f"fused IQ2 expert_map is None but E_local ({e_local}) != "
+            f"global_num_experts ({global_num_experts})")
 
     out = torch.zeros(
         num_tokens, hidden, dtype=torch.float32, device=device)
@@ -502,7 +512,7 @@ def fused_iq2_moe_forward(
         BLOCK_N=block_n,
         BLOCK_BYTES=IQ2_XXS_BLOCK_BYTES,
         HAS_CLAMP=has_clamp,
-        ROUND_GATE_UP=round_gate_up,
+        ROUND_GATE_UP=loop_parity,
         num_warps=num_warps,
     )
 
@@ -526,6 +536,7 @@ def fused_iq2_moe_forward(
         BLOCK_N=block_n,
         BLOCK_BYTES=Q2_K_BLOCK_BYTES,
         MUL_WEIGHT=not apply_router_weight_on_input,
+        ROUND_OUT=loop_parity,
         num_warps=num_warps,
     )
 
@@ -653,7 +664,7 @@ def _self_test() -> None:  # pragma: no cover - manual/GPU-only
             got_exact = fused_iq2_moe_forward(
                 x, tw, ti, gw, uw, dw, grid_t, ksigns_t,
                 global_num_experts=E, expert_map=emap, swiglu_limit=10.0,
-                round_gate_up=True)
+                loop_parity=True)
             got_dflt = fused_iq2_moe_forward(
                 x, tw, ti, gw, uw, dw, grid_t, ksigns_t,
                 global_num_experts=E, expert_map=emap, swiglu_limit=10.0)
@@ -661,7 +672,7 @@ def _self_test() -> None:  # pragma: no cover - manual/GPU-only
             r_dflt = rel_l2(ref, got_dflt)
             print(f"  M={m:4d} {name:8s} rel_l2 loop-parity={r_exact:.3e} "
                   f"default={r_dflt:.3e}")
-            assert r_exact < 2e-3, (m, name, r_exact)
+            assert r_exact < 1e-3, (m, name, r_exact)
             assert r_dflt < 2e-2, (m, name, r_dflt)
 
     # apply_router_weight_on_input contract.
@@ -676,7 +687,7 @@ def _self_test() -> None:  # pragma: no cover - manual/GPU-only
     got = fused_iq2_moe_forward(
         x, tw, ti, gate_w, up_w, down_w, grid_t, ksigns_t,
         global_num_experts=E, swiglu_limit=10.0,
-        apply_router_weight_on_input=True, round_gate_up=True)
+        apply_router_weight_on_input=True, loop_parity=True)
     r = rel_l2(ref, got)
     print(f"  router-weight-on-input rel_l2={r:.3e}")
     assert r < 2e-3, r
@@ -728,8 +739,8 @@ def _self_test() -> None:  # pragma: no cover - manual/GPU-only
         for _ in range(20):
             fn()
         torch.cuda.synchronize()
-        print(f"  perf M={m}: {name} {(time.perf_counter() - t0) / 20 * 1e3:"
-              f".2f} ms/fwd")
+        dt_ms = (time.perf_counter() - t0) / 20 * 1e3
+        print(f"  perf M={m}: {name} {dt_ms:.2f} ms/fwd")
 
     print("fused IQ2 MoE self-test: ALL PASS")
 

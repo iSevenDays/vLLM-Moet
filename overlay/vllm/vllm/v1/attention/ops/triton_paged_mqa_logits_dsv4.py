@@ -180,7 +180,9 @@ def _paged_mqa_logits_kernel(
         if DOT_BF16:
             s = tl.dot(q.to(tl.bfloat16), tl.trans(k))
         else:
-            s = tl.dot(q, tl.trans(k))                      # [BLOCK_H, N]
+            # fp32 operands -> Ada tf32 MMA (10-bit mantissa), matching the
+            # sparse-MLA attention kernel's DOT_BF16=False path.
+            s = tl.dot(q, tl.trans(k), allow_tf32=True)     # [BLOCK_H, N]
         s = tl.maximum(s, 0.0) * w[:, None]
         s = tl.where(h_ok[:, None], s, 0.0)
         acc += tl.sum(s, axis=0)
@@ -268,9 +270,16 @@ def paged_mqa_logits_dsv4_triton(
         BLOCK_N=triton.next_power_of_2(block_size),
         BLOCK_SIZE=block_size,
         BLOCK_H=block_h,
-        # interpreter (numpy) cannot emulate bf16 dot -> f32 there; GPU build
-        # uses bf16 operands (fp8 MMA parity + smem headroom).
-        DOT_BF16=not _IS_INTERPRET,
+        # Force the fp32/tf32 score dot -- the mirror of the sparse-MLA
+        # attention fix (commit b15828066, 16K 0.948->0.966). The bf16 dot
+        # rounded the dequantized K (fp8 value x full-f32 per-token scale)
+        # and Q to 8-bit mantissa BEFORE scoring; the indexer's top-k
+        # SELECTS which tokens sparse attention sees, so score rounding is
+        # a discrete error source at long context (a needle key that slips
+        # below the top-512 boundary is unrecoverable downstream). smem
+        # fits fp32 operands here easily: D=128 (vs 512 in the attention
+        # kernel), q [32,128] + k [BLOCK_N,128] f32 tiles.
+        DOT_BF16=False,
         num_warps=4,
         num_stages=1,
     )
