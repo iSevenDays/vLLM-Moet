@@ -1,0 +1,755 @@
+diff --git a/vllm/model_executor/layers/quantization/utils/fused_iq2_moe_triton.py b/vllm/model_executor/layers/quantization/utils/fused_iq2_moe_triton.py
+new file mode 100644
+index 0000000..d2d0191 100644
+--- /dev/null
++++ b/vllm/model_executor/layers/quantization/utils/fused_iq2_moe_triton.py
+@@ -0,0 +1,749 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Fused IQ2_XXS/Q2_K MoE forward (Triton) -- the Step 4d fast path.
++
++Replaces the per-expert Python loop (``Mxfp4MoEMethod._iq2_forward``) with
++TWO kernel launches per MoE layer (plus vLLM's ``moe_align_block_size``
++dispatch op), using the sorted-dispatch layout every vLLM fused-MoE kernel
++uses:
++
++    moe_align_block_size(topk_ids)  ->  sorted_token_ids / expert_ids /
++                                        num_tokens_post_padded
++    kernel 1: IQ2_XXS gate+up GEMM + fp32 clamp + fp32 SwiGLU  -> mid
++    kernel 2: Q2_K down GEMM + fp32 router-weight + fp32 atomic combine
++
++Why (the three claims this file exists to deliver):
++
++  1. CUDA-GRAPH SAFE / no ENFORCE_EAGER.  The Python loop syncs the host
++     twice per layer (``uniq.tolist()`` / ``offsets.tolist()``) and issues a
++     data-dependent number of kernel launches, so it cannot be captured.
++     Here every shape is data-INdependent (the sorted buffer is padded to
++     its worst case; blocks past ``num_tokens_post_padded`` early-exit on a
++     device-side scalar), there is no host readback anywhere, and the
++     launch count is fixed at 3 ops/layer -- capturable by construction.
++     ``__main__`` proves it with a torch.cuda.CUDAGraph capture+replay.
++
++  2. FEWER bf16 ROUNDINGS THAN THE LOOP (closer to antirez's fp32
++     trajectory).  The loop rounds FOUR times inside the MoE block:
++     gate->bf16, up->bf16 (GEMM epilogues), silu(gate)*up->bf16 (torch
++     elementwise), expert_out->bf16 (down epilogue) -- and only then
++     combines in fp32.  antirez (ds4_cuda.cu ``moe_gate_up_mid_*``) keeps
++     gate/up/SwiGLU/combine entirely in fp32, rounding ONLY where the mid
++     is quantized for the down dot.  This fused path matches that shape:
++     gate/up stay in the fp32 accumulator through clamp+SwiGLU (in-kernel,
++     in-register), the mid is rounded ONCE at the kernel-1/kernel-2
++     boundary (bf16 by default -- the proven production trajectory), and
++     the down output goes straight from the fp32 accumulator through the
++     fp32 router-weight multiply into an fp32 atomic add.  Net: 4 bf16
++     roundings -> 1.
++
++  3. LAUNCH COUNT.  ~500 launches/layer (4 per active expert x ~128 local
++     experts) -> 3.
++
++GEMM numerics are IDENTICAL to the proven standalone kernels
++(``iq2_xxs_mm_triton`` / ``q2_k_mm_triton``): fp32 in-register dequant,
++fp32 A operand, tf32 ``tl.dot`` (10-bit mantissa on Ada), fp32 accumulate,
++same 32-wide stripe contraction order.  Only the epilogues differ (see
++knobs).
++
++Knobs (wrapper kwargs; the mxfp4 integration maps env vars onto them):
++
++* ``mid_fp32=True``     -- keep the mid fp32 across the kernel boundary
++                           (the antirez trajectory).  Default False: the
++                           bf16-mid trajectory measured best (0.966 @16K);
++                           the fp32-mid Q8K experiment regressed (see the
++                           Q3(a) note in mxfp4._iq2_forward).
++* ``loop_parity=True``  -- reproduce the Python loop's exact rounding
++                           sequence (bf16 gate/up -> clamp -> bf16 silu ->
++                           bf16 mul -> bf16 expert_out) for A/B triage
++                           against the loop.  Default False (single mid
++                           rounding).
++
++Contract (same as ``_iq2_forward``): returns ONLY the routed-expert output
++(bf16 ``[T, hidden]``); shared experts and the EP/TP all-reduce stay with
++the MoE runner.  Under EP, non-local experts map to ``expert_ids == -1``
++blocks which both kernels skip, so each rank emits a partial sum.
++"""
++
++from __future__ import annotations
++
++import torch
++
++from vllm.triton_utils import tl, triton
++
++QK_K = 256
++IQ2_XXS_BLOCK_BYTES = 66
++Q2_K_BLOCK_BYTES = 84
++
++
++# ---------------------------------------------------------------------------
++# Kernel 1: sorted-dispatch IQ2_XXS gate+up GEMM + fp32 clamp/SwiGLU -> mid.
++#
++# Grid: (cdiv(EM, BLOCK_M), cdiv(N_inter, BLOCK_N)).  EM is the padded
++# sorted-dispatch length (shape-static).  One program computes a
++# [BLOCK_M, BLOCK_N] tile of the mid for ONE expert's token block: both the
++# gate and the up dot are accumulated in the same pass over K (one A-tile
++# load feeds two tl.dots), then clamp + SwiGLU run on the fp32 accumulators
++# and the mid is stored once, indexed by the flat (token*topk+slot) id.
++# ---------------------------------------------------------------------------
++@triton.jit
++def _fused_iq2_gate_up_swiglu_kernel(
++    a_ptr,           # *bf16 [T, K]
++    gate_w_ptr,      # *uint8 [E_local, N, BLOCKS_PER_ROW * 66]
++    up_w_ptr,        # *uint8 [E_local, N, BLOCKS_PER_ROW * 66]
++    grid_ptr,        # *uint8 [2048]  (iq2xxs_grid, flattened)
++    ksigns_ptr,      # *uint8 [128]   (ksigns_iq2xs)
++    mid_ptr,         # *bf16|fp32 [T * TOP_K, N]
++    sorted_token_ids_ptr,       # *i32 [EM]
++    expert_ids_ptr,             # *i32 [EM / BLOCK_M]
++    num_tokens_post_padded_ptr, # *i32 [1]
++    num_valid_tokens,
++    N_RUNTIME,       # runtime N (intermediate dim)
++    stride_am, stride_ak,
++    stride_we, stride_wn,       # shared by gate & up (same shape/layout)
++    stride_mm, stride_mn,
++    swiglu_hi,       # fp32 clamp threshold (gate: +hi; up: +/-hi)
++    BLOCKS_PER_ROW: tl.constexpr,   # K // 256
++    TOP_K: tl.constexpr,
++    BLOCK_M: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_BYTES: tl.constexpr,      # 66
++    HAS_CLAMP: tl.constexpr,
++    ROUND_GATE_UP: tl.constexpr,    # emulate the Python loop's roundings
++):
++    pid_m = tl.program_id(0)
++    pid_n = tl.program_id(1)
++
++    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
++    if pid_m * BLOCK_M >= num_tokens_post_padded:
++        return
++    off_expert = tl.load(expert_ids_ptr + pid_m)
++    if off_expert == -1:
++        return
++
++    offs_token = tl.load(
++        sorted_token_ids_ptr + pid_m * BLOCK_M + tl.arange(0, BLOCK_M))
++    token_mask = offs_token < num_valid_tokens
++    a_row = offs_token // TOP_K                              # [BLOCK_M]
++
++    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    mask_n = offs_n < N_RUNTIME
++
++    # Per-expert weight slab bases (int64: E * N * row_bytes can pass 2^31).
++    gate_e_ptr = gate_w_ptr + off_expert.to(tl.int64) * stride_we
++    up_e_ptr = up_w_ptr + off_expert.to(tl.int64) * stride_we
++
++    i8 = tl.arange(0, 8)
++    k4 = tl.arange(0, 4)
++    i32 = tl.arange(0, 32)
++
++    acc_g = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++    acc_u = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++
++    for kb in range(BLOCKS_PER_ROW):
++        block_base = offs_n * stride_wn + kb * BLOCK_BYTES   # [BLOCK_N]
++
++        # d (fp16 super-block scale), gate + up.
++        gd_lo = tl.load(gate_e_ptr + block_base + 0, mask=mask_n,
++                        other=0).to(tl.uint32)
++        gd_hi = tl.load(gate_e_ptr + block_base + 1, mask=mask_n,
++                        other=0).to(tl.uint32)
++        gd = ((gd_lo | (gd_hi << 8)).to(tl.uint16)
++              .to(tl.float16, bitcast=True).to(tl.float32))
++        g_scale_pre = 0.125 * gd                             # [BLOCK_N]
++        ud_lo = tl.load(up_e_ptr + block_base + 0, mask=mask_n,
++                        other=0).to(tl.uint32)
++        ud_hi = tl.load(up_e_ptr + block_base + 1, mask=mask_n,
++                        other=0).to(tl.uint32)
++        ud = ((ud_lo | (ud_hi << 8)).to(tl.uint16)
++              .to(tl.float16, bitcast=True).to(tl.float32))
++        u_scale_pre = 0.125 * ud                             # [BLOCK_N]
++
++        for ib32 in tl.static_range(8):
++            sub_base = block_base + 2 + ib32 * 8             # [BLOCK_N]
++
++            # A tile for this 32-wide K window (loaded once, used twice).
++            k_glob = kb * 256 + ib32 * 32 + i32              # [32]
++            a_tile = tl.load(
++                a_ptr + a_row[:, None] * stride_am
++                + k_glob[None, :] * stride_ak,
++                mask=token_mask[:, None], other=0.0,
++            ).to(tl.float32)                                 # [BLOCK_M, 32]
++
++            # ---- gate stripe decode (identical math to iq2_xxs_mm) ----
++            q0_lo = tl.load(gate_e_ptr + sub_base + 0, mask=mask_n,
++                            other=0).to(tl.uint32)
++            q0_hi = tl.load(gate_e_ptr + sub_base + 1, mask=mask_n,
++                            other=0).to(tl.uint32)
++            q1_lo = tl.load(gate_e_ptr + sub_base + 2, mask=mask_n,
++                            other=0).to(tl.uint32)
++            q1_hi = tl.load(gate_e_ptr + sub_base + 3, mask=mask_n,
++                            other=0).to(tl.uint32)
++            q2_lo = tl.load(gate_e_ptr + sub_base + 4, mask=mask_n,
++                            other=0).to(tl.uint32)
++            q2_hi = tl.load(gate_e_ptr + sub_base + 5, mask=mask_n,
++                            other=0).to(tl.uint32)
++            q3_lo = tl.load(gate_e_ptr + sub_base + 6, mask=mask_n,
++                            other=0).to(tl.uint32)
++            q3_hi = tl.load(gate_e_ptr + sub_base + 7, mask=mask_n,
++                            other=0).to(tl.uint32)
++            aux0 = (q0_lo | (q0_hi << 8)) | ((q1_lo | (q1_hi << 8)) << 16)
++            aux1 = (q2_lo | (q2_hi << 8)) | ((q3_lo | (q3_hi << 8)) << 16)
++
++            ls = (2 * ((aux1 >> 28) & 0xf) + 1).to(tl.float32)
++            scale_sb = g_scale_pre * ls                      # [BLOCK_N]
++            a_k = (aux0[:, None] >> (8 * k4[None, :])) & 0xff
++            sign_k = (aux1[:, None] >> (7 * k4[None, :])) & 0x7f
++            grid_offs = a_k[:, :, None] * 8 + i8[None, None, :]
++            grid_vals = tl.load(grid_ptr + grid_offs).to(tl.int32)
++            sign_byte = tl.load(ksigns_ptr + sign_k).to(tl.int32)
++            sign_bit = (sign_byte[:, :, None] >> i8[None, None, :]) & 1
++            signed = (grid_vals * (1 - 2 * sign_bit)).to(tl.float32)
++            w_tile = tl.reshape(
++                scale_sb[:, None, None] * signed, (BLOCK_N, 32))
++            acc_g += tl.dot(a_tile, tl.trans(w_tile), allow_tf32=True)
++
++            # ---- up stripe decode --------------------------------------
++            q0_lo = tl.load(up_e_ptr + sub_base + 0, mask=mask_n,
++                            other=0).to(tl.uint32)
++            q0_hi = tl.load(up_e_ptr + sub_base + 1, mask=mask_n,
++                            other=0).to(tl.uint32)
++            q1_lo = tl.load(up_e_ptr + sub_base + 2, mask=mask_n,
++                            other=0).to(tl.uint32)
++            q1_hi = tl.load(up_e_ptr + sub_base + 3, mask=mask_n,
++                            other=0).to(tl.uint32)
++            q2_lo = tl.load(up_e_ptr + sub_base + 4, mask=mask_n,
++                            other=0).to(tl.uint32)
++            q2_hi = tl.load(up_e_ptr + sub_base + 5, mask=mask_n,
++                            other=0).to(tl.uint32)
++            q3_lo = tl.load(up_e_ptr + sub_base + 6, mask=mask_n,
++                            other=0).to(tl.uint32)
++            q3_hi = tl.load(up_e_ptr + sub_base + 7, mask=mask_n,
++                            other=0).to(tl.uint32)
++            aux0 = (q0_lo | (q0_hi << 8)) | ((q1_lo | (q1_hi << 8)) << 16)
++            aux1 = (q2_lo | (q2_hi << 8)) | ((q3_lo | (q3_hi << 8)) << 16)
++
++            ls = (2 * ((aux1 >> 28) & 0xf) + 1).to(tl.float32)
++            scale_sb = u_scale_pre * ls
++            a_k = (aux0[:, None] >> (8 * k4[None, :])) & 0xff
++            sign_k = (aux1[:, None] >> (7 * k4[None, :])) & 0x7f
++            grid_offs = a_k[:, :, None] * 8 + i8[None, None, :]
++            grid_vals = tl.load(grid_ptr + grid_offs).to(tl.int32)
++            sign_byte = tl.load(ksigns_ptr + sign_k).to(tl.int32)
++            sign_bit = (sign_byte[:, :, None] >> i8[None, None, :]) & 1
++            signed = (grid_vals * (1 - 2 * sign_bit)).to(tl.float32)
++            w_tile = tl.reshape(
++                scale_sb[:, None, None] * signed, (BLOCK_N, 32))
++            acc_u += tl.dot(a_tile, tl.trans(w_tile), allow_tf32=True)
++
++    # ---- clamp + SwiGLU epilogue (fp32 in-register) -----------------------
++    g = acc_g
++    u = acc_u
++    if ROUND_GATE_UP:
++        # Loop parity: GEMM epilogue rounds to bf16 BEFORE the clamp.
++        g = g.to(tl.bfloat16).to(tl.float32)
++        u = u.to(tl.bfloat16).to(tl.float32)
++    if HAS_CLAMP:
++        # DSv4 swiglu_limit semantics (fused_moe/utils.swiglu_limit_func):
++        # gate upper-clamped only, up clamped both sides.
++        g = tl.minimum(g, swiglu_hi)
++        u = tl.minimum(tl.maximum(u, -swiglu_hi), swiglu_hi)
++    s = g / (1.0 + tl.exp(-g))               # exact SiLU (antirez formula)
++    if ROUND_GATE_UP:
++        # Loop parity: torch silu rounds its output to bf16 before the mul.
++        s = s.to(tl.bfloat16).to(tl.float32)
++    mid = s * u
++
++    tl.store(
++        mid_ptr + offs_token[:, None] * stride_mm + offs_n[None, :] * stride_mn,
++        mid.to(mid_ptr.dtype.element_ty),
++        mask=token_mask[:, None] & mask_n[None, :],
++    )
++
++
++# ---------------------------------------------------------------------------
++# Kernel 2: sorted-dispatch Q2_K down GEMM + fp32 router weight + fp32
++# atomic combine.
++#
++# Grid: (cdiv(EM, BLOCK_M), cdiv(N_hidden, BLOCK_N)).  The fp32 accumulator
++# is scaled by the (fp32) router weight and atomically added into the fp32
++# output row of the ORIGINAL token -- no bf16 rounding between the GEMM and
++# the combine (the Python loop rounded expert_out to bf16 here).  fp32
++# atomicAdd order is non-deterministic, exactly like the loop's index_add_.
++# ---------------------------------------------------------------------------
++@triton.jit
++def _fused_q2_k_down_combine_kernel(
++    mid_ptr,         # *bf16|fp32 [T * TOP_K, K]
++    down_w_ptr,      # *uint8 [E_local, N, BLOCKS_PER_ROW * 84]
++    out_ptr,         # *fp32 [T, N]
++    topk_weights_ptr,           # *fp32 [T * TOP_K]
++    sorted_token_ids_ptr,       # *i32 [EM]
++    expert_ids_ptr,             # *i32 [EM / BLOCK_M]
++    num_tokens_post_padded_ptr, # *i32 [1]
++    num_valid_tokens,
++    N_RUNTIME,       # runtime N (hidden dim)
++    stride_mm, stride_mk,
++    stride_we, stride_wn,
++    stride_om, stride_on,
++    BLOCKS_PER_ROW: tl.constexpr,   # K // 256
++    TOP_K: tl.constexpr,
++    BLOCK_M: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_BYTES: tl.constexpr,      # 84
++    MUL_WEIGHT: tl.constexpr,
++    ROUND_OUT: tl.constexpr,        # emulate the loop's bf16 expert_out
++):
++    pid_m = tl.program_id(0)
++    pid_n = tl.program_id(1)
++
++    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
++    if pid_m * BLOCK_M >= num_tokens_post_padded:
++        return
++    off_expert = tl.load(expert_ids_ptr + pid_m)
++    if off_expert == -1:
++        return
++
++    offs_token = tl.load(
++        sorted_token_ids_ptr + pid_m * BLOCK_M + tl.arange(0, BLOCK_M))
++    token_mask = offs_token < num_valid_tokens
++    out_row = offs_token // TOP_K                            # [BLOCK_M]
++
++    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    mask_n = offs_n < N_RUNTIME
++
++    w_e_ptr = down_w_ptr + off_expert.to(tl.int64) * stride_we
++
++    i32 = tl.arange(0, 32)
++    is_half1 = i32 >= 16
++
++    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++
++    for kb in range(BLOCKS_PER_ROW):
++        block_base = offs_n * stride_wn + kb * BLOCK_BYTES   # [BLOCK_N]
++
++        d_lo = tl.load(w_e_ptr + block_base + 80, mask=mask_n,
++                       other=0).to(tl.uint32)
++        d_hi = tl.load(w_e_ptr + block_base + 81, mask=mask_n,
++                       other=0).to(tl.uint32)
++        d_fp32 = ((d_lo | (d_hi << 8)).to(tl.uint16)
++                  .to(tl.float16, bitcast=True).to(tl.float32))
++        dm_lo = tl.load(w_e_ptr + block_base + 82, mask=mask_n,
++                        other=0).to(tl.uint32)
++        dm_hi = tl.load(w_e_ptr + block_base + 83, mask=mask_n,
++                        other=0).to(tl.uint32)
++        dmin_fp32 = ((dm_lo | (dm_hi << 8)).to(tl.uint16)
++                     .to(tl.float16, bitcast=True).to(tl.float32))
++
++        for ip in tl.static_range(8):
++            is0 = 2 * ip
++            is1 = 2 * ip + 1
++            k0 = is0 // 8
++            shift = (ip % 4) * 2
++
++            s0 = tl.load(w_e_ptr + block_base + is0, mask=mask_n,
++                         other=0).to(tl.uint32)
++            s1 = tl.load(w_e_ptr + block_base + is1, mask=mask_n,
++                         other=0).to(tl.uint32)
++            scale0 = (s0 & 0xF).to(tl.float32)
++            min0 = (s0 >> 4).to(tl.float32)
++            scale1 = (s1 & 0xF).to(tl.float32)
++            min1 = (s1 >> 4).to(tl.float32)
++
++            qs_offs = 16 + k0 * 32 + i32
++            qs_window = tl.load(
++                w_e_ptr + block_base[:, None] + qs_offs[None, :],
++                mask=mask_n[:, None], other=0,
++            ).to(tl.uint32)
++            codes_f = ((qs_window >> shift) & 0x3).to(tl.float32)
++
++            scale_vec = tl.where(
++                is_half1[None, :], scale1[:, None], scale0[:, None])
++            min_vec = tl.where(
++                is_half1[None, :], min1[:, None], min0[:, None])
++            w_tile = d_fp32[:, None] * scale_vec * codes_f \
++                - dmin_fp32[:, None] * min_vec               # [BLOCK_N, 32]
++
++            k_glob = kb * 256 + ip * 32 + i32
++            a_tile = tl.load(
++                mid_ptr + offs_token[:, None] * stride_mm
++                + k_glob[None, :] * stride_mk,
++                mask=token_mask[:, None], other=0.0,
++            ).to(tl.float32)                                 # [BLOCK_M, 32]
++
++            acc += tl.dot(a_tile, tl.trans(w_tile), allow_tf32=True)
++
++    if ROUND_OUT:
++        # Loop parity: q2_k_mm rounds expert_out to bf16 before the fp32
++        # weight multiply + index_add combine.
++        acc = acc.to(tl.bfloat16).to(tl.float32)
++    if MUL_WEIGHT:
++        w = tl.load(topk_weights_ptr + offs_token, mask=token_mask,
++                    other=0.0).to(tl.float32)
++        acc = acc * w[:, None]
++
++    tl.atomic_add(
++        out_ptr + out_row[:, None] * stride_om + offs_n[None, :] * stride_on,
++        acc,
++        mask=token_mask[:, None] & mask_n[None, :],
++    )
++
++
++# ---------------------------------------------------------------------------
++# Python wrapper.
++# ---------------------------------------------------------------------------
++def fused_iq2_moe_forward(
++    x: torch.Tensor,
++    topk_weights: torch.Tensor,
++    topk_ids: torch.Tensor,
++    gate_w: torch.Tensor,
++    up_w: torch.Tensor,
++    down_w: torch.Tensor,
++    lut_grid: torch.Tensor,
++    lut_ksigns: torch.Tensor,
++    *,
++    global_num_experts: int,
++    expert_map: torch.Tensor | None = None,
++    swiglu_limit: float | None = None,
++    apply_router_weight_on_input: bool = False,
++    mid_fp32: bool = False,
++    loop_parity: bool = False,
++    block_m: int = 16,
++    block_n: int = 16,
++    num_warps: int = 2,
++) -> torch.Tensor:
++    """Fused routed-expert MoE forward for IQ2_XXS gate/up + Q2_K down.
++
++    Sync-free and shape-static: safe under CUDA-graph capture.
++
++    Args:
++        x: bf16 activations ``[T, hidden]``.
++        topk_weights: router weights ``[T, topk]`` (any float dtype).
++        topk_ids: GLOBAL expert ids ``[T, topk]`` (int; cast to int32).
++        gate_w / up_w: uint8 ``[E_local, N_inter, blocks * 66]`` IQ2_XXS.
++        down_w: uint8 ``[E_local, hidden, blocks * 84]`` Q2_K.
++        lut_grid / lut_ksigns: ``iq2_xxs_mm_triton._get_luts(device)``.
++        global_num_experts: total expert count (moe_align needs it).
++        expert_map: optional ``[global_num_experts]`` global->local map
++            (-1 for non-local experts; their blocks are skipped).
++        swiglu_limit: DSv4 clamp threshold (None/0 disables).
++        apply_router_weight_on_input: router weight already folded into x
++            (topk=1 fast path); skip the combine multiply.
++        mid_fp32: keep the kernel-boundary mid in fp32 (antirez
++            trajectory) instead of the default bf16.
++        loop_parity: reproduce the Python loop's bf16 gate/up/silu/
++            expert_out roundings exactly (A/B triage knob).
++
++    Returns:
++        bf16 ``[T, hidden]`` routed-expert output (partial under EP).
++    """
++    from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
++        moe_align_block_size)
++
++    num_tokens, hidden = x.shape
++    topk = topk_ids.shape[1]
++    device = x.device
++
++    e_local, n_inter, gate_rb = gate_w.shape
++    _, up_n, up_rb = up_w.shape
++    _, dn_n, dn_rb = down_w.shape
++    gate_k = (gate_rb // IQ2_XXS_BLOCK_BYTES) * QK_K
++    dn_k = (dn_rb // Q2_K_BLOCK_BYTES) * QK_K
++    if gate_k != hidden:
++        raise RuntimeError(
++            f"fused IQ2 gate K ({gate_k}) != hidden ({hidden})")
++    if up_n != n_inter or up_rb != gate_rb:
++        raise RuntimeError("fused IQ2 gate/up shape mismatch")
++    if dn_n != hidden:
++        raise RuntimeError(f"fused IQ2 down N ({dn_n}) != hidden ({hidden})")
++    if dn_k != n_inter:
++        raise RuntimeError(
++            f"fused IQ2 down K ({dn_k}) != intermediate ({n_inter})")
++    if expert_map is None and e_local != global_num_experts:
++        raise RuntimeError(
++            f"fused IQ2 expert_map is None but E_local ({e_local}) != "
++            f"global_num_experts ({global_num_experts})")
++
++    out = torch.zeros(
++        num_tokens, hidden, dtype=torch.float32, device=device)
++    if num_tokens == 0:
++        return out.to(torch.bfloat16)
++
++    x_bf16 = x if x.dtype == torch.bfloat16 else x.to(torch.bfloat16)
++    x_bf16 = x_bf16.contiguous()
++    topk_ids_i32 = (topk_ids if topk_ids.dtype == torch.int32 else
++                    topk_ids.to(torch.int32))
++    weights_flat = topk_weights.reshape(-1).to(torch.float32).contiguous()
++
++    sorted_token_ids, expert_ids, num_tokens_post_padded = \
++        moe_align_block_size(
++            topk_ids_i32, block_m, global_num_experts, expert_map)
++
++    mid = torch.empty(
++        num_tokens * topk, n_inter,
++        dtype=torch.float32 if mid_fp32 else torch.bfloat16, device=device)
++
++    em = sorted_token_ids.shape[0]           # shape-static (worst case)
++    num_m_blocks = triton.cdiv(em, block_m)
++    num_valid_tokens = topk_ids_i32.numel()
++
++    has_clamp = swiglu_limit is not None and float(swiglu_limit) > 0.0
++    swiglu_hi = float(swiglu_limit) if has_clamp else 0.0
++
++    _fused_iq2_gate_up_swiglu_kernel[(
++        num_m_blocks, triton.cdiv(n_inter, block_n))](
++        x_bf16,
++        gate_w,
++        up_w,
++        lut_grid,
++        lut_ksigns,
++        mid,
++        sorted_token_ids,
++        expert_ids,
++        num_tokens_post_padded,
++        num_valid_tokens,
++        n_inter,
++        x_bf16.stride(0), x_bf16.stride(1),
++        gate_w.stride(0), gate_w.stride(1),
++        mid.stride(0), mid.stride(1),
++        swiglu_hi,
++        BLOCKS_PER_ROW=gate_rb // IQ2_XXS_BLOCK_BYTES,
++        TOP_K=topk,
++        BLOCK_M=block_m,
++        BLOCK_N=block_n,
++        BLOCK_BYTES=IQ2_XXS_BLOCK_BYTES,
++        HAS_CLAMP=has_clamp,
++        ROUND_GATE_UP=loop_parity,
++        num_warps=num_warps,
++    )
++
++    _fused_q2_k_down_combine_kernel[(
++        num_m_blocks, triton.cdiv(hidden, block_n))](
++        mid,
++        down_w,
++        out,
++        weights_flat,
++        sorted_token_ids,
++        expert_ids,
++        num_tokens_post_padded,
++        num_valid_tokens,
++        hidden,
++        mid.stride(0), mid.stride(1),
++        down_w.stride(0), down_w.stride(1),
++        out.stride(0), out.stride(1),
++        BLOCKS_PER_ROW=dn_rb // Q2_K_BLOCK_BYTES,
++        TOP_K=topk,
++        BLOCK_M=block_m,
++        BLOCK_N=block_n,
++        BLOCK_BYTES=Q2_K_BLOCK_BYTES,
++        MUL_WEIGHT=not apply_router_weight_on_input,
++        ROUND_OUT=loop_parity,
++        num_warps=num_warps,
++    )
++
++    return out.to(torch.bfloat16)
++
++
++# ---------------------------------------------------------------------------
++# Validation: reference loop (mirrors mxfp4._iq2_forward numerics exactly,
++# via the proven standalone GEMMs) + self-test.
++# ---------------------------------------------------------------------------
++def _reference_loop(
++    x: torch.Tensor,
++    topk_weights: torch.Tensor,
++    topk_ids: torch.Tensor,
++    gate_w: torch.Tensor,
++    up_w: torch.Tensor,
++    down_w: torch.Tensor,
++    lut_grid: torch.Tensor,
++    lut_ksigns: torch.Tensor,
++    *,
++    expert_map: torch.Tensor | None,
++    swiglu_limit: float | None,
++    apply_router_weight_on_input: bool,
++) -> torch.Tensor:
++    """Per-expert loop with the Python loop's exact rounding sequence."""
++    from vllm.model_executor.layers.quantization.utils import (
++        iq2_xxs_mm_triton, q2_k_mm_triton)
++
++    num_tokens, hidden = x.shape
++    topk = topk_ids.shape[1]
++    device = x.device
++    e_local, n_inter, gate_rb = gate_w.shape
++    _, _, dn_rb = down_w.shape
++    gate_shape = (n_inter, (gate_rb // IQ2_XXS_BLOCK_BYTES) * QK_K)
++    down_shape = (hidden, (dn_rb // Q2_K_BLOCK_BYTES) * QK_K)
++
++    out = torch.zeros(num_tokens, hidden, dtype=torch.float32, device=device)
++    flat_global = topk_ids.reshape(-1).to(torch.long)
++    flat_local = expert_map[flat_global] if expert_map is not None \
++        else flat_global
++    valid = flat_local >= 0
++    if not bool(valid.any()):
++        return out.to(torch.bfloat16)
++    local_v = flat_local[valid]
++    slots_v = torch.nonzero(valid, as_tuple=False).flatten()
++    tok_v = slots_v // topk
++    w_v = topk_weights.reshape(-1).to(torch.float32)[slots_v]
++    order = local_v.argsort()
++    local_s, tok_s, w_s = local_v[order], tok_v[order], w_v[order]
++    x_slot = x.to(torch.bfloat16)[tok_s]
++
++    hi = float(swiglu_limit) if swiglu_limit else None
++    uniq, counts = torch.unique_consecutive(local_s, return_counts=True)
++    offs = [0] + counts.cumsum(0).tolist()
++    for i, eid in enumerate(uniq.tolist()):
++        s, e = offs[i], offs[i + 1]
++        x_e = x_slot[s:e]
++        g = iq2_xxs_mm_triton.iq2_xxs_mm(
++            x_e, gate_w[eid], gate_shape, lut_grid, lut_ksigns)
++        u = iq2_xxs_mm_triton.iq2_xxs_mm(
++            x_e, up_w[eid], gate_shape, lut_grid, lut_ksigns)
++        if hi is not None:
++            g = torch.clamp(g, max=hi)
++            u = torch.clamp(u, min=-hi, max=hi)
++        mid = torch.nn.functional.silu(g) * u
++        eo = q2_k_mm_triton.q2_k_mm(mid, down_w[eid], down_shape)
++        if apply_router_weight_on_input:
++            contrib = eo.to(torch.float32)
++        else:
++            contrib = eo.to(torch.float32) * w_s[s:e].unsqueeze(-1)
++        out.index_add_(0, tok_s[s:e], contrib)
++    return out.to(torch.bfloat16)
++
++
++def _self_test() -> None:  # pragma: no cover - manual/GPU-only
++    import numpy as np
++
++    from vllm.model_executor.layers.quantization.utils import (
++        iq2_xxs_mm_triton, q2_k_mm_triton)
++
++    assert torch.cuda.is_available(), "self-test needs a GPU"
++    device = torch.device("cuda")
++    torch.manual_seed(7)
++
++    E, HID, INTER, TOPK = 16, 1024, 512, 6
++    gate_np = np.stack([
++        iq2_xxs_mm_triton._make_random_iq2xxs_weights(INTER, HID, seed=10 + e)
++        for e in range(E)])
++    up_np = np.stack([
++        iq2_xxs_mm_triton._make_random_iq2xxs_weights(INTER, HID, seed=50 + e)
++        for e in range(E)])
++    down_np = np.stack([
++        q2_k_mm_triton._make_random_q2_k_weights(HID, INTER, seed=90 + e)
++        for e in range(E)])
++    gate_w = torch.from_numpy(gate_np).to(device)
++    up_w = torch.from_numpy(up_np).to(device)
++    down_w = torch.from_numpy(down_np).to(device)
++    grid_t, ksigns_t = iq2_xxs_mm_triton._get_luts(device)
++
++    def rel_l2(a: torch.Tensor, b: torch.Tensor) -> float:
++        a, b = a.float(), b.float()
++        d = float(torch.linalg.vector_norm(a - b))
++        n = float(torch.linalg.vector_norm(a))
++        return d / n if n > 0 else 0.0
++
++    print(f"fused IQ2 MoE self-test: E={E} hid={HID} inter={INTER} "
++          f"topk={TOPK}")
++    half_map = torch.full((E,), -1, dtype=torch.int32, device=device)
++    half_map[: E // 2] = torch.arange(E // 2, dtype=torch.int32,
++                                      device=device)
++    for m in (1, 7, 16, 64, 333):
++        x = (torch.randn(m, HID, device=device) * 0.3).to(torch.bfloat16)
++        logits = torch.randn(m, E, device=device)
++        tw, ti = torch.topk(torch.softmax(logits, -1), TOPK, dim=-1)
++        tw = (tw / tw.sum(-1, keepdim=True)).to(torch.float32)
++        ti = ti.to(torch.int32)
++
++        for name, emap, e_loc in (("full", None, E),
++                                  ("ep-half", half_map, E // 2)):
++            gw, uw, dw = gate_w[:e_loc], up_w[:e_loc], down_w[:e_loc]
++            ref = _reference_loop(
++                x, tw, ti, gw, uw, dw, grid_t, ksigns_t,
++                expert_map=emap, swiglu_limit=10.0,
++                apply_router_weight_on_input=False)
++            got_exact = fused_iq2_moe_forward(
++                x, tw, ti, gw, uw, dw, grid_t, ksigns_t,
++                global_num_experts=E, expert_map=emap, swiglu_limit=10.0,
++                loop_parity=True)
++            got_dflt = fused_iq2_moe_forward(
++                x, tw, ti, gw, uw, dw, grid_t, ksigns_t,
++                global_num_experts=E, expert_map=emap, swiglu_limit=10.0)
++            r_exact = rel_l2(ref, got_exact)
++            r_dflt = rel_l2(ref, got_dflt)
++            print(f"  M={m:4d} {name:8s} rel_l2 loop-parity={r_exact:.3e} "
++                  f"default={r_dflt:.3e}")
++            assert r_exact < 1e-3, (m, name, r_exact)
++            assert r_dflt < 2e-2, (m, name, r_dflt)
++
++    # apply_router_weight_on_input contract.
++    m = 9
++    x = (torch.randn(m, HID, device=device) * 0.3).to(torch.bfloat16)
++    tw = torch.ones(m, 1, dtype=torch.float32, device=device)
++    ti = torch.randint(0, E, (m, 1), dtype=torch.int32, device=device)
++    ref = _reference_loop(
++        x, tw, ti, gate_w, up_w, down_w, grid_t, ksigns_t,
++        expert_map=None, swiglu_limit=10.0,
++        apply_router_weight_on_input=True)
++    got = fused_iq2_moe_forward(
++        x, tw, ti, gate_w, up_w, down_w, grid_t, ksigns_t,
++        global_num_experts=E, swiglu_limit=10.0,
++        apply_router_weight_on_input=True, loop_parity=True)
++    r = rel_l2(ref, got)
++    print(f"  router-weight-on-input rel_l2={r:.3e}")
++    assert r < 2e-3, r
++
++    # CUDA-graph capture + replay (the no-ENFORCE_EAGER proof).
++    m = 8
++    x_st = (torch.randn(m, HID, device=device) * 0.3).to(torch.bfloat16)
++    tw_st = torch.rand(m, TOPK, dtype=torch.float32, device=device)
++    ti_st = torch.randint(0, E, (m, TOPK), dtype=torch.int32, device=device)
++    stream = torch.cuda.Stream()
++    with torch.cuda.stream(stream):
++        for _ in range(3):  # warmup / JIT
++            _ = fused_iq2_moe_forward(
++                x_st, tw_st, ti_st, gate_w, up_w, down_w, grid_t, ksigns_t,
++                global_num_experts=E, swiglu_limit=10.0)
++    torch.cuda.current_stream().wait_stream(stream)
++    eager = fused_iq2_moe_forward(
++        x_st, tw_st, ti_st, gate_w, up_w, down_w, grid_t, ksigns_t,
++        global_num_experts=E, swiglu_limit=10.0)
++    g = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(g):
++        captured = fused_iq2_moe_forward(
++            x_st, tw_st, ti_st, gate_w, up_w, down_w, grid_t, ksigns_t,
++            global_num_experts=E, swiglu_limit=10.0)
++    g.replay()
++    torch.cuda.synchronize()
++    r = rel_l2(eager, captured)
++    print(f"  cudagraph capture+replay rel_l2 vs eager={r:.3e}")
++    assert r < 1e-6, r
++
++    # Perf probe: fused vs loop.
++    import time
++    m = 64
++    x = (torch.randn(m, HID, device=device) * 0.3).to(torch.bfloat16)
++    tw, ti = torch.topk(
++        torch.softmax(torch.randn(m, E, device=device), -1), TOPK, dim=-1)
++    tw, ti = tw.to(torch.float32), ti.to(torch.int32)
++    for fn, name in ((lambda: fused_iq2_moe_forward(
++            x, tw, ti, gate_w, up_w, down_w, grid_t, ksigns_t,
++            global_num_experts=E, swiglu_limit=10.0), "fused"),
++            (lambda: _reference_loop(
++                x, tw, ti, gate_w, up_w, down_w, grid_t, ksigns_t,
++                expert_map=None, swiglu_limit=10.0,
++                apply_router_weight_on_input=False), "loop")):
++        for _ in range(3):
++            fn()
++        torch.cuda.synchronize()
++        t0 = time.perf_counter()
++        for _ in range(20):
++            fn()
++        torch.cuda.synchronize()
++        dt_ms = (time.perf_counter() - t0) / 20 * 1e3
++        print(f"  perf M={m}: {name} {dt_ms:.2f} ms/fwd")
++
++    print("fused IQ2 MoE self-test: ALL PASS")
++
++
++if __name__ == "__main__":  # pragma: no cover
++    _self_test()

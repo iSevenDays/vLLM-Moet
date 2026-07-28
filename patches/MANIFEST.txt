@@ -21,6 +21,7 @@ vllm-vllm-model_executor-layers-quantization-fp8.py.patch
 vllm-vllm-model_executor-layers-quantization-modelopt.py.patch
 vllm-vllm-model_executor-layers-quantization-mxfp4.py.patch
 vllm-vllm-model_executor-layers-quantization-utils-fp8_utils.py.patch
+vllm-vllm-model_executor-layers-quantization-utils-fused_iq2_moe_triton.py.patch
 vllm-vllm-model_executor-layers-quantization-utils-iq2_xxs_mm_triton.py.patch
 vllm-vllm-model_executor-layers-quantization-utils-iq2_xxs_ref.py.patch
 vllm-vllm-model_executor-layers-quantization-utils-iq2_xxs_triton.py.patch
