@@ -1,9 +1,9 @@
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
-index 0000000..da2d001 100644
+index 0000000..327a047 100644
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
-@@ -0,0 +1,3546 @@
+@@ -0,0 +1,3634 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Routed experts on 2-bit tensor-sym planes (cubit moe_w2) for the
@@ -2299,6 +2299,12 @@ index 0000000..da2d001 100644
 +                            dtype=torch.float32, device=dev),
 +            c2=torch.zeros(slots + 4, hidden, dtype=torch.bfloat16,
 +                           device=dev),
++            # Inverse of moe_align's slot -> flattened-route permutation.
++            # One int32 per padded slot is enough because sorted_ids contains
++            # at least T*top_k entries.  The fused deterministic unpermute
++            # writes only valid route coordinates and checks route_ids before
++            # reading the inverse, so sentinel routes need no initialization.
++            route_slot=torch.empty(slots, dtype=torch.int32, device=dev),
 +            desc=torch.empty(4, slots // _BLOCK, 6, dtype=torch.int64,
 +                             device=dev),
 +            # split-FP4 (moe_w4q_mm) desc tables: 8 u64 per pair, 64 B ABI
@@ -2325,6 +2331,101 @@ index 0000000..da2d001 100644
 +
 +import triton
 +import triton.language as tl
++
++
++@triton.jit
++def _route_slot_invert_kernel(
++    sorted_ids_ptr,
++    route_slot_ptr,
++    n_slots,
++    n_routes,
++    BLOCK: tl.constexpr,
++):
++    """Invert moe_align's collision-free valid slot -> route permutation."""
++    slot = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    in_bounds = slot < n_slots
++    route = tl.load(sorted_ids_ptr + slot, mask=in_bounds, other=n_routes)
++    valid = in_bounds & (route >= 0) & (route < n_routes)
++    # Every valid flattened route occurs at most once in sorted_ids.  Stores
++    # therefore have no collisions and need no atomics (deterministic).
++    tl.store(route_slot_ptr + route, slot, mask=valid)
++
++
++@triton.jit
++def _deterministic_unpermute_kernel(
++    c2_ptr,
++    route_slot_ptr,
++    route_ids_ptr,
++    weights_ptr,
++    miss_rows_ptr,
++    out_ptr,
++    hidden,
++    n_slots,
++    n_experts,
++    TOP_K: tl.constexpr,
++    HAS_MISS_ROWS: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++):
++    """Fixed-order weighted route reduction without FP32 route tensors."""
++    token = tl.program_id(0)
++    cols = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
++    col_mask = cols < hidden
++    acc = tl.zeros((BLOCK_H,), dtype=tl.float32)
++    for j in tl.static_range(0, TOP_K):
++        route = token * TOP_K + j
++        expert = tl.load(route_ids_ptr + route)
++        valid_route = (expert >= 0) & (expert < n_experts)
++        slot = tl.load(route_slot_ptr + route,
++                       mask=valid_route, other=0).to(tl.int32)
++        valid_slot = valid_route & (slot >= 0) & (slot < n_slots)
++        value = tl.load(c2_ptr + slot * hidden + cols,
++                        mask=valid_slot & col_mask,
++                        other=0.0).to(tl.float32)
++        if HAS_MISS_ROWS:
++            resident = tl.load(miss_rows_ptr + slot,
++                               mask=valid_slot, other=0).to(tl.int1)
++            # Select before multiplication so stale NaN/Inf workspace rows
++            # belonging to cache misses cannot poison a zero contribution.
++            value = tl.where(resident, value, 0.0)
++        weight = tl.load(weights_ptr + route,
++                         mask=valid_route, other=0.0).to(tl.float32)
++        acc += value * weight
++    tl.store(out_ptr + token * hidden + cols, acc, mask=col_mask)
++
++
++def _deterministic_unpermute(
++    c2: torch.Tensor,
++    sorted_ids: torch.Tensor,
++    route_ids: torch.Tensor,
++    topk_weights: torch.Tensor,
++    miss_rows: torch.Tensor | None,
++    route_slot: torch.Tensor,
++    out: torch.Tensor,
++    n_experts: int,
++) -> torch.Tensor:
++    """Deterministically undo moe_align using bounded persistent scratch.
++
++    The prior torch implementation allocated the FP32 slot conversion/product
++    plus an FP32 [T*top_k, H] gather.  At the 1,044-token failing shape,
++    top_k=6, H=4,096, and E=256 padding, that peaks near 414 MiB per rank.
++    This path uses a 4-byte inverse per route and accumulates each
++    [token, hidden-tile] result in registers.
++    """
++    tokens, top_k = topk_weights.shape
++    n_slots = sorted_ids.numel()
++    hidden = c2.shape[1]
++    _route_slot_invert_kernel[(triton.cdiv(n_slots, 256),)](
++        sorted_ids, route_slot, n_slots, tokens * top_k, BLOCK=256)
++    miss_ptr = miss_rows if miss_rows is not None else c2
++    _deterministic_unpermute_kernel[
++        (tokens, triton.cdiv(hidden, 256))
++    ](
++        c2, route_slot, route_ids, topk_weights, miss_ptr, out,
++        hidden, n_slots, n_experts,
++        TOP_K=top_k, HAS_MISS_ROWS=miss_rows is not None, BLOCK_H=256,
++        num_warps=4,
++    )
++    return out
 +
 +
 +@triton.jit
@@ -3500,31 +3601,18 @@ index 0000000..da2d001 100644
 +        else:
 +            _launch("w4", st["K2"], d[3], st["N2"], pairs * 4, stream)
 +
-+    # ---- weighted unpermute (pad slots masked out), DETERMINISTIC.
-+    # The old `out.index_add_(0, rows, c2*w)` scattered with atomics, so the
-+    # f32 accumulation ORDER varied run-to-run: identical inputs wobbled by
-+    # up to ~1.6e-2 abs on prefill, and single-token probes produced a small
-+    # set of bit-distinct logit variants — the root cause of the "greedy
-+    # decode is not reproducible" investigation (PP_DETERMINISM.md; it was
-+    # never PP-specific). Deterministic scheme: every VALID slot owns a
-+    # unique (token, j) coordinate (valid sorted_ids are a permutation of
-+    # token*top_k + j), so index_copy_ into [T*top_k (+1 dump row), H] has no
-+    # write collisions except filler slots, which all target the discarded
-+    # dump row. The final sum(dim=1) reduces top_k in a fixed order.
-+    # Static shapes + no host branches -> cudagraph-capture-safe.
-+    w = topk_weights.reshape(-1)[sorted_ids.clamp(max=T * top_k - 1)]
-+    w = torch.where(valid, w, torch.zeros_like(w)).to(torch.float32)
-+    if miss_rows is not None:
-+        # base cache: rows of non-resident pairs hold stale workspace values
-+        # (their GEMMs early-EXITed) — zero their scatter weight so a miss
-+        # contributes exactly nothing (the replay recomputes them properly).
-+        w = w * miss_rows.to(torch.float32)
-+    dump = T * top_k                       # collision row for filler slots
-+    dst = torch.where(valid, sorted_ids,
-+                      torch.full_like(sorted_ids, dump)).long()
-+    gath = torch.zeros(dump + 1, H, dtype=torch.float32, device=dev)
-+    gath.index_copy_(0, dst, ws["c2"][:slots].float() * w.unsqueeze(1))
-+    return gath[:dump].view(T, top_k, H).sum(dim=1).to(x.dtype)
++    # ---- weighted unpermute (pad/sentinel/miss rows masked), DETERMINISTIC.
++    # Atomic index_add was nondeterministic; the first deterministic torch
++    # replacement materialized ~414 MiB of FP32 route intermediates at the
++    # 1,044-token prefill shape and OOMed a 100K request.  Invert moe_align's
++    # collision-free valid permutation into persistent int32 scratch, then
++    # have one Triton program accumulate each output tile in fixed route-j
++    # order.  This preserves deterministic, graph-safe behavior while the
++    # only per-call allocation is the returned BF16 [T,H] tensor.
++    out = torch.empty_like(x)
++    return _deterministic_unpermute(
++        ws["c2"][:slots], sorted_ids, route_ids, topk_weights, miss_rows,
++        ws["route_slot"], out, st["E"])
 +
 +
 +def _moe_w2_forward_fake(
