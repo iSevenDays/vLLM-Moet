@@ -6,6 +6,7 @@ it describes.
 
 | file | what it is |
 |------|------------|
+| [`BRIEFING.md`](BRIEFING.md) | **Raw-data-first briefing for an external analyst.** All 60 measurements, every retracted conclusion, and the open questions. Hand this over when asking someone else to reason about the problem. |
 | [`STATUS.md`](STATUS.md) | **Authoritative status, measurements, decisions, NEXT queue.** Start here. |
 | [`HANDOFF.md`](HANDOFF.md) | Raw state + primary sources for a fresh agent. Read after STATUS. |
 | [`runlogs/`](runlogs/) | Raw artifacts backing every claim in STATUS. |
