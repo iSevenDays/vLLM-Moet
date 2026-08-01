@@ -910,6 +910,52 @@ def _mxfp4_fp8_unit_bytes(nib, ck_scale_bytes, serving_scale_bytes):
 # that intermittently OOM'd the box when boots overlapped.
 _n_created = 0
 _skip_logged = False
+_pack_io_skip_logged = False
+_pack_io_skip_installed = False
+_pack_io_skip_layers: set[int] = set()
+_PACK_EXPERT_WEIGHT_RE = re.compile(
+    r"(?:^|\.)layers\.(\d+)\.ffn\.experts\.\d+\."
+    r"w[123]\.(?:weight|scale)$"
+)
+
+
+def _pack_io_should_skip(weight_name: str) -> bool:
+    """True only for raw routed-expert tensors whose transformer layer is
+    already validated in the persistent pack/planes cache."""
+    match = _PACK_EXPERT_WEIGHT_RE.search(weight_name)
+    return (match is not None
+            and int(match.group(1)) in _pack_io_skip_layers)
+
+
+def _install_pack_io_skip(layer_idx: int) -> None:
+    """Teach the ordinary safetensors iterator to reject a cached layer's
+    expert payloads before ``safe_open.get_tensor`` reads them.
+
+    ``plan_pack_skip`` calls this only after the identity- and geometry-keyed
+    pack/planes probe succeeds.  The wrapper preserves vLLM's EP filtering and
+    changes no non-expert, shared-expert, MTP, or uncached-layer name.
+    """
+    global _pack_io_skip_installed, _pack_io_skip_logged
+    _pack_io_skip_layers.add(int(layer_idx))
+    if _pack_io_skip_installed:
+        return
+    from vllm.model_executor.model_loader import weight_utils as _weight_utils
+
+    original = _weight_utils.should_skip_weight
+
+    @functools.wraps(original)
+    def cached_or_original(weight_name, local_expert_ids):
+        if _pack_io_should_skip(weight_name):
+            return True
+        return original(weight_name, local_expert_ids)
+
+    _weight_utils.should_skip_weight = cached_or_original
+    _pack_io_skip_installed = True
+    if not _pack_io_skip_logged:
+        _pack_io_skip_logged = True
+        logger.info(
+            "moe_w2 PACK I/O-SKIP installed: identity-validated routed "
+            "expert tensors are filtered before safetensors get_tensor")
 
 
 def _noop_loader(*args, **kwargs):
@@ -935,6 +981,10 @@ def plan_pack_skip(layer) -> bool:
     global _n_created
     key = _n_created
     _n_created += 1
+    if key == 0:
+        # A process normally constructs one target model, but clearing here
+        # keeps an in-process rebuild/reload from inheriting stale layer IDs.
+        _pack_io_skip_layers.clear()
     layer._moe_w2_create_key = key
     if not enabled():
         return False
@@ -990,6 +1040,14 @@ def plan_pack_skip(layer) -> bool:
         p.weight_loader = _noop_loader
     layer._moe_w2_shapes = (E, N13, K13, N2, K2)
     layer._moe_w2_pack_skip = True
+    lidx = _pc.layer_idx_from_name(getattr(layer, "layer_name", ""))
+    if lidx is not None:
+        _install_pack_io_skip(lidx)
+    else:
+        logger.warning(
+            "moe_w2: pack layer key %d has no transformer layer index; "
+            "parameter staging is skipped but checkpoint I/O cannot be "
+            "filtered safely", key)
     global _skip_logged
     if not _skip_logged:
         _skip_logged = True
