@@ -882,6 +882,61 @@ the needle's leading component survives and the TAIL is lost
 `ZEPHYR-ORYX-CYPRESS` → `ZEPHYR-ORYX-CORYX`). Whatever the mechanism, it
 truncates verbatim copy length rather than failing to locate the needle.
 
+### 5.17 DECISIVE: the digits ARE retrievable — the failure is DECODE-side
+
+Ask the same prompt a different way and the whole diagnosis changes. Production
+config (`index_topk=512`, chunk 1056), pt 9687, the exact prompt where the normal
+question returns `PELICAN-1234`:
+
+| question (`tools/needle_digits_probe.py --variant`) | digits at answer position | result |
+|-----------------------------------------------------|--------------------------:|:------:|
+| `ask` — "reply with only the code"                   | 5-6 | FAIL `PELICAN-1234` |
+| `firstword` — "only the word at the start"           | -   | PASS `pelican` |
+| **`digitsonly`** — "only the four digits at the end" | **0-1** | **PASS `1605`** |
+| `yesno` / `yesno_neg` (1 token)                      | -   | PASS `yes` / `no` |
+
+**The digits are fully retrievable at 8K on the stock config.** Nothing is
+missing from attention, nothing is unselected, no value is destroyed. Asked for
+first, they come back exact. The failure is entirely in SUSTAINING a multi-token
+verbatim copy, i.e. it is DECODE-side, not prefill/attention-side.
+
+This retires the framing of §§5.10-5.16. Those sections' *measurements* stand
+(and their eliminations remain valid), but their shared premise — that the
+digit information was unavailable — is now falsified. The `index_topk=2048`
+result (§5.15) is real and reproducible, but it must be reinterpreted: raising
+selection width evidently makes the decode-side copy survive longer, rather than
+"restoring" information that was missing.
+
+**Where it breaks, precisely.** From the top-20 logprobs:
+
+| context | answer positions 0-4 | position 5 |
+|--------:|----------------------|------------|
+| pt 3909 (PASS) | all p≈1.000 | `538` at lp **-0.000** |
+| pt 9686 (FAIL) | all p≈1.000 | `123` at lp **-0.765**, true token absent from top-20 |
+
+So failure needs BOTH a late answer position AND long context — at 4K position 5
+is perfect; at 9.7K position 0-1 is perfect. An interaction, not a pure
+positional artifact.
+
+**Leading hypothesis: DSpark speculative decoding.** `num_speculative_tokens: 5`
+and the collapse lands at output token index 5 — the block boundary. Draft
+quality degrades with context, which supplies the length half of the
+interaction. Crucially, with CORRECT rejection sampling a bad draft is rejected
+and the target model's own token is emitted, so output should be bitwise
+indistinguishable from non-speculative decoding. **Observable degradation
+therefore implicates the verification/acceptance path itself**, not merely poor
+drafts. This build also carries substantial custom DSpark work (negative padding
+IDs, sentinel filtering, `dspark_scheduler: false`, `dspark_noise_token_id`
+128799).
+
+Decisive next test (one boot): relaunch with `SPECULATIVE_CONFIG` omitted
+entirely and re-run `--variant ask` at 8192. If the digits return, DSpark's
+acceptance path is the root cause and everything from §5.10 onward was chasing
+its shadow. Cheap pre-checks that need no boot: `--variant digitsonly` at 12K/16K/
+32K (does position-0 recall survive where `ask` fails?), and an answer-position
+sweep to find whether the breakpoint tracks `num_speculative_tokens` if that
+value is changed.
+
 ## 6. KV capacity: runtime fits three full contexts; printed metrics were wrong
 
 - Startup reported 912,691 tokens/3.482x; `/metrics` reported

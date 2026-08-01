@@ -80,7 +80,8 @@ CODE_WORDS = [
 ]
 QUESTION = "What is the project access code? Reply with only the code."
 DIGIT_WORDS = "zero one two three four five six seven eight nine".split()
-VARIANTS = ("ask", "yesno", "yesno_neg", "spell", "words", "repeat", "verbose")
+VARIANTS = ("ask", "yesno", "yesno_neg", "spell", "words", "repeat", "verbose",
+            "digitsonly", "firstword")
 
 
 def needle_code(L, run=0):
@@ -130,6 +131,20 @@ def build_spec(variant, L, run):
         spoken = " ".join(DIGIT_WORDS[int(d)] for d in digits)
         return ([f"IMPORTANT NOTE: The project access code is {c}, that is "
                  f"{word} dash {spoken}. Remember this."], None, QUESTION, c, c)
+    # The two position-isolating variants. Every observed failure loses the TAIL
+    # of the copied span (GLACIER-7741-ORYX -> GLACIER-7741 -> GLACIER;
+    # PELICAN-1605 -> PELICAN), while a 1-token answer (yesno/yesno_neg) is
+    # correct. If the loss is about POSITION IN THE ANSWER rather than the
+    # information being unavailable, then asking for the digits FIRST should
+    # recover them, and asking for only the word should always succeed.
+    if variant == "digitsonly":
+        return ([line], None,
+                "What are the four digits at the end of the project access "
+                "code? Reply with only those four digits.", digits, digits)
+    if variant == "firstword":
+        return ([line], None,
+                "What is the word at the start of the project access code? "
+                "Reply with only that word.", word, word)
     raise SystemExit(f"unknown variant: {variant}")
 
 
