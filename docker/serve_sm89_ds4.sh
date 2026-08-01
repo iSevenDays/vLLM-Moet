@@ -141,6 +141,8 @@ else
 fi
 MODEL=${MODEL:-/root/models/DeepSeek-V4-Flash}   # checkpoint dir (read-only)
 CACHE=${CACHE:-/root/models/moet-cache}          # quant caches; ~90 GB free
+JIT_CACHE=${JIT_CACHE:-$CACHE/jit}               # compiler cache may be shared
+                                                  # across weight-cache namespaces
 NETWORK=${NETWORK:-host}     # this host serves directly; use 'none' to isolate quantization
 RESTART=${RESTART:-no}       # production: unless-stopped (survives crashes/reboots)
 MAXLEN=${MAXLEN:-262144}     # maximum context length; lower for the first boot test
@@ -156,6 +158,9 @@ CUDAGRAPH_SIZES=${CUDAGRAPH_SIZES:-1,2,4,8}  # cudagraph_capture_sizes, comma-se
 BREAKABLE_CUDAGRAPH=${BREAKABLE_CUDAGRAPH:-auto}  # auto = leave vLLM default; 0 = keep
                              # torch.compile/Inductor enabled instead of auto breakable graphs.
 MTP_TOKENS=${MTP_TOKENS:-1}  # speculative tokens; keep 1 (see header section 4)
+SPECULATIVE_CONFIG=${SPECULATIVE_CONFIG:-}  # compact JSON override for embedded
+                             # speculative heads (for example 0731 DSpark).
+                             # Empty preserves the MTP_TOKENS behavior above.
 PREFIX_CACHING=${PREFIX_CACHING:-1}  # reuse repeated prompt KV; read header section 4
 SCALE_REFIT=${SCALE_REFIT:-1}  # normal W2 conversion; 0 is for comparison or rollback
 FP8_DELTA_GB=${FP8_DELTA_GB:-0}  # FP8-e4m3 delta PREFILL tier (Ada native FP8 MMA).
@@ -211,7 +216,7 @@ IMG=${IMG:-vllm-moet-sm89:v0251}  # canonical living tag (vLLM 0.25.1 lineage),
                              # 2026-07-24: +27% short decode, +66% c4 aggregate). Pre-native
                              # rollback image: IMG=vllm-moet-sm89:v0251-pre-native.
 
-mkdir -p "$CACHE/$PLANES_SUBDIR" "$CACHE/jit" "$STORE"
+mkdir -p "$CACHE/$PLANES_SUBDIR" "$JIT_CACHE" "$STORE"
 docker rm -f "$NAME" 2>/dev/null || true
 # TP>1 needs host IPC + big /dev/shm for inter-worker tensors; TP1 must NOT
 # pay that (see TECHNICAL NOTES: the ~26 GiB shm helped sink a TP2 first run).
@@ -229,10 +234,12 @@ else
   TPARGS=""
   IPCARGS="--shm-size 8g"
 fi
-if [ "$MTP_TOKENS" -gt 0 ]; then
-  MTPARGS="--speculative-config {\"method\":\"deepseek_mtp\",\"num_speculative_tokens\":$MTP_TOKENS}"
+if [ -n "$SPECULATIVE_CONFIG" ]; then
+  SPECARGS=(--speculative-config "$SPECULATIVE_CONFIG")
+elif [ "$MTP_TOKENS" -gt 0 ]; then
+  SPECARGS=(--speculative-config "{\"method\":\"deepseek_mtp\",\"num_speculative_tokens\":$MTP_TOKENS}")
 else
-  MTPARGS=""
+  SPECARGS=()
 fi
 if [ "$PREFIX_CACHING" = 1 ]; then
   PREFIXARGS=""
@@ -280,7 +287,7 @@ docker run -d --name "$NAME" --restart "$RESTART" --gpus "$GPUS" --network "$NET
   -v "$MODEL":/model:ro \
   -v /root/models/DeepSeek-V4-Flash-IQ2:/root/models/DeepSeek-V4-Flash-IQ2:ro \
   -v "$CACHE/$PLANES_SUBDIR":/plane-cache \
-  -v "$CACHE/jit":/root/.cache \
+  -v "$JIT_CACHE":/root/.cache \
   $RESVOL \
   -e VLLM_MOE_W2=1 \
   $DELTA_ENV \
@@ -303,12 +310,12 @@ docker run -d --name "$NAME" --restart "$RESTART" --gpus "$GPUS" --network "$NET
   --tool-call-parser deepseek_v4 \
   --enable-auto-tool-choice \
   --reasoning-parser deepseek_v4 \
-  $TPARGS $PREFIXARGS $MTPARGS \
+  $TPARGS $PREFIXARGS "${SPECARGS[@]}" \
   --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"],"cudagraph_capture_sizes":['"$CUDAGRAPH_SIZES"']}' \
   ${ENFORCE_EAGER:+--enforce-eager} \
   --port "$PORT"
 BUILD=$(docker exec "$NAME" cat /opt/moet-checks/SOURCE.txt 2>/dev/null | grep -v '^#' | head -1 || true)
-echo "started $NAME (sm_89, gpus=${GPUS} tp=${TP} residency=${RESIDENCY}, memcap=${MEM_GB}g, ready-timeout=${READY_TIMEOUT_S}s, port ${PORT}, network=$NETWORK, restart=$RESTART, max-model-len=$MAXLEN, util=$UTIL, batched=$BATCHED_TOKENS, seqs=$NUM_SEQS, mtp=$MTP_TOKENS, prefix-cache=$PREFIX_CACHING, scale-refit=$SCALE_REFIT, sm89-native=${SM89_NATIVE:-default-on}, graphs=[$CUDAGRAPH_SIZES], breakable-cudagraph=$BREAKABLE_CUDAGRAPH, quality-prefill=$QUALITY_PREFILL)"
+echo "started $NAME (sm_89, gpus=${GPUS} tp=${TP} residency=${RESIDENCY}, memcap=${MEM_GB}g, ready-timeout=${READY_TIMEOUT_S}s, port ${PORT}, network=$NETWORK, restart=$RESTART, max-model-len=$MAXLEN, util=$UTIL, batched=$BATCHED_TOKENS, seqs=$NUM_SEQS, speculative=${SPECULATIVE_CONFIG:-mtp:$MTP_TOKENS}, prefix-cache=$PREFIX_CACHING, scale-refit=$SCALE_REFIT, sm89-native=${SM89_NATIVE:-default-on}, graphs=[$CUDAGRAPH_SIZES], breakable-cudagraph=$BREAKABLE_CUDAGRAPH, quality-prefill=$QUALITY_PREFILL)"
 if [ "$RESIDENCY" = gpu ]; then
   echo "  residency=gpu: 2-bit base GPU-RESIDENT (BASE_CACHE_GB=0), sharded across ${TP} rank(s); no host pack/arena. FORCE_RESIDENT=${FORCE_RESIDENT} (1 = bypass the boot-guard VRAM-budget refusal on >=48 GiB cards). Watch for: 'moe_w2 planes: ... GPU-RESIDENT' and ~37 GiB/card VRAM."
 else
