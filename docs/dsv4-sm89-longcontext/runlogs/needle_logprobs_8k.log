@@ -1,0 +1,7 @@
+filler blob = 246,944 bytes from 6 files
+L=  4096 d=0.5 ask    pt=3909   PASS word=True  digits=True  (39s) true=ZEPHYR-5384 ans='ZEPHYR-5384'
+L=  8192 d=0.5 ask    pt=9686   FAIL word=True  digits=False (100s) true=PELICAN-1605 ans='PELICAN-1234'
+L=  8192 d=0.5 ask    pt=9686   FAIL word=True  digits=False (98s) true=PELICAN-1605 ans='PELICAN-1234'
+L=  8192 d=0.5 yesno  pt=9691   FAIL word=False digits=False (98s) true=PELICAN-1605 ans='yes'
+L=  8192 d=0.5 spell  pt=9684   FAIL word=False digits=False (99s) true=PELICAN-1605 ans='P E L I C A N  \nP E L I C A N  \nP E L I C A N '
+wrote /root/ktransformers/runlogs/needle_logprobs_8k_20260801T112338Z.json

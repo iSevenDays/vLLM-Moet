@@ -1,0 +1,5 @@
+filler blob = 246,944 bytes from 6 files
+L=  8192 d=0.98 ask    pt=9686   FAIL word=True  digits=False (98s) true=PELICAN-1605 ans='PELICAN'
+L=  8192 d=0.02 ask    pt=9686   PASS word=True  digits=True  (96s) true=PELICAN-1605 ans='PELICAN-1605'
+L=  8192 d=0.5 yesno_neg pt=9691   FAIL word=False digits=False (99s) true=PELICAN-1605 ans='no\n\nThe project access code is P'
+wrote /root/ktransformers/runlogs/needle_logprobs_ctrl_20260801T113740Z.json

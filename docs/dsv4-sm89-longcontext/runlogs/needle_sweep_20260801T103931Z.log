@@ -1,0 +1,19 @@
+[needle_sweep] calibration: 12014 bytes -> 3141 tok => 3.8249 bytes/tok (37.3s)
+[needle_sweep] L=  2048 run 0: pt=2019 PASS maxp=1.0 deg=False (20s) head='LANTERN-7356'
+[needle_sweep] L= 16384 run 0: pt=19713 FAIL maxp=0.8808 deg=True (196s) head='PELICAN'
+[needle_sweep] L= 32768 run 0: pt=38222 FAIL maxp=0.7782 deg=True (401s) head='CYPHER'
+[needle_sweep] L= 49152 run 0: pt=59166 FAIL maxp=0.6538 deg=True (621s) head='LANTERN-9-9-9-9-9-9-9-9-9-9-9'
+
+=== needle_sweep (mid-context retrieval, chat-only) ===
+ length      pt correct   maxp  deg  wall_s  answer_head
+------------------------------------------------------------------------
+   2048    2019      OK  1.000    -   20.34  'LANTERN-7356'
+  16384   19713    FAIL  0.881    Y  196.38  'PELICAN'
+  32768   38222    FAIL  0.778    Y   400.9  'CYPHER'
+  49152   59166    FAIL  0.654    Y  621.02  'LANTERN-9-9-9-9-9-9-9-9-9-9-9'
+
+onset L* (first FAIL): 16384
+endpoint=/v1/chat/completions top_logprobs=20 max_tokens=24 depth=0.5 thinking=false
+filler_source: ['CONCEPTS.md', 'docs/ada-sm89-port.md', 'kernels/MANIFEST.md', 'AGENTS.md', 'overlay/vllm/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py', '/root/autostart/CLAUDE.md']
+
+wrote /root/ktransformers/runlogs/needle_sweep_20260801T103931Z.json

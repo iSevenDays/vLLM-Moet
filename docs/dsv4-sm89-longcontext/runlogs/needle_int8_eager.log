@@ -1,0 +1,8 @@
+filler blob = 246,944 bytes from 6 files
+L=  3072 d=0.5 ask    pt=2864   PASS word=True  digits=True  (53s) true=TUNDRA-3711 ans='TUNDRA-3711'
+L=  5120 d=0.5 ask    pt=5100   FAIL word=True  digits=False (60s) true=FALCON-1042 ans='FALCON'
+L=  6144 d=0.5 ask    pt=6650   FAIL word=True  digits=False (81s) true=PUMICE-7544 ans='PUMICE-7542'
+L=  7168 d=0.5 ask    pt=8316   PASS word=True  digits=True  (91s) true=SAFFRON-7888 ans='SAFFRON-7888'
+L=  7936 d=0.5 ask    pt=9376   FAIL word=True  digits=False (104s) true=CYPRESS-0074 ans='CYPRESS-1234'
+L=  8192 d=0.5 ask    pt=9686   FAIL word=True  digits=False (113s) true=PELICAN-1605 ans='PELICAN-1234'
+wrote /root/ktransformers/runlogs/needle_int8_eager_20260801T130145Z.json

@@ -1,0 +1,6 @@
+filler blob = 246,944 bytes from 6 files
+L=  5120 d=0.5 ask    pt=5100   FAIL word=True  digits=False (55s) true=FALCON-1042 ans='FALCON'
+L=  6144 d=0.5 ask    pt=6650   FAIL word=True  digits=False (77s) true=PUMICE-7544 ans='PUMICE-7541'
+L=  7168 d=0.5 ask    pt=8316   PASS word=True  digits=True  (92s) true=SAFFRON-7888 ans='SAFFRON-7888'
+L=  7936 d=0.5 ask    pt=9376   FAIL word=True  digits=False (100s) true=CYPRESS-0074 ans='CYPRESS-0120'
+wrote /root/ktransformers/runlogs/needle_totallen_20260801T123553Z.json

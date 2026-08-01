@@ -1,0 +1,97 @@
+{
+ "per_request": [
+  {
+   "length": 4096,
+   "target_length": 4096,
+   "depth": 0.5,
+   "run": 0,
+   "needle_code": "ZEPHYR-5384",
+   "max_tokens": 24,
+   "prompt_tokens": 4192,
+   "out_tokens": 15,
+   "stop_reason": "stop",
+   "correct": true,
+   "answer_head": "The project access code is **ZEPHYR-5384**.",
+   "answer_token_maxprob": 0.8603,
+   "repetitive": false,
+   "garbled": false,
+   "degenerate": false,
+   "wall_s": 42.21,
+   "prefill_tps": 99.0
+  },
+  {
+   "length": 8192,
+   "target_length": 8192,
+   "depth": 0.5,
+   "run": 0,
+   "needle_code": "PELICAN-1605",
+   "max_tokens": 24,
+   "prompt_tokens": 10374,
+   "out_tokens": 24,
+   "stop_reason": "length",
+   "correct": false,
+   "answer_head": "PELICAN PELICAN PELICAN PELICAN PELICAN PELICAN",
+   "answer_token_maxprob": 0.8807,
+   "repetitive": false,
+   "garbled": true,
+   "degenerate": true,
+   "wall_s": 101.15,
+   "prefill_tps": 103.0
+  },
+  {
+   "length": 12288,
+   "target_length": 12288,
+   "depth": 0.5,
+   "run": 0,
+   "needle_code": "LANTERN-7358",
+   "max_tokens": 24,
+   "prompt_tokens": 14902,
+   "out_tokens": 24,
+   "stop_reason": "length",
+   "correct": false,
+   "answer_head": "LANTERN-2024-10-31-Wi-Fi-secret-code-is-\"Sculpting-a-data-system",
+   "answer_token_maxprob": 0.7695,
+   "repetitive": false,
+   "garbled": false,
+   "degenerate": false,
+   "wall_s": 148.7,
+   "prefill_tps": 100.0
+  }
+ ],
+ "lengths": [
+  4096,
+  8192,
+  12288
+ ],
+ "runs": 1,
+ "depth": 0.5,
+ "max_tokens": 24,
+ "timeout": 1800,
+ "endpoint": "chat/completions",
+ "top_logprobs": 20,
+ "filler_source": [
+  "CONCEPTS.md",
+  "docs/ada-sm89-port.md",
+  "kernels/MANIFEST.md",
+  "AGENTS.md",
+  "overlay/vllm/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py",
+  "/root/autostart/CLAUDE.md"
+ ],
+ "filler_base_bytes": 246944,
+ "calibration": {
+  "sample_bytes": 12014,
+  "prompt_tokens": 3141,
+  "bytes_per_token": 3.8249,
+  "wall_s": 31.38
+ },
+ "length_units": "prompt_tokens (target; filler sized via bytes_per_token)",
+ "onset_L": 8192,
+ "correct_lengths": [
+  4096
+ ],
+ "failed_lengths": [
+  8192,
+  12288
+ ],
+ "all_correct": false
+}

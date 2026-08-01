@@ -1,0 +1,11 @@
+filler blob = 246,944 bytes from 6 files
+L=  3072 d=0.4 ask    pt=2864   PASS word=True  digits=True  (84s) true=TUNDRA-3711 ans='TUNDRA-3711'
+L=  3072 d=0.5 ask    pt=2864   PASS word=True  digits=True  (32s) true=TUNDRA-3711 ans='TUNDRA-3711'
+L=  3072 d=0.58 ask    pt=2865   PASS word=True  digits=True  (32s) true=TUNDRA-3711 ans='TUNDRA-3711'
+L=  3072 d=0.66 ask    pt=2863   PASS word=True  digits=True  (31s) true=TUNDRA-3711 ans='TUNDRA-3711'
+L=  3072 d=0.75 ask    pt=2865   PASS word=True  digits=True  (30s) true=TUNDRA-3711 ans='TUNDRA-3711'
+L=  3072 d=0.85 ask    pt=2864   PASS word=True  digits=True  (31s) true=TUNDRA-3711 ans='TUNDRA-3711'
+L=  3072 d=0.95 ask    pt=2863   PASS word=True  digits=True  (31s) true=TUNDRA-3711 ans='TUNDRA-3711'
+L=  8192 d=0.175 ask    pt=9685   FAIL word=True  digits=False (110s) true=PELICAN-1605 ans='PELICAN_GROUP_500_IS_5_PHASE_2_345_OVERLAPPING'
+L=  8192 d=0.24 ask    pt=9685   FAIL word=True  digits=False (105s) true=PELICAN-1605 ans='PELICAN-1234'
+wrote /root/ktransformers/runlogs/needle_boundary_20260801T122658Z.json

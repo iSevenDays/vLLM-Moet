@@ -1,0 +1,17 @@
+[needle_sweep] calibration: 12014 bytes -> 3141 tok => 3.8249 bytes/tok (31.4s)
+[needle_sweep] L=  4096 run 0: pt=4192 PASS maxp=0.8603 deg=False (42s) head='The project access code is **ZEPHYR-5384'
+[needle_sweep] L=  8192 run 0: pt=10374 FAIL maxp=0.8807 deg=True (101s) head='PELICAN PELICAN PELICAN PELICAN PELICAN '
+[needle_sweep] L= 12288 run 0: pt=14902 FAIL maxp=0.7695 deg=False (149s) head='LANTERN-2024-10-31-Wi-Fi-secret-code-is-'
+
+=== needle_sweep (mid-context retrieval, chat-only) ===
+ length      pt correct   maxp  deg  wall_s  answer_head
+------------------------------------------------------------------------
+   4096    4192      OK  0.860    -   42.21  'The project access code is **ZEPHYR-5384'
+   8192   10374    FAIL  0.881    Y  101.15  'PELICAN PELICAN PELICAN PELICAN PELICAN '
+  12288   14902    FAIL  0.769    -   148.7  'LANTERN-2024-10-31-Wi-Fi-secret-code-is-'
+
+onset L* (first FAIL): 8192
+endpoint=/v1/chat/completions top_logprobs=20 max_tokens=24 depth=0.5 thinking=false
+filler_source: ['CONCEPTS.md', 'docs/ada-sm89-port.md', 'kernels/MANIFEST.md', 'AGENTS.md', 'overlay/vllm/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py', '/root/autostart/CLAUDE.md']
+
+wrote /root/ktransformers/runlogs/needle_onset_20260801T110302Z.json

@@ -1,0 +1,5 @@
+filler blob = 246,944 bytes
+L=  8192 words    pt=9689   FAIL (102s) want='ZEPHYR-ORYX-CYPRESS' got='ZEPHYR-ORYX-CORYX'
+L=  8192 repeat   pt=9677   FAIL (102s) want='PELICAN-1605' got='PELICAN-305'
+L=  8192 verbose  pt=9691   FAIL (104s) want='PELICAN-1605' got='PELICAN-1606'
+wrote /root/ktransformers/runlogs/needle_variants_fp8_20260801T114419Z.json

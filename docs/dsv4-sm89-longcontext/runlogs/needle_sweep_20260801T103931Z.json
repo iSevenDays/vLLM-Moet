@@ -1,0 +1,118 @@
+{
+ "per_request": [
+  {
+   "length": 2048,
+   "target_length": 2048,
+   "depth": 0.5,
+   "run": 0,
+   "needle_code": "LANTERN-7356",
+   "max_tokens": 24,
+   "prompt_tokens": 2019,
+   "out_tokens": 6,
+   "stop_reason": "stop",
+   "correct": true,
+   "answer_head": "LANTERN-7356",
+   "answer_token_maxprob": 1.0,
+   "repetitive": false,
+   "garbled": false,
+   "degenerate": false,
+   "wall_s": 20.34,
+   "prefill_tps": 99.0
+  },
+  {
+   "length": 16384,
+   "target_length": 16384,
+   "depth": 0.5,
+   "run": 0,
+   "needle_code": "PELICAN-3738",
+   "max_tokens": 24,
+   "prompt_tokens": 19713,
+   "out_tokens": 5,
+   "stop_reason": "stop",
+   "correct": false,
+   "answer_head": "PELICAN",
+   "answer_token_maxprob": 0.8808,
+   "repetitive": false,
+   "garbled": true,
+   "degenerate": true,
+   "wall_s": 196.38,
+   "prefill_tps": 100.0
+  },
+  {
+   "length": 32768,
+   "target_length": 32768,
+   "depth": 0.5,
+   "run": 0,
+   "needle_code": "CYPRESS-0527",
+   "max_tokens": 24,
+   "prompt_tokens": 38222,
+   "out_tokens": 4,
+   "stop_reason": "stop",
+   "correct": false,
+   "answer_head": "CYPHER",
+   "answer_token_maxprob": 0.7782,
+   "repetitive": false,
+   "garbled": true,
+   "degenerate": true,
+   "wall_s": 400.9,
+   "prefill_tps": 95.0
+  },
+  {
+   "length": 49152,
+   "target_length": 49152,
+   "depth": 0.5,
+   "run": 0,
+   "needle_code": "LANTERN-2037",
+   "max_tokens": 24,
+   "prompt_tokens": 59166,
+   "out_tokens": 24,
+   "stop_reason": "length",
+   "correct": false,
+   "answer_head": "LANTERN-9-9-9-9-9-9-9-9-9-9-9",
+   "answer_token_maxprob": 0.6538,
+   "repetitive": false,
+   "garbled": true,
+   "degenerate": true,
+   "wall_s": 621.02,
+   "prefill_tps": 95.0
+  }
+ ],
+ "lengths": [
+  2048,
+  16384,
+  32768,
+  49152
+ ],
+ "runs": 1,
+ "depth": 0.5,
+ "max_tokens": 24,
+ "timeout": 1800,
+ "endpoint": "chat/completions",
+ "top_logprobs": 20,
+ "filler_source": [
+  "CONCEPTS.md",
+  "docs/ada-sm89-port.md",
+  "kernels/MANIFEST.md",
+  "AGENTS.md",
+  "overlay/vllm/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py",
+  "/root/autostart/CLAUDE.md"
+ ],
+ "filler_base_bytes": 246944,
+ "calibration": {
+  "sample_bytes": 12014,
+  "prompt_tokens": 3141,
+  "bytes_per_token": 3.8249,
+  "wall_s": 37.31
+ },
+ "length_units": "prompt_tokens (target; filler sized via bytes_per_token)",
+ "onset_L": 16384,
+ "correct_lengths": [
+  2048
+ ],
+ "failed_lengths": [
+  16384,
+  32768,
+  49152
+ ],
+ "all_correct": false
+}
