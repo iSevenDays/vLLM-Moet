@@ -195,8 +195,11 @@ independent of which column was watched, and separately corroborated by
 measurements (§3) — black-box request/response, unaffected. The
 `index_topk=2048` result — unaffected.
 
-**Re-opened:** whether the digit-bearing entry survives the k=512 cut is now
-**unmeasured**, and the central mechanism claim of §5.18–5.19 rests on it.
+**MEASURED (T4, 2026-08-01):** the digit-bearing entry **DOES survive the
+k=512 cut at question-time** — selected in 20/21 ratio-4 layers (rank 0 in one)
+on the FAILING `ask`; `digitsonly` (passing) is 21/21. So selection is
+**EXONERATED (H2 confirmed)** and the §5.18 selection story is retracted. Full
+data + the question-chunk isolation: [`runlogs/T4_analysis.md`](runlogs/T4_analysis.md).
 
 ### Two further instrument defects
 1. `_trace_indexer_rank` was called **only from the prefill branch**, so
@@ -363,11 +366,13 @@ artifact of a llama-arch key that exists for MiniMax-M3. Full side-by-side + the
 reproduce commands: [`runlogs/T2_local_blocks_parity.md`](runlogs/T2_local_blocks_parity.md).
 
 **H2 — The digit entry is in fact selected and the mechanism story is wrong.**
-§5.18's "query content raises the digit entry's score" was inferred from
-`digitsonly`/`digitspad` passing, never measured — and the one direct measurement
-watched the wrong column. If column 968 is selected in every layer on the
-*failing* `ask`, selection is exonerated and the value/decode path reopens.
-*Falsifier:* V1, one boot.
+**CONFIRMED (T4, 2026-08-01).** At question-time the digit column is selected in
+**20/21 ratio-4 layers** (rank 0 in one) on the FAILING `ask`; `digitsonly`
+(passing) is 21/21 — i.e. `digitsonly` does **not** select the digit more.
+Selection is exonerated; the value/decode path reopens. §5.18's "query content
+raises the digit entry's score" is retracted (it was inferred from
+`digitsonly`/`digitspad` passing, never measured; the one direct measurement
+watched the wrong column). Details: [`runlogs/T4_analysis.md`](runlogs/T4_analysis.md).
 
 **H3 — Chunked-prefill boundary corrupts the compressor's overlapping window.**
 Chunk size flips individual points (§3a), which a pure coverage story cannot
@@ -381,11 +386,12 @@ launch differs on chunk, speculation method/width, ctx and util (§3d); the sm_8
 attribution holds none of them fixed. *Falsifier:* V5, one boot.
 
 **H5 — `index_topk=512` is genuinely marginal for this task on any hardware.**
-§2 evaporated its direct evidence; the llama.cpp "pass" that further weakened it
-is now **discounted** (T6: it ran on the OLD checkpoint, not 0731). So H5
-**regains weight** — until a 0731 like-for-like reference passes, marginal
-top-k coverage remains a live explanation. *Falsifier:* T4 showing the digit
-column comfortably inside the k=512 cut on a *failing* `ask`.
+**Weakened at 8K (T4):** the digit column IS inside the k=512 cut at
+question-time on the failing `ask` (20/21 layers), so plain coverage is not the
+8K mechanism. NOT fully eliminated: `index_topk=2048` still rescues 6/6 to 18.5K
+(§7) — so at *longer* contexts (where the digit likely ranks worse) coverage may
+contribute, and 2048 may help at 8K via a non-coverage path (attention-weight
+distribution / context entries). The 8K and >8K mechanisms may differ.
 
 ---
 
