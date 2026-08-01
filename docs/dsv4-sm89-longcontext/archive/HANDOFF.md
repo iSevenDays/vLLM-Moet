@@ -1,3 +1,9 @@
+> # ⚠️ SUPERSEDED — DO NOT QUOTE
+> Consolidated into [`../README.md`](../README.md) (2026-08-01), which is now the
+> single source of truth. This file is kept for provenance only and contains
+> **withdrawn claims** — notably the §5.19 indexer rank trace, which measured the
+> wrong column (README §2). Verify anything here against README before using it.
+
 # HANDOFF — DeepSeek-V4-Flash-0731 long-context server (read me first)
 
 > **Moved 2026-08-01.** This file previously lived at

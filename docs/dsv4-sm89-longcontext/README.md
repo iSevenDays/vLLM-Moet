@@ -1,146 +1,451 @@
-# DeepSeek-V4-Flash on Ada sm_89 — long-context investigation
+# DeepSeek-V4-Flash on Ada sm_89 — long-context digit loss
 
-Canonical home for the DSv4-Flash-0731 / 2×RTX 4090 D work. Everything that was
-previously scattered under `/root/ktransformers` now lives here, next to the code
-it describes.
+**Single source of truth.** Last updated 2026-08-01. Everything for this
+investigation lives here, in the repo whose code it describes.
 
-| file | what it is |
+| path | what it is |
 |------|------------|
-| [`BRIEFING.md`](BRIEFING.md) | **Raw-data-first briefing for an external analyst.** All 60 measurements, every retracted conclusion, and the open questions. Hand this over when asking someone else to reason about the problem. |
-| [`STATUS.md`](STATUS.md) | **Authoritative status, measurements, decisions, NEXT queue.** Start here. |
-| [`HANDOFF.md`](HANDOFF.md) | Raw state + primary sources for a fresh agent. Read after STATUS. |
-| [`runlogs/`](runlogs/) | Raw artifacts backing every claim in STATUS. |
-| [`../../tools/README.md`](../../tools/README.md) | The test harnesses, what each one proves, and its runtime. |
+| **this file** | **The only current document. Read it end to end.** |
+| [`runlogs/`](runlogs/) | Raw artifacts. [`ALL_NEEDLE_RESULTS.csv`](runlogs/ALL_NEEDLE_RESULTS.csv) = all 60 needle measurements, machine-readable. |
+| [`../../tools/README.md`](../../tools/README.md) | Test harnesses: what each proves, what it costs, how to run it. |
+| [`archive/`](archive/) | Superseded: `STATUS.md` (the §5.1–5.19 blow-by-blow, kept for provenance), `PLAN.md`, `BRIEFING.md`, `HANDOFF.md`. **Do not quote these** — they contain withdrawn claims. Consolidated into this file. |
 
-## The one thing to read before touching this
+---
 
-**"Needle retrieval is broken above ~8K" is WRONG, and believing it costs hours.**
-The model recovers the needle's **word** at every length tested (2K–48K); only the
-numeric **digits** are lost:
+## 0. Read this first
+
+Two things will cost you hours if you don't know them.
+
+**(a) "Needle retrieval is broken above ~8K" is wrong.** The model recovers the
+needle's leading component at every length tested (2K–48K) and loses the
+**trailing** component:
 
 ```
-true PELICAN-1605  ->  "PELICAN PELICAN PELICAN..."
-true LANTERN-2037  ->  "LANTERN-9-9-9-9-9..."
+true PELICAN-1605       -> "PELICAN-1234"   /  "PELICAN PELICAN PELICAN..."
+true LANTERN-2037       -> "LANTERN-9-9-9-9-9..."
+true GLACIER-7741-ORYX  -> "GLACIER-7741"  (depth 0.5)  /  "GLACIER"  (depth 0.1)
 ```
 
-Retrieval works. The attended value's fine detail is unreadable. Those are
-different bugs with different fixes. Use
+Retrieval locates the needle. Exact multi-token copy is what fails. Use
 [`tools/needle_digits_probe.py`](../../tools/needle_digits_probe.py), which
-reports `word_present` / `digits_present` separately — the old
-`bench/runner/probes.py --probe needle_sweep` metric collapses both into one
-bit and is what produced the misdiagnosis.
+reports `word_present` / `digits_present` separately; the old
+`bench/runner/probes.py --probe needle_sweep` collapses both into one bit and is
+what produced the original misdiagnosis.
 
-## Current best understanding (2026-08-01)
+**(b) Seven interpretations have been retracted here (§4). The raw
+request/response measurements have never been wrong — every failure was in what
+an instrument was believed to be pointing at.** Before trusting any diagnostic,
+verify its addressing on a known input. The prompts are deterministic and the
+tokenizer runs on CPU in seconds; that check would have caught the worst error
+(§2) immediately.
 
-**Selection coverage is the operative variable, and what gets selected depends on
-QUERY CONTENT.** The needle's digits are always physically present and readable —
-asking "the four **digits** at the end" returns `1605` exactly from the same 8K
-prompt where "what is the code?" returns `1234`. The indexer scores are computed
-from the query, so a query naming the digits raises their compressed entry's
-score; a generic query favours the word's entry, and at marginal coverage the
-digit entry misses the top-k cut. `index_topk=2048` fixes the generic question by
-admitting 4× the candidates (STATUS §5.15, §5.18).
+### Standing decisions
 
-Two hypotheses were raised and then **retracted by their own falsifiers** in this
-investigation — read §5.16 and §5.18 before reviving either:
-- a "~26× indexer ranking gap" (unsound: compared two different needle probes);
-- a decode-side / speculative-block-boundary story (killed by `digitspad`, which
-  puts the digits at answer position ~6 and still passes).
+- **`/root/models/DeepSeek-V4-Flash-0731` is the only checkpoint.** The older
+  `/root/models/DeepSeek-V4-Flash` (146 GB) is superseded: configs differ
+  materially (0731 adds DSpark — `dspark_block_size 5`,
+  `dspark_target_layer_ids [40,41,42]`, `dspark_markov_rank 256` — and has 46
+  `compress_ratios` entries vs 44). Any result quoted from the old checkpoint is
+  not comparable. ⚠️ **Deletion approved in principle but NOT executed** — 146 GB
+  and irreversible; confirm before reclaiming.
+- `vllm-moet-sm89:v0251` is the canonical living tag. Preserve baselines as
+  suffixed tags; never default to a candidate tag.
+- **Never `--enforce-eager`** on this rig.
+- Production: container `moet-0731-dspark-exact`, port **8011**, sole container,
+  indexer trace off by default.
 
-## How the root cause was localized: `index_topk=512` is too marginal
+---
 
-`--hf-overrides '{"index_topk":2048}'` takes the needle battery from **2/6 to
-6/6, all digits exact**, including the pt 9686 case that failed under every
-other configuration (STATUS §5.15).
+## 1. System
 
-Top-512 selection over the ratio-4 compressed entries was operating near ties,
-so the digit-bearing entry frequently fell outside the selected set. That
-explains every earlier observation:
+| property | value |
+|---|---|
+| GPUs | 2 × RTX 4090 D, 48 GiB, **Ada sm_89**; Proxmox LXC, 630 GiB RAM, no swap |
+| Model | DSv4-Flash-0731, 43 layers, 256 experts / 6 active, FP4 E2M1 experts, bf16 attention |
+| Serving | local fork `vLLM-Moet`, image `vllm-moet-sm89:v0251`, TP=2 |
+| Launch | `--kv-cache-dtype fp8 --block-size 256 --max-model-len 262144 --max-num-batched-tokens 1056 --max-num-seqs 3 --no-enable-prefix-caching`, DSpark k=5, graphs [1,2,4,6,8,12,18] |
+| Attention | FlashInfer has **no sm_89 DSv4 sparse-MLA kernel** → decode *and* prefill route to a local Triton port (`triton_sparse_mla_dsv4.py`), boot self-test `worst_row_rel 6.6e-3` |
+| Indexer | ragged/prefill logits fall back to a **torch reference** pre-SM90; paged/decode uses a local Triton port. FP8 indexer cache (MXFP4 is sm_10x-only). |
 
-- the **word** always survived — the 20 `compress_ratio=128` layers see the whole
-  context (~75 entries at 9.7K, far below `index_topk`) and never select at all;
-- digits failed **non-monotonically** in length and were deterministic per input
-  — whether a given needle's entry makes the cut depends on its score
-  distribution, not on length;
-- halving `--max-num-batched-tokens` reshuffled *which* cases passed without
-  changing the count (2/6 either way, a different 2) — a marginal selection is
-  perturbed by any numerically-transparent change (STATUS §5.14);
-- better **storage** precision could not help (`VLLM_DSV4_KV_INT8=1`: 6/6
-  identical) because the entry was never attended in the first place.
+### Architecture, from the checkpoint's own reference
 
-### …but `index_topk` is a diagnostic, not the fix
+`/root/models/DeepSeek-V4-Flash-0731/inference/model.py` ships with the weights
+and is authoritative — ~600 lines, read it directly.
 
-Extending to longer contexts finds the ceiling, and one variable explains every
-result: **selection coverage** = `index_topk / (prompt_tokens / 4)`. PASS while
-coverage ≳44%, FAIL at ≤40%, coin-flip between. Rule of thumb: **reliable
-context ≈ 10 × index_topk** (512 → ~5K, 2048 → ~20K; 35825 tokens at topk 2048
-= 23% coverage, and it FAILS).
+- KV cache is a **ring buffer of only `window_size` tokens**
+  (`kv_cache[:bsz, start_pos % win] = kv`), sized
+  `window_size + max_seq_len // compress_ratio` (line 479). Older tokens are
+  **never retained exactly** — only as learned gated-pooling compressed entries.
+- Selection: `topk_idxs = index_score.topk(min(index_topk, end_pos // ratio))`,
+  `index_score = (einsum(q, kv_cache[:, :end_pos//ratio]).relu_() * weights).sum(dim=2)`.
+- An `Indexer` exists **only on `compress_ratio == 4` layers**; ratio-128 layers
+  use positional order (all causal entries) by design.
+- Attend set = `cat([always_included_window_idxs, compress_topk_idxs])`, two
+  segments sharing ONE softmax (line ~520).
+- The indexer *simulates FP4* on q/kv (`fp4_act_quant(..., fp4_block_size=32)`).
 
-**The regression is real, but quote it qualitatively — not as a ratio.** An
-earlier "~26× ranking-quality gap" figure was withdrawn (STATUS §5.16): it
-divided our hard-needle coverage requirement by upstream's, and upstream's
-recipe (`needle: sizes_words: [8000, 90000]`) runs a *different, easier* probe
-(random-word filler, default depth 0.1). Like-for-like, on upstream's own probe
-and settings, is still damning: at 10,815 tokens we return `GLACIER` for secret
-`GLACIER-7741-ORYX`, while upstream records PASS for both 8000 and 90000 words
-(≈121K tokens).
+Config: `index_topk 512`, `index_n_heads 64`, `index_head_dim 128`,
+`sliding_window 128`, `rope_theta 10000`, `compress_rope_theta 160000`,
+yarn factor 16 / `original_max_position_embeddings 65536`.
+`compress_ratios` = 21 layers ratio 4, 20 ratio 128, 5 zeros; indexed
+`compress_ratios[layer_id]` (`overlay/.../deepseek_v4/attention.py:201`).
 
-Use that easy needle as the regression gate — it fails in **~65 s** versus
-100–650 s per hard-needle point, and it is exactly what upstream validates:
+---
 
-```bash
-python3 tools/needle_probe.py 8011 8000 0.1     # FAIL today: "GLACIER"
+## 2. THE CORRECTION: the §5.19 rank trace measured the wrong column
+
+The archived `STATUS.md` §5.19 / `BRIEFING.md` §5 present an indexer rank trace
+as "the single most informative measurement". **It was pointed at filler prose.**
+
+The trace ran with `VLLM_DSV4_INDEXER_TRACE_POS=4843`, taken from the probe's
+`needle_abs_pos_est = int(prompt_tokens × depth)` = `int(9686 × 0.5)`
+(`needle_digits_probe.py:232`) → ratio-4 column `4843 // 4 = 1210`.
+
+The prompt is deterministic, so the true position is checkable on CPU in seconds.
+Reconstructed byte-exact and tokenized with the real tokenizer:
+
+| item | value |
+|---|---|
+| context | 29,433 bytes / 9,682 tokens (probe reports pt 9,686) |
+| needle inserted at | byte 14,515 of 29,076 = **49.9 % by byte** |
+| needle first token `'IM'` | abs **3,858** = **39.8 % by token** |
+| `'160'`, `'5'` — **the digits** | abs 3,873–3,874 → ratio-4 column **968** |
+| **column actually traced** | **1210** — abs 4,836–4,843 |
+
+Token dump of the traced column: `[' in',' `','gen','/','`',' as',' the',' validated']`
+— filler prose, **~243 columns from the needle**.
+
+**Independently re-verified** with `tools/verify_needle_token_position.py`
+(CPU, seconds — run this before aiming any position-addressed instrument):
+
+| | measured | probe's estimate | off by |
+|---|---:|---:|---:|
+| digits token position | **3,871** | 4,841 | **+970 tokens** |
+| ratio-4 column | **967** | 1210 | **243** |
+| ratio-128 column | **30** | 37 | 7 |
+
+⚠️ The exact ratio-4 column is **967–968** depending on whether you index the
+`"1605"` string start or the `'160'` token, and on the chat template's prefix.
+For a trace that ±1 matters: **sweep a small column range, not a single value.**
+
+**Root cause of the error:** the probe inserts the needle at a **byte** fraction
+of the filler but reports its position as a **token** fraction. The filler's
+first half (markdown + Python) tokenizes denser than its second half, so
+byte-50 % lands at token-39.8 %.
+
+**Invalidated — do not quote:** the rank table (112/592/523/1003/693/184/125/492);
+"selected in roughly half the ratio-4 layers"; "rank varies 5.4 %→48 % across
+layers" (that is the layer-to-layer spread of *a filler token*, unremarkable);
+and the derived open question "why does the needle's entry rank vary?" — not a
+real observation.
+
+**Survives:** "the top-k boundary is exactly 512" (rank 492 selected, 523 not) —
+independent of which column was watched, and separately corroborated by
+`tools/test_indexer_topk_selection.py` and the paged suite. All 60 end-to-end
+measurements (§3) — black-box request/response, unaffected. The
+`index_topk=2048` result — unaffected.
+
+**Re-opened:** whether the digit-bearing entry survives the k=512 cut is now
+**unmeasured**, and the central mechanism claim of §5.18–5.19 rests on it.
+
+### Two further instrument defects
+1. `_trace_indexer_rank` is called **only from the prefill branch**
+   (`sparse_attn_indexer.py:663`). The decode branch (`persistent_topk` /
+   `top_k_per_row_decode`) has no trace — **selection during generation has
+   never been observed**, and the symptom is a generation failure.
+2. The archived `BRIEFING.md` §3b "needle absolute token pos" column
+   (194/1695/2324/4843/9492) comes from the same estimate; `--abs-pos N` is
+   converted to `depth = N/L` and applied as a byte fraction. The pass/fail
+   pattern still refutes "fixed position" and "fixed length" (those need only
+   *some* monotone axis) but **the axis values are wrong** — recompute before
+   fitting any threshold.
+
+---
+
+## 3. What is established
+
+### 3a. Configuration sweep — plain question (`ask`, depth 0.5)
+
+`pt` = actual prompt tokens; topk = `index_topk`; chunk = `max_num_batched_tokens`.
+
+| pt | topk512 ch1056 | topk512 ch528 | topk2048 ch528 | INT8-NoPE | true code |
+|---:|---|---|---|---|---|
+| 2864 | PASS | PASS | PASS | PASS | TUNDRA-3711 |
+| 5100 | FAIL `FALCON` | FAIL `FALCON` | **PASS** | FAIL | FALCON-1042 |
+| 6650 | FAIL `7541` | **PASS** | **PASS** | FAIL `7542` | PUMICE-7544 |
+| 8316 | **PASS** | FAIL `1206` | **PASS** | PASS | SAFFRON-7888 |
+| 9376 | FAIL `0120` | FAIL `CYAN-42` | **PASS** | FAIL `1234` | CYPRESS-0074 |
+| 9686 | FAIL `1234` | FAIL `1234` | **PASS** | FAIL `1234` | PELICAN-1605 |
+| 13988 | — | — | **PASS** | — | LANTERN-7358 |
+| 18559 | — | — | **PASS** | — | PELICAN-3738 |
+| 35825 | — | — | FAIL `CYBERTRON` | — | CYPRESS-0527 |
+| ~53000 | — | — | TIMEOUT (1800 s, no data) | — | — |
+
+Two facts worth holding onto: **chunk size flips individual points in opposite
+directions** (2/6 either way, a *different* 2) — chunk size should not change
+scores, so a pure coverage story does not explain this; and **`index_topk=2048`
+is the only change ever measured to convert failures into passes**.
+
+### 3b. Question form, all at pt ≈ 9685, topk512 ch1056
+
+| variant | answer | result |
+|---|---|---|
+| `ask` "What is the project access code?" | `PELICAN-1234` | FAIL |
+| `digitsonly` "the four **digits** at the end" | `1605` | **PASS** |
+| `digitspad` forced prefix, digits at answer pos ~6 | `THE FINAL FOUR DIGITS ARE 1605` | **PASS** |
+| `firstword` | `pelican` | PASS |
+| `yesno` / `yesno_neg` (1 token, true / wrong code) | `yes` / `no` | PASS — real discrimination |
+| `spell` | `P E L I C A N \n P E L I C A N …` | FAIL |
+| `words` (3 salient words, no digits) | `ZEPHYR-ORYX-CORYX` | FAIL (3rd blended) |
+| `repeat` (code 3× at .35/.5/.65) | `PELICAN-305` | FAIL |
+| `verbose` (digits also spelled out) | `PELICAN-1606` | FAIL (off by one) |
+
+`digitsonly` passing is the key datum: **the digits are retrievable at 8K on the
+stock config.** `digitspad` passing kills any "answer position" explanation.
+
+### 3c. Logprobs at the digit position (raw)
+
 ```
+pt 3909 PASS, position 5:  '538' logprob -0.000 (p~1.000); runners-up -14.4, -15.4
+pt 9686 FAIL, position 5:  '123' logprob -0.765 (p~0.47); runners-up 301 -1.5,
+                           927 -2.5, 627 -2.6, 294 -4.0 — true token '160' ABSENT
+                           from the top-20
+positions 0-4 in BOTH cases: all ~ -0.000
+```
+
+### 3d. Reference points
+
+**llama.cpp passes the needle test on this same hardware** (operator-verified
+2026-08-01). This is the like-for-like reference previously thought unavailable,
+and it shifts the prior from "architectural limit of `index_topk=512`" toward
+**port defect**. Three confounds to close first (all cheap — task V6):
+1. **Which weights.** Shell history shows
+   `/root/antirez/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf`.
+   Confirm it was converted from **0731**, not the superseded checkpoint.
+2. **Which probe / length / depth.** 8K random-word depth 0.1 and 10.8K
+   realistic-filler depth 0.5 are different claims. Record pt, filler, depth, reply.
+3. **Which quantization.** That GGUF is IQ2-XXS experts + Q8 projections; ours is
+   FP4 E2M1. A *pass* under IQ2 is evidence **against** an expert-precision story.
+
+**Upstream (`kacper-daftcode/vLLM-Moet`, Blackwell)** records
+`needle @121k tokens PASS` with the same `--kv-cache-dtype fp8`. But its recipe
+is `needle: sizes_words: [8000, 90000]`, which drives the **easy random-word
+probe at default depth 0.1** — not the realistic-filler needle. Running *that
+same probe* on our production config: 8000 words → pt 10,815 → `GLACIER` (FAIL);
+at depth 0.5 → `GLACIER-7741` (FAIL). Upstream contains **none** of the sm_89
+Triton kernels, so it is a behavioural reference only. Note our launch also
+differs on `max_num_batched_tokens` (1056 vs 4096), speculation (`dspark k=5` vs
+`deepseek_mtp k=2`), `max-model-len` (262144 vs 131072) and util (0.98 vs 0.92) —
+see H4.
 
 ⚠️ `bench/suites/needle_sweep.yaml` and the `needle_sweep` docstring claim
-random-word filler "did NOT reproduce the failure". **That is wrong** at this
-length — it reproduces plainly, and more severely at depth 0.1 than 0.5.
+random-word filler "did NOT reproduce the failure". **That is wrong** at ≥10K —
+it reproduces plainly, and more severely at depth 0.1 than 0.5.
 
-Note the failure shape is filler-independent: the needle's leading component
-survives and the **tail** is lost (`GLACIER-7741-ORYX` → `GLACIER-7741` →
-`GLACIER`). Whatever the mechanism, it truncates verbatim copy length rather
-than failing to locate the needle.
+---
 
-So:
-- `index_topk=2048` is a usable mitigation **up to ~20K context** and must still
-  be quality-validated (GSM8K/GPQA) since it deviates from the trained 512.
-- It **cannot** reach 262K — that needs ~26,000, i.e. ~40% of all entries, which
-  is nearly dense attention and defeats the sparse design.
-- **The real fix is the sm89 indexer's score quality.** Everything downstream is
-  verified, so the defect is in the scores or their inputs. Indexer RoPE is
-  already eliminated; remaining suspects and their cheap checks are in
-  STATUS §5.15.
+## 4. Eliminated and retracted
 
-## Eliminated — do not re-litigate (each by measurement, not argument)
+### Verified clean (evidence attached, so it can be disputed)
 
-| cause | how it was ruled out |
-|-------|----------------------|
-| FP8 KV dtype | upstream passes `needle @121k` with the same flag on native Blackwell kernels |
-| NoPE storage precision | `VLLM_DSV4_KV_INT8=1` A/B: **6/6 identical** despite 3–4× better readback |
-| top-k selection kernels | `tools/test_indexer_topk_selection.py`: 512/512 correct with all high scores beyond index 512 |
-| indexer scoring (ragged + paged) | torch fallback matches the checkpoint reference; paged Triton suite passes |
-| per-token scalars | top-k is per query **row**, so `q_scale`/`softmax_scale`/`head_scale` are ranking-neutral |
-| compressor semantics | `tools/test_compressor_vs_checkpoint_ref.py`: agrees with an independent checkpoint transcription at ~2.6e-3 (bf16 floor) |
-| compressed-attention KV store/gather | 11 previously-blocked tests now pass after the arch-gate fix |
-| intra-chunk state overwrite | `tools/test_compressor_state_capacity.py`: allocation is chunk-aware (267/149 blocks vs 266/148 required) |
-| fixed needle position (~2048) | passes at abs 2721, fails at abs 1695 |
-| fixed total-length cutoff (~8192) | non-monotonic: pt 8316 passes, 5100/6650 fail |
+| component | evidence |
+|---|---|
+| top-k selection kernel | k=512, all high scores beyond index 512 → `persistent_topk` returns **512/512** correct, zero overlap with first 512 (`tools/test_indexer_topk_selection.py`) |
+| ragged indexer logits | sm_89 torch fallback = `sum_h relu(q·kᵀ)·w`, correct per-row k dequant and `[ks,ke)` −inf masking; matches checkpoint (`overlay/.../deep_gemm.py:588`) |
+| paged indexer logits | own suite 9 passed / 5 skipped |
+| compressor semantics | vs an **independent transcription of the checkpoint's `Compressor`**: ~2.6e-3 (bf16 floor) across the ratio-4 overlapping window, softmax axis, block-0 padding, APE indexing, RoPE position, ratio-128 branch (`tools/test_compressor_vs_checkpoint_ref.py`) — **within a single chunk only**, see H3 |
+| compressor state capacity | chunk-aware, not window-sized: required 266/148 blocks, observed **267/149** at chunk 1056; 134/82 → **135/83** at chunk 528 |
+| compressed-attn KV store/gather | 11 previously-blocked tests pass after the arch-gate fix; suite now 30 passed / 6 skipped / 0 failed |
+| NoPE KV storage precision | E4M3 readback err 2.48e-2 vs INT8 8.0e-3, yet the INT8 A/B is **6/6 identical** → storage precision is not limiting |
+| indexer key-quant granularity | per-row(D=128) vs checkpoint's block-32: recall@512 within ~1 %, top entry never dislodged |
+| indexer RoPE | `attention.py:262` shares the attention rope; built with `compress_ratio` → `compress_rope_theta`, matching the reference |
+| per-token scalars | top-k is per query **row**, so `q_scale`/`softmax_scale`/`head_scale` are ranking-neutral by construction |
+| `sqrtsoftplus`, `noaux_tc`, `num_hash_layers`, `hc_*` | **all implemented and matching the checkpoint** — `fused_topk_bias_router.py:243`, `nvidia/model.py:599`, `:584`/`:716` (raises rather than degrading), Sinkhorn HC at `:866–979`. Also **mis-scoped**: the first two govern MoE expert routing, `hc_*` governs residual mixing; neither touches `index_score`. Remaining gap: the CUDA kernels are unverified numerically (task V4). |
 
-## Ground truth — prefer these over any doc here
+### Retracted interpretations — do not revive without reading why
 
-1. **`/root/models/DeepSeek-V4-Flash-0731/inference/model.py`** — DeepSeek's own
-   implementation for this exact checkpoint. Authoritative for the ring-buffer
-   SWA cache, the compressor, and the indexer (`Indexer` exists **only** on
-   `compress_ratio == 4` layers; ratio-128 layers use positional order).
-2. **`~/llama.cpp`** — a DFlash+DSpark build that passes the needle test
-   (`src/models/dflash.cpp`).
-3. **`upstream/main`** (`kacper-daftcode/vLLM-Moet`) — passes needle @121K on
-   Blackwell. Note it contains **none** of the sm_89 Triton kernels, so it is a
-   behavioural reference, not a code-diff target.
+1. ~~FP8 KV cache is the cause~~ (inherited) — upstream passes with the same flag.
+2. ~~Fails above a fixed absolute needle position (~2048)~~ — passes at est. 2721, fails at est. 1695. (Axis values also wrong, §2.)
+3. ~~Fails above a fixed total length (~8192)~~ — non-monotonic: pt 8316 passes while 5100 and 6650 fail.
+4. ~~"~26× indexer ranking-quality gap"~~ — **unsound arithmetic**: divided our hard-needle coverage requirement by upstream's *easier* probe's.
+5. ~~The failure is decode-side, at the speculative block boundary~~ — `num_speculative_tokens=5` and the collapse at answer position 5 looked compelling; killed by `digitspad`.
+6. ~~sm_89 produces bad indexer scores~~ — retired on the strength of the §5.19 trace, which is now void (§2), so this is **unsupported in both directions**. Kernel-level suites still pass.
+7. ~~The §5.19 rank trace is the decisive measurement~~ — §2. Wrong column.
 
-## Working rule
+### A real bug found and fixed (unrelated to the symptom)
+`has_cutedsl()` = `_has_module("cutlass")` — a **package** check with no device
+check. The package is installed, so `dequantize_and_gather_k_cache` dispatched to
+a CuTeDSL kernel with no pre-SM90 lowering. Now gated on
+`has_device_capability(90)`. It had been hiding the only sm_89 validation of the
+compressed-attention K-cache path.
 
-Deploys and end-to-end probes are expensive (6–10 min boots, 30–190 s per
-probe); unit tests are cheap (seconds, often CPU-only). Every harness in
-[`tools/README.md`](../../tools/README.md) was written to replace a server round
-trip. Add to them before reaching for another boot.
+---
+
+## 5. Hypotheses, ranked by posterior × cheapness to falsify
+
+**H1 — Selection policy differs from the reference: missing always-included
+local/recent compressed blocks.** The checkpoint concatenates the raw 128-token
+window with `compress_topk_idxs` sharing one softmax (`model.py:520`).
+llama.cpp *additionally* models `indexer.local_blocks`
+(`llama.cpp/src/llama-arch.cpp:260–261`), which has no obvious counterpart here.
+If the port admits *only* the top-k from the compressed segment, recent-but-not-
+top-k entries are dropped where the reference keeps them — and that produces our
+symptom shape directly. **Highest-value structural lead.**
+*Falsifier:* V3, CPU, no boot.
+
+**H2 — The digit entry is in fact selected and the mechanism story is wrong.**
+§5.18's "query content raises the digit entry's score" was inferred from
+`digitsonly`/`digitspad` passing, never measured — and the one direct measurement
+watched the wrong column. If column 968 is selected in every layer on the
+*failing* `ask`, selection is exonerated and the value/decode path reopens.
+*Falsifier:* V1, one boot.
+
+**H3 — Chunked-prefill boundary corrupts the compressor's overlapping window.**
+Chunk size flips individual points (§3a), which a pure coverage story cannot
+explain — chunk size should not change scores. The ratio-4 compressor is
+overlapping and carries `kv_state`/`score_state` across calls; the reference
+builds them in one `start_pos == 0` pass, and our validation was single-chunk.
+*Falsifier:* V2b, CPU, no boot.
+
+**H4 — Config divergence from upstream's validated recipe, not sm_89.** Our
+launch differs on chunk, speculation method/width, ctx and util (§3d); the sm_89
+attribution holds none of them fixed. *Falsifier:* V5, one boot.
+
+**H5 — `index_topk=512` is genuinely marginal for this task on any hardware.**
+Weakened by llama.cpp passing and by §2 (its direct evidence evaporated), not
+eliminated — llama.cpp may be running an easier probe.
+*Falsifier:* V1 showing the digit column comfortably inside the cut on a
+*failing* request; or the V6 confounds closing cleanly.
+
+---
+
+## 6. Verification queue — cheapest first
+
+**V0 — Measurement hygiene. Do this before any new sweep.** *(CPU, ~30 min)*
+Otherwise every future position claim inherits the §2 error.
+0. `tools/verify_needle_token_position.py` already exists and reports the
+   measured position for any (length, variant, depth) — run it first. Note it
+   needs `/root/autostart/CLAUDE.md` mounted to reproduce the filler blob exactly
+   at prompt sizes above ~29 KB (below that the file falls beyond truncation and
+   is irrelevant).
+1. `needle_digits_probe.py` must report the **measured** token position of the
+   needle, not `int(pt × depth)`.
+2. `--abs-pos` must place by **token** position (tokenize, insert, verify), not
+   by converting to a byte fraction.
+3. Recompute the archived §3b position axis and restate the two refutations
+   against it.
+
+**V1 — Retrace with the correct column.** *(one boot, ~15 min; decisive)*
+The measurement §5.19 was meant to be. Re-derive the digit token position first
+(CPU, seconds — the prompt is deterministic), then:
+```bash
+-e VLLM_DSV4_INDEXER_TRACE=1 -e VLLM_DSV4_INDEXER_TRACE_POS=3871 \   # verified; sweep +/-8 tokens
+-e VLLM_DSV4_INDEXER_TRACE_MIN_N=2000 -e VLLM_DSV4_INDEXER_TRACE_MAX=64
+python3 tools/needle_digits_probe.py --lengths 8192 --variant ask        # FAILS
+python3 tools/needle_digits_probe.py --lengths 8192 --variant digitsonly # PASSES
+```
+Trace **both** variants — §5.18's mechanism is now a directly testable
+prediction. Prerequisites, both required for the output to be readable:
+label emissions **by layer id** (currently counter-labeled,
+`sparse_attn_indexer.py:106`) and **gate on TP rank 0** (both ranks emit today).
+*Outcomes:* digit column outside the cut on `ask` / inside on `digitsonly` →
+§5.18 confirmed, fix is coverage. Digit column **inside** the cut on failing
+`ask` → **H2**, selection exonerated, reopen the decode/value path.
+
+**V2 — Trace the decode path.** *(code change, fold into V1's boot)*
+Add `_trace_indexer_rank` to the decode branch after
+`persistent_topk`/`top_k_per_row_decode`. Generation-time selection has never
+been observed and the symptom is a generation failure.
+
+**V2b — Cross-chunk compressor parity.** *(CPU, no boot)*
+Extend `tools/test_compressor_vs_checkpoint_ref.py` to drive the port's
+compressor in N chunks and compare against the reference's single-pass output at
+the boundary columns. Tests H3.
+
+**V3 — `indexer.local_blocks` parity.** *(CPU, ~1 h reading)*
+Compare attend-set assembly across three implementations: checkpoint
+`model.py:513–520`, this port (`sparse_attn_indexer.py` + the sparse-MLA
+backend's index handling), and llama.cpp `src/models/dflash.cpp` +
+`LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS`. One question: **does any of them
+always-include recent compressed blocks that the port drops?** Yes → H1
+confirmed, fix is a selection-policy patch and `index_topk` can return to 512.
+
+**V4 — Numerically verify the CUDA routing kernels.** *(unit, minutes)*
+Production runs `ops.topk_hash_softplus_sqrt`; the torch fallbacks are XPU/CPU
+only. Assert kernel ≡ torch fallback ≡ checkpoint `Gate.forward`, including the
+DSv4-Flash bias regime (all ≈ 8.08). Low prior for this symptom but closes §4's
+last gap. Add an assert on the `input_tokens is not None` fallback while there.
+
+**V5 — Upstream recipe on sm_89.** *(one boot + ~2 min)*
+Run `pro6000x2-tp2.yaml`'s serve args verbatim (chunk 4096, `deepseek_mtp` k=2,
+ctx 131072, util 0.92) and upstream's own cheap gate
+`python3 tools/needle_probe.py 8011 8000 0.1` (~65 s). Pass → the gap is
+configuration (H4), not architecture. Note the `moe_w2` strict guard may trip
+when speculation changes: vary `num_speculative_tokens` rather than removing
+speculation; **never relax the guard**.
+
+**V6 — Close the llama.cpp confounds.** *(minutes)* §3d's three items. Cheapest
+way to firm up the single most informative new datum. Record in `runlogs/`.
+
+---
+
+## 7. Fix strategy
+
+**Now — interim production setting.** `index_topk=2048` is the only change
+measured to convert failures into passes (6/6 exact to 18.5K):
+```bash
+--hf-overrides '{"index_topk": 2048}'
+```
+Costs compute, not VRAM. Ship it **if** long-context exactness matters more than
+throughput, and record the throughput delta. Caveats that must stay attached: its
+mechanism is now unconfirmed (§2); it fails at 35.8K; it deviates from the
+trained 512 so it needs GSM8K/GPQA validation; and the `reliable ≈ 10 ×
+index_topk` extrapolation implies ~26,000 at 262K — effectively dense, not a
+principled setting. **`index_topk = 0` does not mean unlimited** — it selects
+nothing and leaves only the 128-token window.
+
+**Next — fix the cause.** Follow whichever of H1/H2/H3 the queue confirms:
+H1 → patch attend-set assembly to always-include local blocks (likely small, and
+`index_topk` returns to 512). H2 → selection exonerated, reopen the decode/value
+path and re-examine `digitspad` under the corrected instrument. H3 → fix the
+compressor's cross-chunk state, which would also explain the chunk-size
+sensitivity. H4 → adopt upstream's serve args, no kernel work.
+
+**Do not:** quote the §5.19 rank table, the "5 %→48 % spread", or the "~26×
+gap"; run another end-to-end sweep before V0; relax the `moe_w2` strict
+miss-replay guard to unblock a DSpark A/B; use `--enforce-eager`.
+
+---
+
+## 8. Reproduction
+
+```bash
+docker start moet-0731-dspark-exact          # sole container, 6-10 min boot
+until curl -fsS http://127.0.0.1:8011/health >/dev/null; do sleep 20; done
+
+python3 tools/needle_digits_probe.py --lengths 8192 --variant ask         # FAIL
+python3 tools/needle_digits_probe.py --lengths 8192 --variant digitsonly  # PASS
+python3 tools/needle_probe.py 8011 8000 0.1                              # upstream's probe, FAIL
+```
+CPU harnesses run in seconds and are safe while serving — see
+[`tools/README.md`](../../tools/README.md). Costs: boot 6–10 min; 8K needle point
+~100 s; 32K ~650 s.
+
+⚠️ `EXTRA_MOUNTS` is **not** a knob in `docker/serve_sm89_ds4.sh` — passing it is
+silently ignored and your modified file never reaches the container. Smuggle
+mounts through `EXTRA_DOCKER_ENV`, which is spliced raw into `docker run`.
+
+## 9. Primary sources
+
+- `/root/models/DeepSeek-V4-Flash-0731/inference/model.py` — **the authority.**
+  `Compressor` (284), `Indexer` (~393), `Attention.forward` (~490), attend-set
+  assembly (513–520), `Gate.forward` (576).
+- `inference/kernel.py` — `act_quant`, `fp4_act_quant`.
+- `overlay/vllm/vllm/model_executor/layers/sparse_attn_indexer.py` — selection.
+- `overlay/vllm/vllm/v1/attention/ops/triton_sparse_mla_dsv4.py` — sm_89
+  attention port (packed layout contract in the docstring).
+- `overlay/vllm/vllm/models/deepseek_v4/compressor.py` +
+  `common/ops/fused_compress_quant_cache.py`.
+- `~/llama.cpp` — passes the needle test; `src/models/dflash.cpp`, indexer params
+  in `src/llama-arch.cpp:255–262`.
+- `archive/STATUS.md` §§5.1–5.19 — the full chain, for provenance only.
