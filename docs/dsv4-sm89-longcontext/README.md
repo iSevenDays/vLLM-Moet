@@ -5,10 +5,15 @@ investigation lives here, in the repo whose code it describes.
 
 | path | what it is |
 |------|------------|
-| **this file** | **The only current document. Read it end to end.** |
+| **this file** | **Knowledge**: system, what is established, what is eliminated and why. Read §0, §2, §4 first. |
+| [`PLAN.md`](PLAN.md) | **Execution**: ordered task queue T1–T8 with exact commands, expected output and decision tables. **If you are here to do work, start there.** |
 | [`runlogs/`](runlogs/) | Raw artifacts. [`ALL_NEEDLE_RESULTS.csv`](runlogs/ALL_NEEDLE_RESULTS.csv) = all 60 needle measurements, machine-readable. |
 | [`../../tools/README.md`](../../tools/README.md) | Test harnesses: what each proves, what it costs, how to run it. |
-| [`archive/`](archive/) | Superseded: `STATUS.md` (the §5.1–5.19 blow-by-blow, kept for provenance), `PLAN.md`, `BRIEFING.md`, `HANDOFF.md`. **Do not quote these** — they contain withdrawn claims. Consolidated into this file. |
+
+Nothing else. The former `STATUS.md` / `BRIEFING.md` / `HANDOFF.md` / archive are
+**deleted** — fully absorbed here. If you need the original §5.1–5.19 narrative
+for provenance: `git log --follow --all -- 'docs/dsv4-sm89-longcontext/*'` and
+`git show 3678f3b00:docs/dsv4-sm89-longcontext/archive/STATUS.md`.
 
 ---
 
@@ -90,12 +95,45 @@ yarn factor 16 / `original_max_position_embeddings 65536`.
 `compress_ratios` = 21 layers ratio 4, 20 ratio 128, 5 zeros; indexed
 `compress_ratios[layer_id]` (`overlay/.../deepseek_v4/attention.py:201`).
 
+### Serving state — throughput, prefill envelope, KV capacity
+
+These are settled and **not** part of the open problem; they are here so nobody
+re-measures them. All on the §1 production config.
+
+| gate | result |
+|---|---|
+| single warmed request, 256 tok | median **~62 decode tok/s** (target ≥40 — passes decisively); both GPUs 98–99 % util |
+| 3 × 256 concurrent, graph-18 | median **~33 tok/s/stream**, ~73 tok/s aggregate, 9/9 coherent, no assertion |
+| DSpark acceptance | ~36–37 % of proposed tokens |
+| first request after any restart | **always excluded** — it warms DSpark/Triton/Inductor caches and can launch `cc1plus`. It is a correctness gate, never a throughput sample |
+
+**Prefill envelope ≈ 64–80K tokens.** Fresh-boot sweep: 16K/32K/48K/64K all pass;
+80K OOMs **at the same `nvidia-smi` peak (48,508 MiB) where 64K passed**. So the
+constraint is not total memory — it is a specific deep-context allocation plus
+PyTorch cache fragmentation. The ceiling is therefore *allocator-state
+dependent*, not a clean function of prompt length: a dirty allocator (after
+several decode benchmarks) fails earlier than a fresh boot.
+
+**KV capacity (boot log, authoritative).** `pool=4836` packed blocks,
+`allocatable=4835` (one null block reserved), `max-request=1480`,
+`per-group=(1024,20,20,267,149)`, GPU KV cache 856,573 tokens, max concurrency
+**3.27×** at 262,144 tokens/request. The two compressor groups (267/149) are
+sized *per prefill chunk plus the sliding window*, which is what makes chunked
+prefill safe — see §4's capacity row.
+
+⚠️ **`--kv-cache-memory-bytes` BYPASSES `--gpu-memory-utilization`.** Boot log,
+verbatim: *"reserved 4.51 GiB … skipped memory profiling. This does not respect
+the gpu_memory_utilization config."* Lowering `UTIL` alone is a **no-op**;
+headroom must come from reducing `--kv-cache-memory-bytes` or
+`--max-num-batched-tokens`.
+
 ---
 
 ## 2. THE CORRECTION: the §5.19 rank trace measured the wrong column
 
-The archived `STATUS.md` §5.19 / `BRIEFING.md` §5 present an indexer rank trace
-as "the single most informative measurement". **It was pointed at filler prose.**
+The now-deleted `STATUS.md` §5.19 / `BRIEFING.md` §5 presented an indexer rank
+trace as "the single most informative measurement". **It was pointed at filler
+prose.** (Recoverable via git; see the file table above.)
 
 The trace ran with `VLLM_DSV4_INDEXER_TRACE_POS=4843`, taken from the probe's
 `needle_abs_pos_est = int(prompt_tokens × depth)` = `int(9686 × 0.5)`
@@ -260,7 +298,7 @@ it reproduces plainly, and more severely at depth 0.1 than 0.5.
 | indexer key-quant granularity | per-row(D=128) vs checkpoint's block-32: recall@512 within ~1 %, top entry never dislodged |
 | indexer RoPE | `attention.py:262` shares the attention rope; built with `compress_ratio` → `compress_rope_theta`, matching the reference |
 | per-token scalars | top-k is per query **row**, so `q_scale`/`softmax_scale`/`head_scale` are ranking-neutral by construction |
-| `sqrtsoftplus`, `noaux_tc`, `num_hash_layers`, `hc_*` | **all implemented and matching the checkpoint** — `fused_topk_bias_router.py:243`, `nvidia/model.py:599`, `:584`/`:716` (raises rather than degrading), Sinkhorn HC at `:866–979`. Also **mis-scoped**: the first two govern MoE expert routing, `hc_*` governs residual mixing; neither touches `index_score`. Remaining gap: the CUDA kernels are unverified numerically (task V4). |
+| `sqrtsoftplus`, `noaux_tc`, `num_hash_layers`, `hc_*` | **all implemented and matching the checkpoint** — `overlay/.../fused_moe/router/fused_topk_bias_router.py:243`, `overlay/.../deepseek_v4/nvidia/model.py:599`, `overlay/.../nvidia/model.py:584`/`:716` (raises rather than degrading), Sinkhorn HC at `:866–979`. Also **mis-scoped**: the first two govern MoE expert routing, `hc_*` governs residual mixing; neither touches `index_score`. Remaining gap: the CUDA kernels are unverified numerically (task V4). |
 
 ### Retracted interpretations — do not revive without reading why
 
@@ -320,6 +358,11 @@ eliminated — llama.cpp may be running an easier probe.
 ---
 
 ## 6. Verification queue — cheapest first
+
+> **Superseded by [`PLAN.md`](PLAN.md)**, which specifies each of these as an
+> executable task (T1–T8) with exact commands, expected output and decision
+> tables. The summaries below are kept for rationale; **follow PLAN.md for the
+> order and the mechanics.**
 
 **V0 — Measurement hygiene. Do this before any new sweep.** *(CPU, ~30 min)*
 Otherwise every future position claim inherits the §2 error.
@@ -448,4 +491,3 @@ mounts through `EXTRA_DOCKER_ENV`, which is spliced raw into `docker run`.
   `common/ops/fused_compress_quant_cache.py`.
 - `~/llama.cpp` — passes the needle test; `src/models/dflash.cpp`, indexer params
   in `src/llama-arch.cpp:255–262`.
-- `archive/STATUS.md` §§5.1–5.19 — the full chain, for provenance only.
