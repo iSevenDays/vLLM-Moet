@@ -1,0 +1,8 @@
+filler blob = 246,944 bytes from 6 files
+L=  3072 d=0.5 ask    pt=2864   PASS word=True  digits=True  (56s) true=TUNDRA-3711 ans='TUNDRA-3711'
+L=  5120 d=0.5 ask    pt=5100   PASS word=True  digits=True  (88s) true=FALCON-1042 ans='FALCON-1042'
+L=  6144 d=0.5 ask    pt=6650   PASS word=True  digits=True  (117s) true=PUMICE-7544 ans='PUMICE-7544'
+L=  7168 d=0.5 ask    pt=8316   PASS word=True  digits=True  (148s) true=SAFFRON-7888 ans='SAFFRON-7888'
+L=  7936 d=0.5 ask    pt=9376   PASS word=True  digits=True  (164s) true=CYPRESS-0074 ans='CYPRESS-0074'
+L=  8192 d=0.5 ask    pt=9686   PASS word=True  digits=True  (172s) true=PELICAN-1605 ans='PELICAN-1605'
+wrote /root/ktransformers/runlogs/needle_topk2048_20260801T141215Z.json

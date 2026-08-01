@@ -1,0 +1,4 @@
+filler blob = 246,944 bytes from 6 files
+L= 12288 d=0.5 ask    pt=13988  PASS word=True  digits=True  (249s) true=LANTERN-7358 ans='LANTERN-7358'
+L= 16384 d=0.5 ask    pt=18559  PASS word=True  digits=True  (328s) true=PELICAN-3738 ans='PELICAN-3738'
+L= 32768 d=0.5 ask    pt=35825  FAIL word=False digits=False (657s) true=CYPRESS-0527 ans='CYBERTRON'

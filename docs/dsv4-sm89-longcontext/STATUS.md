@@ -678,6 +678,112 @@ geometries). Run against the chunk-528 / topk-512 row above as a clean
 single-variable baseline. Artifacts: `docs/dsv4-sm89-longcontext/runlogs/needle_chunk528_*.json`,
 `docs/dsv4-sm89-longcontext/runlogs/needle_topk2048_*.json`.
 
+### 5.15 ROOT CAUSE + FIX: `index_topk=512` selection is too marginal on sm89
+
+Raising `index_topk` 512 → 2048 (`--hf-overrides '{"index_topk":2048}'`, chunk
+528, everything else identical) turns the whole battery green:
+
+| actual pt | topk512/chunk1056 | topk512/chunk528 | **topk2048/chunk528** | true code |
+|----------:|-------------------|------------------|-----------------------|-----------|
+| 2864 | PASS | PASS | **PASS** | TUNDRA-3711 |
+| 5100 | FAIL `FALCON` | FAIL `FALCON` | **PASS `FALCON-1042`** | FALCON-1042 |
+| 6650 | FAIL `7541` | PASS | **PASS `PUMICE-7544`** | PUMICE-7544 |
+| 8316 | PASS | FAIL `1206` | **PASS `SAFFRON-7888`** | SAFFRON-7888 |
+| 9376 | FAIL `0120` | FAIL `CYAN-42` | **PASS `CYPRESS-0074`** | CYPRESS-0074 |
+| 9686 | FAIL `1234` | FAIL `1234` | **PASS `PELICAN-1605`** | PELICAN-1605 |
+
+**2/6 → 6/6, all digits exact**, including pt 9686 which failed under every
+previous configuration. This is the first change that converts failures into
+passes, and it confirms §5.14's mechanism: top-512 selection over the ratio-4
+compressed entries was operating near ties, so the digit-bearing entry
+frequently fell outside the selected set. It also explains every earlier
+observation — the word survived because the 20 ratio-128 layers see the whole
+context and never select; digits were lost non-monotonically because whether a
+given needle's entry makes the cut depends on the specific score distribution;
+and better *storage* precision (§5.11 INT8) could not help because the entry was
+never attended in the first place.
+
+Caveats to settle before treating this as shipped:
+- The checkpoint config specifies `index_topk: 512`, so 2048 **deviates from the
+  trained setting**. It attends to a superset of what the model expects, which is
+  usually neutral-to-slightly-negative rather than harmful, but it MUST be
+  validated on a real quality benchmark (GSM8K / GPQA, as upstream's recipes do)
+  before shipping. Do not assume needle-green means quality-neutral.
+- Why 512 suffices upstream (needle @121K on Blackwell) but not here is still
+  open. The likely reason is that the sm89 indexer *scores* differ slightly from
+  the native path (ragged logits go through a torch fallback, paged through a
+  Triton port; both match their references, but a marginal top-512 is sensitive
+  to any difference). Confirming that would need the score-rank trace.
+- Cost: 4× the selected entries → more attention compute and KV read bandwidth.
+  Measured prefill wall-time at these lengths was not materially worse
+  (172 s at pt 9686 vs 182 s for topk512/chunk528), but this needs proper
+  measurement at 100K+.
+- Tested at `BATCHED_TOKENS=528`, one run, depth 0.5. Confirm at the production
+  1056 and across depths/lengths.
+
+**Where it stops working, and what that proves.** Extending the same server to
+longer contexts finds the ceiling, and one variable explains every result:
+**selection coverage** = `index_topk / (prompt_tokens / 4)` (ratio-4 layers).
+
+| index_topk | prompt tokens | candidates | coverage | result |
+|-----------:|--------------:|-----------:|---------:|:------:|
+| 512  | 2864  | 716  | 72%  | PASS |
+| 512  | 5100  | 1275 | 40%  | FAIL |
+| 512  | 6650 / 8316 | 1662 / 2079 | 31% / 25% | **chunk-dependent coin-flip** |
+| 512  | 9686  | 2422 | 21%  | FAIL |
+| 2048 | 9686  | 2422 | 85%  | PASS |
+| 2048 | 13988 | 3497 | 59%  | PASS |
+| 2048 | 18559 | 4640 | 44%  | PASS |
+| 2048 | 35825 | 8956 | 23%  | **FAIL** (`CYBERTRON`; word lost too) |
+
+PASS while coverage ≳44%, FAIL at ≤40%, coin-flip in between — which is exactly
+the §5.14 "noise floor" seen from the other side. As a rule of thumb:
+**reliable context ≈ 10 × index_topk** (512 → ~5K, 2048 → ~20K; observed
+boundaries 5100 and 35825 straddle both predictions).
+
+**This is the important number.** Upstream passes `needle @121k` with
+`index_topk=512`, i.e. coverage **512 / (121000/4) = 1.7%**. We need **~44%**.
+That is a **~26× gap in indexer RANKING quality** between this sm89 port and the
+native path — not a marginal difference, a substantive defect that simply never
+manifests as a crash or a reference mismatch.
+
+Two consequences:
+1. **`index_topk` is NOT a path to 262K.** The rule demands ~26,000, i.e. ~40%
+   of all 65,536 ratio-4 entries — nearly dense attention, defeating the sparse
+   design and unaffordable in compute/bandwidth. Treat 2048 as a *diagnostic*
+   and as a usable mitigation for contexts up to ~20K, nothing more.
+2. **The real fix is the sm89 indexer's score quality.** Everything downstream of
+   the scores is verified (top-k kernel selects correctly by score; the ragged
+   torch fallback matches the checkpoint formula; the paged Triton port passes its
+   suite). So the defect is in the scores themselves, or their inputs.
+
+Suspects for the score gap, in order, with the cheap check for each:
+- **Indexer RoPE** — ELIMINATED: `attention.py:262` sets
+  `self.indexer_rotary_emb = self.rotary_emb`, and that rope is built with
+  `compress_ratio` (so `compress_rope_theta`), matching the reference's
+  `self.indexer.freqs_cis = self.freqs_cis`.
+- **Per-head `indexer_weights`** — the only remaining per-key-ranking-relevant
+  input besides `k_scale`. Check the head-scale/softmax-scale folding in
+  `fused_indexer_q_rope_quant` (`weights_out = weights * q_scale * softmax_scale
+  * head_scale`) against the reference's
+  `(index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)`.
+- **`k_scale` per compressed entry** — a per-key scale error DOES change ranking
+  (unlike per-token scalars). Verify the indexer K cache's UE8M0 scale write/read
+  round-trip end-to-end, not just within one reference.
+- **FP8 quantization of the indexer q/k** — the reference *simulates* FP4 for the
+  indexer (`fp4_act_quant(q, fp4_block_size, True)`), we use an FP8 indexer
+  cache. Different noise, and it is the one place the reference deliberately
+  lowers precision; worth confirming the intended scheme matches.
+
+Highest-value observability next: dump, for one request and one ratio-4 layer,
+the score RANK of the compressed entry holding a known needle position. That
+turns "ranking quality is ~26× worse" from an inference into a direct
+measurement, and it is the fastest way to discriminate the suspects above.
+
+Artifacts: `docs/dsv4-sm89-longcontext/runlogs/needle_topk2048_*.json`
+(the 48K point was still in flight at write time; the coverage rule predicts
+FAIL at ~15%).
+
 ## 6. KV capacity: runtime fits three full contexts; printed metrics were wrong
 
 - Startup reported 912,691 tokens/3.482x; `/metrics` reported

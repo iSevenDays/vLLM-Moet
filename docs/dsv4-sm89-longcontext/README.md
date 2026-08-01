@@ -29,24 +29,49 @@ reports `word_present` / `digits_present` separately — the old
 `bench/runner/probes.py --probe needle_sweep` metric collapses both into one
 bit and is what produced the misdiagnosis.
 
-## Current understanding (2026-08-01)
+## Root cause found (2026-08-01): `index_topk=512` selection is too marginal
 
-Digit fidelity sits at a **numerical noise floor**, not behind a discrete defect:
+`--hf-overrides '{"index_topk":2048}'` takes the needle battery from **2/6 to
+6/6, all digits exact**, including the pt 9686 case that failed under every
+other configuration (STATUS §5.15).
 
-- Halving `--max-num-batched-tokens` (1056 → 528) keeps the score at 2/6 but
-  flips **a different 2** — two cases move in *opposite* directions
-  (STATUS §5.14). A systematic bug degrades consistently; this reshuffles.
-- The failure is deterministic per input (bit-identical on repeat), yet
-  **non-monotonic in length** (pt 8316 passes while 5100 and 6650 fail).
-- Errors are **near-misses** once redundancy or salience is added (`1606` for
-  `1605`, `7542` for `7544`) but fall back to the generic prior `1234` on the
-  plain task.
-- The word always survives because the 20 `compress_ratio=128` layers see the
-  whole context (~75 entries at 9.7K, far below `index_topk`, so no selection
-  happens there at all).
+Top-512 selection over the ratio-4 compressed entries was operating near ties,
+so the digit-bearing entry frequently fell outside the selected set. That
+explains every earlier observation:
 
-Leading quantity: **which ratio-4 compressed entries get selected**. Raising
-`index_topk` is the active experiment (STATUS §5.14).
+- the **word** always survived — the 20 `compress_ratio=128` layers see the whole
+  context (~75 entries at 9.7K, far below `index_topk`) and never select at all;
+- digits failed **non-monotonically** in length and were deterministic per input
+  — whether a given needle's entry makes the cut depends on its score
+  distribution, not on length;
+- halving `--max-num-batched-tokens` reshuffled *which* cases passed without
+  changing the count (2/6 either way, a different 2) — a marginal selection is
+  perturbed by any numerically-transparent change (STATUS §5.14);
+- better **storage** precision could not help (`VLLM_DSV4_KV_INT8=1`: 6/6
+  identical) because the entry was never attended in the first place.
+
+### …but `index_topk` is a diagnostic, not the fix
+
+Extending to longer contexts finds the ceiling, and one variable explains every
+result: **selection coverage** = `index_topk / (prompt_tokens / 4)`. PASS while
+coverage ≳44%, FAIL at ≤40%, coin-flip between. Rule of thumb: **reliable
+context ≈ 10 × index_topk** (512 → ~5K, 2048 → ~20K; 35825 tokens at topk 2048
+= 23% coverage, and it FAILS).
+
+**The important number:** upstream passes `needle @121k` with `index_topk=512` —
+coverage **1.7%**. We need **~44%**. That is a **~26× gap in indexer ranking
+quality** versus the native path: a substantive defect that never surfaces as a
+crash or a reference mismatch.
+
+So:
+- `index_topk=2048` is a usable mitigation **up to ~20K context** and must still
+  be quality-validated (GSM8K/GPQA) since it deviates from the trained 512.
+- It **cannot** reach 262K — that needs ~26,000, i.e. ~40% of all entries, which
+  is nearly dense attention and defeats the sparse design.
+- **The real fix is the sm89 indexer's score quality.** Everything downstream is
+  verified, so the defect is in the scores or their inputs. Indexer RoPE is
+  already eliminated; remaining suspects and their cheap checks are in
+  STATUS §5.15.
 
 ## Eliminated — do not re-litigate (each by measurement, not argument)
 
