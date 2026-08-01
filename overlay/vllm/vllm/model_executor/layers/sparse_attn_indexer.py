@@ -63,23 +63,70 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 #   VLLM_DSV4_INDEXER_TRACE_MIN_N=<n> only trace rows with >= n candidates, so
 #                                    only the final prefill chunk (whose query
 #                                    is the real question) reports
-#   VLLM_DSV4_INDEXER_TRACE_MAX=<n>  cap emissions (default 24)
+#   VLLM_DSV4_INDEXER_TRACE_MAX=<n>  cap PREFILL emissions (default 24)
+#   VLLM_DSV4_INDEXER_TRACE_SPAN=<n> +-column window swept on the ratio-4 column
+#                                    (default 2; the exact column is 967-968)
+#   VLLM_DSV4_INDEXER_TRACE_DECODE_MAX=<n> cap DECODE emissions (default 96);
+#                                    decode fires every layer x step, own cap
 #
-# Columns of `logits` index the indexer's COMPRESSED K cache, so the needle's
-# entry is `pos // compress_ratio`. This free function does not know the layer's
-# ratio, so both candidate columns are reported (ratio 4 and ratio 128); read
-# the one matching the layer. Costs a host sync -- diagnostic runs only.
+# Each line is labeled by LAYER (the resolved k_cache_prefix) and emitted from
+# TP rank 0 ONLY (both ranks run the indexer, so without the gate every line is
+# doubled). DECODE rows are traced too (selection during generation was never
+# observable before); the `sel` flag is the robust signal. Columns of `logits`
+# index the indexer's COMPRESSED K cache, so the needle's entry is
+# `pos // compress_ratio`; ratio 4 and 128 columns are both reported (read the
+# one matching the layer). Costs a host sync -- diagnostic runs only.
 _IX_TRACE = os.getenv("VLLM_DSV4_INDEXER_TRACE", "0") == "1"
 _IX_TRACE_POS = int(os.getenv("VLLM_DSV4_INDEXER_TRACE_POS", "-1"))
 _IX_TRACE_MIN_N = int(os.getenv("VLLM_DSV4_INDEXER_TRACE_MIN_N", "0"))
 _IX_TRACE_MAX = int(os.getenv("VLLM_DSV4_INDEXER_TRACE_MAX", "24"))
+# Report a +-span window of ratio-4 columns: the exact column is 967-968
+# depending on tokenization (README sec 2), so a single column can miss it.
+_IX_TRACE_SPAN = int(os.getenv("VLLM_DSV4_INDEXER_TRACE_SPAN", "2"))
+# Decode trace fires every (layer x decode step), so it has its OWN cap to keep
+# it from exhausting the prefill cap in <1 step. On whenever VLLM_DSV4_INDEXER_TRACE=1.
+_IX_TRACE_DECODE_MAX = int(os.getenv("VLLM_DSV4_INDEXER_TRACE_DECODE_MAX", "96"))
 _ix_trace_emitted = 0
+_ix_decode_trace_emitted = 0
 
 
-def _trace_indexer_rank(logits, topk_indices, cu_seqlen_ks, cu_seqlen_ke, k):
-    """Report the score rank of the needle's compressed entry. Opt-in only."""
+def _ix_tp_rank0():
+    """True iff this is TP rank 0 (or the rank is undeterminable). Both ranks
+    run the indexer, so without this every trace line is emitted twice."""
+    try:
+        from vllm.distributed import get_tensor_model_parallel_rank
+        return get_tensor_model_parallel_rank() == 0
+    except Exception:
+        return True  # uninitialized / TP=1 -> do not suppress
+
+
+def _ix_rank_parts(valid, ks, sel, gcol, n, ratio, span):
+    """One ratio's trace string. ``valid`` is the [ks,ke) score slice (prefill)
+    or the [:n] slice (decode); ``gcol`` is the GLOBAL compressed-entry column
+    (pos//ratio); ``sel`` is the set of selected GLOBAL columns. For ratio 4,
+    sweep gcol-span..gcol+span (the exact column is +-1 ambiguous). The
+    ``sel`` membership is the robust signal -- it is independent of the
+    score/rank denominator."""
+    gcols = range(gcol - span, gcol + span + 1) if ratio == 4 else (gcol,)
+    out = []
+    for gc in gcols:
+        lc = gc - ks  # local index into valid
+        if not (0 <= lc < n):
+            out.append(f"c{gc}(oor)")
+            continue
+        score = valid[lc].item()
+        rank = int((valid > valid[lc]).sum().item())  # 0 == highest score
+        out.append(f"c{gc} s={score:.3f} rk={rank}/{n} sel={int(gc in sel)}")
+    return f"r{ratio}[" + " ".join(out) + "]"
+
+
+def _trace_indexer_rank(logits, topk_indices, cu_seqlen_ks, cu_seqlen_ke,
+                        k, layer):
+    """Report the needle's compressed-entry rank during PREFILL. Labeled by
+    layer; TP-rank-0 only; +-span window on the ratio-4 column. Opt-in only."""
     global _ix_trace_emitted
-    if _ix_trace_emitted >= _IX_TRACE_MAX or _IX_TRACE_POS < 0:
+    if (not _IX_TRACE) or _ix_trace_emitted >= _IX_TRACE_MAX \
+            or _IX_TRACE_POS < 0 or not _ix_tp_rank0():
         return
     try:
         row = logits.shape[0] - 1  # last query row of the chunk
@@ -90,25 +137,60 @@ def _trace_indexer_rank(logits, topk_indices, cu_seqlen_ks, cu_seqlen_ke, k):
             return
         valid = logits[row, ks:ke].float()
         sel = set(int(x) for x in topk_indices[row].tolist() if x >= 0)
-        parts = []
-        for ratio in (4, 128):
-            col = _IX_TRACE_POS // ratio
-            if not (ks <= col < ke):
-                parts.append(f"r{ratio}:col={col}(out-of-range)")
-                continue
-            score = valid[col - ks]
-            # rank 0 == highest scoring; strictly-greater count
-            rank = int((valid > score).sum().item())
-            parts.append(
-                f"r{ratio}:col={col} score={score.item():.4f} rank={rank}/{n} "
-                f"pct={rank / max(1, n):.1%} selected={col in sel}")
+        parts = [
+            _ix_rank_parts(valid, ks, sel, _IX_TRACE_POS // 4, n, 4,
+                           _IX_TRACE_SPAN),
+            _ix_rank_parts(valid, ks, sel, _IX_TRACE_POS // 128, n, 128, 0),
+        ]
         _ix_trace_emitted += 1
         logger.info(
-            "DSv4 indexer rank trace [%d/%d]: row=%d candidates=%d k=%d "
-            "needle_pos=%d | %s", _ix_trace_emitted, _IX_TRACE_MAX, row, n, k,
-            _IX_TRACE_POS, "  ".join(parts))
+            "DSv4 indexer rank trace [%d/%d] PREFILL layer=%s row=%d "
+            "cands=%d k=%d needle_pos=%d | %s", _ix_trace_emitted,
+            _IX_TRACE_MAX, layer, row, n, k, _IX_TRACE_POS,
+            "  ".join(parts))
     except Exception as e:  # never let a diagnostic break serving
         logger.warning("DSv4 indexer rank trace failed: %s: %s",
+                       type(e).__name__, e)
+
+
+def _trace_indexer_rank_decode(logits, topk_indices, seq_lens, k_select, layer):
+    """Report the needle's compressed-entry rank during DECODE.
+
+    Decode ``logits`` are shaped ``[num_padded_tokens, max_seq_len]`` with NO
+    ``cu_seqlen_ks``/``ke``; ``seq_lens`` (2D ``(B, next_n)``) gives the per-row
+    valid range, so the prefill helper does not fit and this is separate. The
+    generating token's selection has never been observed and the symptom is a
+    generation failure. The ``sel`` flag is the headline signal; rank/score are
+    secondary (the score denominator convention aside). +-span on ratio 4,
+    TP-rank-0 only, own cap.
+    """
+    global _ix_decode_trace_emitted
+    if (not _IX_TRACE) or _ix_decode_trace_emitted >= _IX_TRACE_DECODE_MAX \
+            or _IX_TRACE_POS < 0 or not _ix_tp_rank0():
+        return
+    try:
+        sl = seq_lens.reshape(-1)  # 2D (B, next_n) -> per-row, row-major
+        num_rows = logits.shape[0]
+        gc4 = _IX_TRACE_POS // 4
+        # first row whose request is long enough to contain the needle column
+        row = next((i for i in range(num_rows) if int(sl[i]) > gc4), 0)
+        n = int(sl[row].item())  # valid candidates = [0, n)
+        if n < _IX_TRACE_MIN_N or n <= 0:
+            return
+        valid = logits[row, :n].float()
+        sel = set(int(x) for x in topk_indices[row].tolist() if x >= 0)
+        parts = [
+            _ix_rank_parts(valid, 0, sel, gc4, n, 4, _IX_TRACE_SPAN),
+            _ix_rank_parts(valid, 0, sel, _IX_TRACE_POS // 128, n, 128, 0),
+        ]
+        _ix_decode_trace_emitted += 1
+        logger.info(
+            "DSv4 indexer rank trace [%d/%d] DECODE layer=%s row=%d "
+            "seq_len=%d k=%d needle_pos=%d | %s", _ix_decode_trace_emitted,
+            _IX_TRACE_DECODE_MAX, layer, row, n, k_select, _IX_TRACE_POS,
+            "  ".join(parts))
+    except Exception as e:  # never let a diagnostic break serving
+        logger.warning("DSv4 indexer decode trace failed: %s: %s",
                        type(e).__name__, e)
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
@@ -662,7 +744,7 @@ def sparse_attn_indexer(
                 )
                 if _IX_TRACE:
                     _trace_indexer_rank(logits, topk_indices, cu_seqlen_ks,
-                                        cu_seqlen_ke, topk_tokens)
+                                        cu_seqlen_ke, topk_tokens, k_cache_prefix)
 
             _merge_dcp_topk_global(
                 logits,
@@ -826,6 +908,10 @@ def sparse_attn_indexer(
                 logits.stride(1),
                 k_select,
             )
+
+        if _IX_TRACE:
+            _trace_indexer_rank_decode(logits, topk_indices, seq_lens,
+                                       k_select, k_cache_prefix)
 
         if dcp_local_quota:
             # Quota tail is dead space for this step; keep the -1 padding
