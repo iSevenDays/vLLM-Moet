@@ -336,6 +336,8 @@ BUILD=$(docker exec "$NAME" cat /opt/moet-checks/SOURCE.txt 2>/dev/null | grep -
 echo "started $NAME (sm_89, gpus=${GPUS} tp=${TP} residency=${RESIDENCY}, memcap=${MEM_GB}g, ready-timeout=${READY_TIMEOUT_S}s, port ${PORT}, network=$NETWORK, restart=$RESTART, max-model-len=$MAXLEN, util=$UTIL, batched=$BATCHED_TOKENS, seqs=$NUM_SEQS, speculative=${SPECULATIVE_CONFIG:-mtp:$MTP_TOKENS}, prefix-cache=$PREFIX_CACHING, scale-refit=$SCALE_REFIT, sm89-native=${SM89_NATIVE:-default-on}, graphs=[$CUDAGRAPH_SIZES], breakable-cudagraph=$BREAKABLE_CUDAGRAPH, quality-prefill=$QUALITY_PREFILL)"
 if [ "$RESIDENCY" = gpu ]; then
   echo "  residency=gpu: 2-bit base GPU-RESIDENT (BASE_CACHE_GB=0), sharded across ${TP} rank(s); no host pack/arena. FORCE_RESIDENT=${FORCE_RESIDENT} (1 = bypass the boot-guard VRAM-budget refusal on >=48 GiB cards). Watch for: 'moe_w2 planes: ... GPU-RESIDENT' and ~37 GiB/card VRAM."
+elif [ "$RESIDENCY" = exact ]; then
+  echo "  residency=exact: checkpoint FP4 cache ${EXACT_GB} GiB/rank + arena ${ARENA_GB} GiB/rank + w8x pack ${STORE}->/packs; native FP8 MMA for prefill/decode, strict miss replay."
 else
   echo "  residency=host: base-cache ${BASE_GB} GiB/rank + arena ${ARENA_GB} GiB/rank + pack ${STORE}->/packs."
 fi
