@@ -430,6 +430,6 @@ After **every** task:
 | T3 make trace usable | DONE | trace now: labeled by LAYER (k_cache_prefix), TP-rank-0 only (was doubled), DECODE branch added after persistent_topk/top_k_per_row_decode (own cap `..._DECODE_MAX`), and `..._TRACE_SPAN` (default 2) sweeps ±ratio-4 columns. ast.parse + patches verify 85/85 + check 85/85. No boot. The `sel` flag is the robust headline signal. → unblocks T4. |
 | T4 retrace correct column (decisive) | TODO | |
 | T5 cross-chunk compressor (H3) | TODO | |
-| T6 llama.cpp confounds | TODO | |
+| T6 llama.cpp confounds | DONE (item 2 deferred) | **llama.cpp pass was on the OLD checkpoint** (GGUF `compress_ratios`=44, no dspark keys, Jul 15) NOT 0731 → not like-for-like; "port defect" prior downgraded, H5 regains weight. `local_blocks` ABSENT in GGUF (T2 confirmed on metadata). Command recorded (ngram-mod spec, q8_0 KV); item 2 (re-run on 0731 GGUF) deferred (needs GPU). → runlogs/T6_llamacpp_confounds.md |
 | T7 upstream recipe (H4) | TODO | |
 | T8 CUDA routing kernels | TODO | |

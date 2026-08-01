@@ -279,12 +279,16 @@ positions 0-4 in BOTH cases: all ~ -0.000
 ### 3d. Reference points
 
 **llama.cpp passes the needle test on this same hardware** (operator-verified
-2026-08-01). This is the like-for-like reference previously thought unavailable,
-and it shifts the prior from "architectural limit of `index_topk=512`" toward
-**port defect**. Three confounds to close first (all cheap — task V6):
-1. **Which weights.** Shell history shows
-   `/root/antirez/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf`.
-   Confirm it was converted from **0731**, not the superseded checkpoint.
+2026-08-01) — **but on the OLD (superseded) checkpoint, not 0731; NOT
+like-for-like** (T6, 2026-08-01). So the prior shift this datum motivated
+("architectural limit of `index_topk=512`" → "port defect") is **not warranted**;
+the sm_89-port-suspicion stories lose their strongest support. Original confounds
+(now partly resolved):
+1. **Which weights — RESOLVED (old checkpoint).** The GGUF llama.cpp used has
+   `compress_ratios` length **44** and **no dspark keys** = the OLD checkpoint
+   (0731 is 46 + dspark; file dated Jul 15, pre-0731). The 0731-derived
+   `DeepSeek-V4-Flash-DSpark-support.gguf` (5.99 GB, has `dspark.*`) was **not**
+   used. Not like-for-like. (T6; `local_blocks` also absent → T2 confirmed.)
 2. **Which probe / length / depth.** 8K random-word depth 0.1 and 10.8K
    realistic-filler depth 0.5 are different claims. Record pt, filler, depth, reply.
 3. **Which quantization.** That GGUF is IQ2-XXS experts + Q8 projections; ours is
@@ -377,10 +381,11 @@ launch differs on chunk, speculation method/width, ctx and util (§3d); the sm_8
 attribution holds none of them fixed. *Falsifier:* V5, one boot.
 
 **H5 — `index_topk=512` is genuinely marginal for this task on any hardware.**
-Weakened by llama.cpp passing and by §2 (its direct evidence evaporated), not
-eliminated — llama.cpp may be running an easier probe.
-*Falsifier:* V1 showing the digit column comfortably inside the cut on a
-*failing* request; or the V6 confounds closing cleanly.
+§2 evaporated its direct evidence; the llama.cpp "pass" that further weakened it
+is now **discounted** (T6: it ran on the OLD checkpoint, not 0731). So H5
+**regains weight** — until a 0731 like-for-like reference passes, marginal
+top-k coverage remains a live explanation. *Falsifier:* T4 showing the digit
+column comfortably inside the k=512 cut on a *failing* `ask`.
 
 ---
 
