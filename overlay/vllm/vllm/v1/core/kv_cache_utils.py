@@ -916,24 +916,36 @@ def is_kv_cache_spec_uniform(kv_cache_spec: dict[str, KVCacheSpec]) -> bool:
     return True
 
 
+def get_num_blocks_per_request_for_kv_cache_config(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> list[int]:
+    """Return the peak block-ID demand for each packed KV cache group.
+
+    One runtime block ID addresses one page from every group.  Therefore page
+    byte sizes cancel: capacity is the shared block pool divided by the sum of
+    each group's maximum page count.  This also remains invariant when a
+    worker-side ``UniformTypeKVCacheSpecs`` wrapper is unwrapped for the
+    scheduler.
+    """
+    return [
+        cdiv(
+            group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+            group.kv_cache_spec.page_size_bytes,
+        )
+        for group in kv_cache_config.kv_cache_groups
+    ]
+
+
 def get_max_concurrency_for_kv_cache_config(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> float:
     """
     Get the maximum concurrency for the given KV cache configuration.
     """
-    num_layer_per_group = max(
-        len(group.layer_names) for group in kv_cache_config.kv_cache_groups
+    blocks_per_group = get_num_blocks_per_request_for_kv_cache_config(
+        vllm_config, kv_cache_config
     )
-    max_memory_usage_per_request = num_layer_per_group * max_memory_usage_bytes(
-        vllm_config, (group.kv_cache_spec for group in kv_cache_config.kv_cache_groups)
-    )
-    memory_per_block = (
-        kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
-        * num_layer_per_group
-    )
-    num_block_per_request = cdiv(max_memory_usage_per_request, memory_per_block)
-    max_concurrency = kv_cache_config.num_blocks / num_block_per_request
+    max_concurrency = kv_cache_config.num_blocks / sum(blocks_per_group)
     return max_concurrency
 
 
@@ -2118,6 +2130,18 @@ def get_kv_cache_configs(
             # handles hybrid layouts correctly.
             num_tokens, max_concurrency = get_kv_cache_capacity(
                 vllm_config, kv_cache_config
+            )
+
+            blocks_per_group = get_num_blocks_per_request_for_kv_cache_config(
+                vllm_config, kv_cache_config
+            )
+            logger.info_once(
+                "GPU KV packed blocks: pool=%d, allocatable=%d "
+                "(one null block reserved), max-request=%d, per-group=%s",
+                kv_cache_config.num_blocks,
+                max(kv_cache_config.num_blocks - 1, 0),
+                sum(blocks_per_group),
+                blocks_per_group,
             )
 
             logger.info_once("GPU KV cache size: %s tokens", f"{num_tokens:,}")

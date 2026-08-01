@@ -148,6 +148,17 @@ _POOL_HEAT_DIR = (os.getenv("VLLM_MOE_W2_POOL_HEAT_DIR")
 _POOL_HEAT_FILL = min(max(
     float(os.getenv("VLLM_MOE_W2_POOL_HEAT_FILL", "0.9")), 0.0), 1.0)
 _POOL_HEAT_VERSION = "pool-heat-v1"
+_POOL_HEAT_TAGS = frozenset(("base", "w8x"))
+
+
+def _pool_heat_enabled_for(tag: str) -> bool:
+    """Return whether *tag* participates in persistent GPU-pool heat.
+
+    Keep the read and periodic-dump predicates identical.  Exact residency
+    uses the ``w8x`` tag; accepting its heat file at startup without ever
+    writing one made every exact restart converge from an empty pool.
+    """
+    return bool(_POOL_HEAT and _POOL_HEAT_DIR and tag in _POOL_HEAT_TAGS)
 
 # ---- lazy-promotion hysteresis (colibri's REPIN anti-ping-pong) ----------
 # When the pool is FULL, a lazy background promotion evicts the least-
@@ -453,7 +464,7 @@ class DeltaTier:
         # Dumps stay blocked until the stash is consumed (or absent).
         self._heat_preloaded = False
         self._heat_pending: list | None = None
-        if _POOL_HEAT and _POOL_HEAT_DIR and tag in ("base", "w8x"):
+        if _pool_heat_enabled_for(tag):
             self._heat_pending = self._read_heat_file()
         # recency-decayed routing frequency per expert (drives the freq policy)
         self._freq = torch.zeros(n_layers, n_experts, dtype=torch.float32)
@@ -761,7 +772,7 @@ class DeltaTier:
             except Exception as e:  # noqa: BLE001 - prefetch is best-effort
                 logger.warning_once("moe_w2 PILOT tick failed: %s", e)
         # pool warm-start: periodic freq-ranked ownership dump (atomic)
-        if (_POOL_HEAT and self._tag == "base" and _POOL_HEAT_DIR
+        if (_pool_heat_enabled_for(self._tag)
                 and time.monotonic() - self._heat_last_dump_t
                 >= _POOL_HEAT_EVERY_S):
             self._heat_last_dump_t = time.monotonic()
