@@ -29,7 +29,24 @@ reports `word_present` / `digits_present` separately — the old
 `bench/runner/probes.py --probe needle_sweep` metric collapses both into one
 bit and is what produced the misdiagnosis.
 
-## Root cause found (2026-08-01): `index_topk=512` selection is too marginal
+## Current best understanding (2026-08-01)
+
+**Selection coverage is the operative variable, and what gets selected depends on
+QUERY CONTENT.** The needle's digits are always physically present and readable —
+asking "the four **digits** at the end" returns `1605` exactly from the same 8K
+prompt where "what is the code?" returns `1234`. The indexer scores are computed
+from the query, so a query naming the digits raises their compressed entry's
+score; a generic query favours the word's entry, and at marginal coverage the
+digit entry misses the top-k cut. `index_topk=2048` fixes the generic question by
+admitting 4× the candidates (STATUS §5.15, §5.18).
+
+Two hypotheses were raised and then **retracted by their own falsifiers** in this
+investigation — read §5.16 and §5.18 before reviving either:
+- a "~26× indexer ranking gap" (unsound: compared two different needle probes);
+- a decode-side / speculative-block-boundary story (killed by `digitspad`, which
+  puts the digits at answer position ~6 and still passes).
+
+## How the root cause was localized: `index_topk=512` is too marginal
 
 `--hf-overrides '{"index_topk":2048}'` takes the needle battery from **2/6 to
 6/6, all digits exact**, including the pt 9686 case that failed under every

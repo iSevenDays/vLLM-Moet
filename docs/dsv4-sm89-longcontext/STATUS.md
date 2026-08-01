@@ -937,6 +937,62 @@ its shadow. Cheap pre-checks that need no boot: `--variant digitsonly` at 12K/16
 sweep to find whether the breakpoint tracks `num_speculative_tokens` if that
 value is changed.
 
+### 5.18 RETRACTION of 5.17's decode-side framing: it is QUERY CONTENT, not position
+
+5.17 concluded the failure was decode-side (a multi-token copy truncating at the
+speculative block boundary, since `num_speculative_tokens=5` and the logprob
+collapse lands at answer position 5). The control designed to falsify that
+refutes it. Same prompt, same needle, pt ~9685, production config:
+
+| variant | digits at answer position | result |
+|---------|--------------------------:|:------:|
+| `digitsonly` | 0-1 | PASS `1605` |
+| **`digitspad`** (forced prefix "THE FINAL FOUR DIGITS ARE") | **~6** | **PASS `1605`** |
+| `ask` | 5-6 | FAIL `1234` |
+
+Digits at position ~6 come back exact. **Answer position is not the variable**, so
+the block-boundary story is dead and DSpark is not implicated by this evidence.
+
+What actually differs is **what the question asks for**:
+- `ask` — "What is the project access code?" -> the salient target is the CODE,
+  and the model must emit WORD then digits as one span.
+- `digitsonly` / `digitspad` — "the four **digits** at the end" -> the question
+  itself names the digits.
+
+The indexer scores are computed FROM THE QUERY. A query naming "four digits"
+raises the score of the digit-bearing compressed entries; a query naming "the
+project access code" favours the word-bearing entry. At marginal selection
+coverage the digit entry then misses the top-k cut — which is precisely why
+`index_topk=2048` fixes the plain question (§5.15): 4x the coverage selects the
+digit entry even when the query does not specifically target it.
+
+**Corrected synthesis, unifying §5.15 and §5.17:** selection coverage is the
+operative variable, and what is selected depends on QUERY CONTENT. The digits are
+always physically present and readable; whether they are *selected* depends on
+(a) how much of the candidate set the top-k admits, and (b) whether the query
+makes them salient. This is an architectural limitation of DSA at low coverage
+amplified by this port, not a decode bug and not a value-precision bug.
+
+**A blocked experiment worth recording.** The clean DSpark A/B (relaunch with
+`SPECULATIVE_CONFIG` omitted) cannot run on this build: it boots and serves
+`speculative_config=None`, but the first long request dies with
+
+    RuntimeError: moe_w2 exact cache failed to converge after 8 replay passes
+    (1 routed expert pairs still missing)
+
+Removing speculation changes the expert access pattern enough to trip the exact
+path's strict miss-replay guard. To A/B DSpark, vary `num_speculative_tokens`
+(keeping the method) rather than removing it, or raise the replay budget — never
+relax the strict guard, which exists so no output is emitted from a residual
+miss.
+
+**Process note for the next agent.** This section is the second retraction in
+one sitting (§5.16 withdrew a "26x" ratio, §5.18 withdraws the decode-side
+framing). Both were caught by controls built specifically to falsify the current
+hypothesis — `digitspad` exists only to kill §5.17. Keep doing that: on this
+system a plausible story fits the data far more often than it is true, and the
+cheap falsifier is always worth writing before the expensive confirmation.
+
 ## 6. KV capacity: runtime fits three full contexts; printed metrics were wrong
 
 - Startup reported 912,691 tokens/3.482x; `/metrics` reported

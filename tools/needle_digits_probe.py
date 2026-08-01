@@ -21,7 +21,10 @@ answer position, because the shape of the digit distribution is the diagnostic:
              => the model is READING the digits
     8K FAIL: emitted at -0.765 (p~0.47) over a diffuse spread of unrelated
              3-digit priors, true token ABSENT from the top-20
-             => the value is destroyed, not merely down-ranked
+             => at THIS answer position the value is unreadable. NOTE: it is
+             NOT globally unavailable -- see `digitsonly` below, which recovers
+             the same digits exactly from the same prompt. The loss depends on
+             the digits' POSITION IN THE ANSWER (STATUS 5.17).
 
 Question variants exist to separate retrieval from readback:
 
@@ -36,6 +39,13 @@ Question variants exist to separate retrieval from readback:
   repeat   the code appears 3x at spread-out depths -- if redundancy rescues it,
            the failure is SNR-limited, not structural.
   verbose  digits also written out ("one six zero five").
+  digitsonly / firstword  ask for one component only, so it lands at answer
+           position ~0. digitsonly returns 1605 EXACTLY on the same 8K prompt
+           where `ask` returns 1234 -- proof the information is present and the
+           failure is decode-side (STATUS 5.17).
+  digitspad  the same digits-only task with a forced multi-token prefix that
+           pushes them to answer position ~5+. Isolates ANSWER POSITION as the
+           only variable.
 
 Findings this probe produced (see PLAN.md 5.10): errors become NEAR-MISSES once
 redundancy or salience is added (1606 for 1605, 7542 for 7544, ZEPHYR-ORYX-CORYX
@@ -43,8 +53,10 @@ for ...-CYPRESS) while the plain task falls back to the generic prior 1234;
 results are deterministic per input (bit-identical on repeat) and NON-monotonic
 in length (pt 8316 passes while 5100 and 6650 fail).
 
-Filler is the same realistic repo text needle_sweep uses (random-word filler
-does NOT reproduce the failure). `--abs-pos` places the needle at an absolute
+Filler is the same realistic repo text needle_sweep uses. CAUTION: the repo
+elsewhere claims random-WORD filler "does not reproduce the failure" -- that is
+WRONG at >=10K tokens, where tools/needle_probe.py reproduces it plainly and
+more severely at depth 0.1 than 0.5 (STATUS 5.16). `--abs-pos` places the needle at an absolute
 token position instead of a depth fraction, which is how the "fixed position"
 and "fixed length" hypotheses were both refuted.
 
@@ -81,7 +93,7 @@ CODE_WORDS = [
 QUESTION = "What is the project access code? Reply with only the code."
 DIGIT_WORDS = "zero one two three four five six seven eight nine".split()
 VARIANTS = ("ask", "yesno", "yesno_neg", "spell", "words", "repeat", "verbose",
-            "digitsonly", "firstword")
+            "digitsonly", "firstword", "digitspad")
 
 
 def needle_code(L, run=0):
@@ -141,6 +153,17 @@ def build_spec(variant, L, run):
         return ([line], None,
                 "What are the four digits at the end of the project access "
                 "code? Reply with only those four digits.", digits, digits)
+    if variant == "digitspad":
+        # Identical retrieval task to `digitsonly`, but a forced multi-token
+        # prefix pushes the digits from answer position ~0 to ~5+. Everything
+        # else -- prompt, needle, depth, what must be recalled -- is unchanged,
+        # so a PASS->FAIL flip isolates ANSWER POSITION as the variable and
+        # implicates the decode path (e.g. the speculative block boundary)
+        # rather than anything in attention.
+        return ([line], None,
+                "Reply with exactly this and nothing else: "
+                "THE FINAL FOUR DIGITS ARE <the four digits at the end of the "
+                "project access code>", digits, digits)
     if variant == "firstword":
         return ([line], None,
                 "What is the word at the start of the project access code? "
