@@ -1,0 +1,20 @@
+diff --git a/vllm/models/deepseek_v4/common/ops/cache_utils.py b/vllm/models/deepseek_v4/common/ops/cache_utils.py
+index 55106d0..29415ba 100644
+--- a/vllm/models/deepseek_v4/common/ops/cache_utils.py
++++ b/vllm/models/deepseek_v4/common/ops/cache_utils.py
+@@ -400,7 +400,14 @@
+     ``current_platform.is_fp8_fnuz()`` for ``swa_k_cache`` (C++ encoder
+     writes FNUZ on gfx942 and OCP on gfx950).
+     """
+-    if has_cutedsl():
++    # has_cutedsl() only asks whether the `cutlass` PACKAGE imports — it says
++    # nothing about the device. DequantGatherKCacheKernel has no pre-SM90
++    # lowering: on Ada (sm_89) the CuTeDSL pipeline dies at
++    # `cute-to-nvvm{... cubin-chip=sm_89}` with an MLIR compile failure, so the
++    # unguarded dispatch is a hard crash on any path that reaches here. The
++    # Triton implementation below is arch-portable and numerically equivalent,
++    # so gate on capability as well as package availability.
++    if has_cutedsl() and current_platform.has_device_capability(90):
+         # lazily import, otherwise some tests fail due to CUDA driver init failure.
+         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
+             dequantize_and_gather_k_cache_cutedsl,
