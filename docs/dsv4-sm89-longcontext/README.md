@@ -55,6 +55,16 @@ tokenizer runs on CPU in seconds; that check would have caught the worst error
   Two stale `MODEL` defaults that pointed at it (`docker/serve_sm89_ds4.sh:142`,
   `start.sh:23`) were repointed to `-0731` before the delete, so nothing can
   resolve to a missing path.
+- **~1 TB reclaimed 2026-08-01** (403 GB → 1.4 TB free). Beyond the checkpoint:
+  its unreferenced conversions `-RAWINT4` / `-AMXINT4` / `-AMXINT4-NUMA1`
+  (388 GB, 0 mounts / 0 refs), and the dead cache tree
+  `moet-cache/{packs,planes,planes-qp}` (537 GB) — verifiably keyed to the
+  deleted checkpoint (`ckpt_id cc19494e…`, `n_layers 44`, lossy `base` tag, vs
+  the live exact `w8x` packs in `moet-cache-0731-exact`). **`moet-cache/jit` was
+  preserved** — it is the shared compiler cache mounted as `/root/.cache`.
+  Still present, 0 mounts, reclaim candidates if wanted: `moet-cache-0731`
+  (53 GB), `moet-cache-0731-host` (133 GB), `DeepSeek-V4-Flash-0731-AMXINT4`
+  (125 GB — AMXINT4 is a rejected direction, ~10 tok/s).
 - `vllm-moet-sm89:v0251` is the canonical living tag. Preserve baselines as
   suffixed tags; never default to a candidate tag.
 - **Never `--enforce-eager`** on this rig.

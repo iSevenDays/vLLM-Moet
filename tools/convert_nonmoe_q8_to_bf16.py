@@ -50,7 +50,7 @@ Usage:
     python3 tools/convert_nonmoe_q8_to_bf16.py \\
         --gguf /root/antirez/ds4/ds4flash.gguf \\
         --out  /root/models/DeepSeek-V4-Flash-IQ2/dsv4_nonmoe_bf16.safetensors \\
-        --model-dir /root/models/DeepSeek-V4-Flash
+        --model-dir /root/models/DeepSeek-V4-Flash-0731
 """
 
 from __future__ import annotations
