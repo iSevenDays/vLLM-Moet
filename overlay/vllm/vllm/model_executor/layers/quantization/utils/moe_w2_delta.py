@@ -1442,7 +1442,13 @@ class DeltaTier:
         this layer's in-flight experts as victims. Returns experts fetched."""
         if layer_key not in self._store:
             return 0
-        ids = ids.unique().long()
+        # Eager-only boundary. CUDA graphs use mark_seen directly, but
+        # speculative/padded eager rows can still carry -1 or E sentinels;
+        # neither may reach the host mirror index below.
+        ids = ids.reshape(-1).long()
+        ids = ids[(ids >= 0) & (ids < self.E)].unique()
+        if ids.numel() == 0:
+            return 0
         mark_seen(self.seen[layer_key], ids.to(self.dev))
         # snapshot seen (protects eviction) exactly like force_promote
         main = torch.cuda.current_stream(self.dev)

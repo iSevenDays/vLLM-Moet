@@ -255,6 +255,25 @@ def _apply_topp(topk_weights: torch.Tensor, topk_ids: torch.Tensor):
     return new_w, new_ids
 
 
+def _sanitize_topk_routes(topk_weights: torch.Tensor,
+                          topk_ids: torch.Tensor,
+                          n_experts: int):
+    """Prepare router output for CUDA MoE alignment.
+
+    DSpark graph padding can leave a complete top-k row at ``-1``.  vLLM's
+    alignment kernel skips IDs >= ``n_experts`` but does not reject negative
+    IDs before indexing shared memory.  Map every invalid route to the
+    supported positive skip sentinel and zero its contribution.  All tensor
+    shapes stay static, so the operation is CUDA-graph-capture-safe.
+    """
+    valid = (topk_ids >= 0) & (topk_ids < n_experts)
+    weights = torch.where(valid, topk_weights,
+                          torch.zeros_like(topk_weights))
+    ids = torch.where(valid, topk_ids,
+                      torch.full_like(topk_ids, n_experts))
+    return weights, ids
+
+
 def enabled() -> bool:
     return os.getenv("VLLM_MOE_W2", "0") == "1"
 
@@ -3029,6 +3048,8 @@ def _moe_w2_forward_timed(
     # moe_align/mark_seen/route_log so dropped experts are neither fetched
     # nor counted as routed.
     topk_weights, topk_ids = _apply_topp(topk_weights, topk_ids)
+    topk_weights, route_ids = _sanitize_topk_routes(
+        topk_weights, topk_ids, st["E"])
     top_k = topk_ids.shape[1]
     dev = x.device
     stream = ctypes.c_void_p(torch.cuda.current_stream(dev).cuda_stream)
@@ -3044,7 +3065,7 @@ def _moe_w2_forward_timed(
     prefill = T > _PREFILL_T
     mblock = 16 if prefill else _BLOCK
     sorted_ids, expert_blocks, num_post = moe_align_block_size(
-        topk_ids, mblock, st["E"])
+        route_ids, mblock, st["E"])
     slots = sorted_ids.numel()
     pairs = slots // mblock
     # st["K2"] = per-rank expert intermediate I (w2 contraction), st["K13"] =
@@ -3109,9 +3130,9 @@ def _moe_w2_forward_timed(
         if torch.cuda.is_current_stream_capturing():
             tier.notify_capture()
         else:
-            tier.ensure_resident(layer_key, topk_ids.view(-1))
+            tier.ensure_resident(layer_key, route_ids.view(-1))
         moe_w2_delta.mark_seen(
-            tier.seen[layer_key], topk_ids.view(-1).long())
+            tier.seen[layer_key], route_ids.view(-1).long())
         if layer_key == 0:
             tier.miss_count.zero_()
         slot_row = tier.slot_table[layer_key]
@@ -3148,7 +3169,7 @@ def _moe_w2_forward_timed(
             if tier is not None:
                 tier.notify_capture()
         elif prefill:
-            btier.ensure_resident(layer_key, topk_ids.view(-1))
+            btier.ensure_resident(layer_key, route_ids.view(-1))
             if use_pf4 and _PREFILL_FP4_ENSURE:
                 # decode-class guarantee for the FP4 side too: fetch the
                 # chunk's routed set into the need-pool AFTER the base rows
@@ -3161,12 +3182,12 @@ def _moe_w2_forward_timed(
                                 "cache): eager chunk working sets fetched "
                                 "to both tiers (first call: layer %d, T=%d)",
                                 layer_key, T)
-                tier.ensure_resident(layer_key, topk_ids.view(-1))
-        moe_w2_delta.mark_seen(btier.seen[layer_key], topk_ids.view(-1).long())
+                tier.ensure_resident(layer_key, route_ids.view(-1))
+        moe_w2_delta.mark_seen(btier.seen[layer_key], route_ids.view(-1).long())
         if tier is not None:
             # the gate's force_promote reads the FP4 tier's own seen scatter
             moe_w2_delta.mark_seen(tier.seen[layer_key],
-                                   topk_ids.view(-1).long())
+                                   route_ids.view(-1).long())
         if not prefill:
             # LOOKA/PILOT (router-lookahead): score predictors + write the
             # next layer's prediction. Must run BEFORE the route_log
@@ -3302,7 +3323,7 @@ def _moe_w2_forward_timed(
             slot_row = tier.slot_table[layer_key]
             pool_ptr = tier.pool.data_ptr()
             moe_w2_delta.mark_seen(tier.seen[layer_key],
-                                   topk_ids.view(-1).long())
+                                   route_ids.view(-1).long())
         else:
             if tier is not None:
                 # seen marks land BEFORE the desc build: the manager's
@@ -3311,7 +3332,7 @@ def _moe_w2_forward_timed(
                 # build below and the GEMMs reading it (same protection
                 # class as decode's step-scoped windows).
                 moe_w2_delta.mark_seen(tier.seen[layer_key],
-                                       topk_ids.view(-1).long())
+                                       route_ids.view(-1).long())
             if use_pf4 or use_w8:
                 if torch.cuda.is_current_stream_capturing():
                     tier.notify_capture()
@@ -3325,7 +3346,7 @@ def _moe_w2_forward_timed(
                                     "eager chunk working sets fetched to "
                                     "the delta tier (first call: layer %d, "
                                     "T=%d)", layer_key, T)
-                    tier.ensure_resident(layer_key, topk_ids.view(-1))
+                    tier.ensure_resident(layer_key, route_ids.view(-1))
                 slot_row = tier.slot_table[layer_key]
                 pool_ptr = tier.pool.data_ptr()
                 if use_w8 and os.getenv(
