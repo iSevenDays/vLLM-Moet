@@ -780,9 +780,43 @@ the score RANK of the compressed entry holding a known needle position. That
 turns "ranking quality is ~26× worse" from an inference into a direct
 measurement, and it is the fastest way to discriminate the suspects above.
 
-Artifacts: `docs/dsv4-sm89-longcontext/runlogs/needle_topk2048_*.json`
-(the 48K point was still in flight at write time; the coverage rule predicts
-FAIL at ~15%).
+**48K: no data — it TIMED OUT at 1800 s, it did not fail.** `index_topk=2048`
+at pt ~53K is simply slow (32K already took 657 s). Do not record it as a
+correctness result; re-run with a longer timeout if the point is wanted.
+
+### `index_topk = 0` — asked, and it does NOT mean "unlimited"
+
+Worth writing down because the knob's naming invites the guess. Setting it to 0
+would make things strictly worse, and it cannot act as a "disable sparsity"
+switch:
+
+- The reference computes `topk(min(index_topk, end_pos // ratio))`, so 0 selects
+  **nothing** from the compressed segment; `topk_idxs` collapses to just the
+  always-included `get_window_topk_idxs` window.
+- Our path agrees: `k_select = 0` yields `topk_indices_buffer[:n, :0]` — an empty
+  slice — and 0 is not in `(512, 1024, 2048)`, so it also drops off
+  `use_persistent_topk` onto `top_k_per_row_decode` with k=0.
+- Sparse mode stays ON regardless: the model/backend gates test
+  `hasattr(hf_config, "index_topk")` and `index_topk is None`
+  (`flashinfer_mla_sparse.py:126,213`), **not truthiness**. 0 is neither absent
+  nor None.
+- Most fundamentally, **there is no dense KV to fall back to.** The reference
+  sizes the cache as
+  `kv_cache_size = window_size + max_seq_len // compress_ratio` (model.py:479):
+  old tokens are *never* retained exactly, only as compressed entries. So
+  "attend to everything" is not representable — 0 would leave the model with
+  `window_size` tokens of context, i.e. no long context at all.
+
+The experiment that question is really reaching for is the opposite end:
+`index_topk >= candidate count` = **100% coverage, i.e. select every compressed
+entry**. We have effectively already run it — topk 2048 at pt 9686 is 85%
+coverage and PASSES. The clean confirmation would be topk 8192 at pt ~35825
+(8956 candidates → ~100%): if that restores exact digits, selection is proven to
+be the *sole* remaining defect. Note k=8192 is outside `(512,1024,2048)` so it
+uses the `top_k_per_row_decode` path, which `tools/test_indexer_topk_selection.py`
+already verified is correct by score.
+
+Artifacts: `docs/dsv4-sm89-longcontext/runlogs/needle_topk2048_*.json`.
 
 ## 6. KV capacity: runtime fits three full contexts; printed metrics were wrong
 
