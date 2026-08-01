@@ -4374,7 +4374,7 @@ class GPUModelRunner(
             try:
                 from vllm.model_executor.layers.quantization.utils import (
                     moe_w2_delta as _w2d)
-                _btier = _w2d._BASE_TIER
+                _btier = _w2d.mandatory_tier()
                 if (
                     _btier is not None
                     and _btier.route_log is not None
@@ -4448,7 +4448,7 @@ class GPUModelRunner(
             try:
                 from vllm.model_executor.layers.quantization.utils import (
                     moe_w2_delta as _w2d)
-                _btier = _w2d._BASE_TIER
+                _btier = _w2d.mandatory_tier()
                 if _btier is not None:
                     # open this step's pin scope: slots touched by any pass
                     # below are ineligible for eviction until the next step
@@ -4511,6 +4511,7 @@ class GPUModelRunner(
                             _btier.force_promote(
                                 max_promote=None,
                                 pin=_w2d.fp_continue(_replays, _max_miss))
+                    _w2d.require_exact_converged(_max_miss)
                     if _replays:
                         _btier.kpi_fp(_replays, _max_miss)
                     # close the base seen window HERE for PP: non-last
@@ -4521,9 +4522,12 @@ class GPUModelRunner(
                     # worker (gate_reforward) and consumes it there.
                     _btier.step_end()
                     if (_w2d._TIER is not None
+                            and _w2d._TIER is not _btier
                             and max_num_scheduled_tokens > 4):
                         _w2d._TIER.step_end()
             except Exception as e:  # noqa: BLE001 - never crash serving
+                if '_w2d' in locals() and _w2d.exact_cache_enabled():
+                    raise
                 logger.warning(
                     "moe_w2 base-cache PP stage replay skipped: %s", e)
 
@@ -4637,7 +4641,7 @@ class GPUModelRunner(
             try:
                 from vllm.model_executor.layers.quantization.utils import (
                     moe_w2_delta as _w2d)
-                _btier = _w2d._BASE_TIER
+                _btier = _w2d.mandatory_tier()
                 if _btier is not None:
                     # open this step's pin scope: slots touched by any pass
                     # below are ineligible for eviction until the next step
@@ -4719,9 +4723,12 @@ class GPUModelRunner(
                             _btier.force_promote(
                                 max_promote=None,
                                 pin=_w2d.fp_continue(_replays, _max_miss))
+                    _w2d.require_exact_converged(_max_miss)
                     if _replays:
                         _btier.kpi_fp(_replays, _max_miss)
             except Exception as e:  # noqa: BLE001 - never crash serving
+                if '_w2d' in locals() and _w2d.exact_cache_enabled():
+                    raise
                 logger.warning("moe_w2 base-cache miss replay skipped: %s", e)
 
         # Confidence-gated FP4 re-forward (VLLM_MOE_W2_GATE=1; default OFF, so
@@ -4855,13 +4862,15 @@ class GPUModelRunner(
             try:
                 from vllm.model_executor.layers.quantization.utils import (
                     moe_w2_delta as _w2d_end)
-                if _w2d_end._BASE_TIER is not None:
-                    _w2d_end._BASE_TIER.step_end()
+                _mandatory = _w2d_end.mandatory_tier()
+                if _mandatory is not None:
+                    _mandatory.step_end()
                 # under PP a pending gate fire consumes the FP4 window in
                 # gate_reforward() (driven by the worker AFTER this call);
                 # force_promote zeroes it there.
-                if _w2d_end._TIER is not None and not getattr(
-                        self, "_gate_fire", False):
+                if (_w2d_end._TIER is not None
+                        and _w2d_end._TIER is not _mandatory and not getattr(
+                        self, "_gate_fire", False)):
                     _w2d_end._TIER.step_end()
             except Exception:  # noqa: BLE001 - never crash serving
                 pass
@@ -6025,10 +6034,11 @@ class GPUModelRunner(
                             import moe_w2_delta as _w2d
                         from vllm.model_executor.layers.quantization.utils \
                             import moe_w2_looka as _w2l
-                        if _w2d._BASE_TIER is not None:
+                        _mandatory = _w2d.mandatory_tier()
+                        if _mandatory is not None:
                             _w2l.arm(self.model,
-                                     _w2d._BASE_TIER.n_layers,
-                                     _w2d._BASE_TIER.dev)
+                                     _mandatory.n_layers,
+                                     _mandatory.dev)
                     except Exception as e:  # noqa: BLE001 - never fatal
                         logger.warning("moe_w2 LOOKA arm failed: %s", e)
 

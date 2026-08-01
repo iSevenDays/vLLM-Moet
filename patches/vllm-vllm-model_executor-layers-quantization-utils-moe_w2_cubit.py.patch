@@ -1,9 +1,9 @@
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
-index 0000000..395a43a 100644
+index 0000000..ff67321 100644
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
-@@ -0,0 +1,3301 @@
+@@ -0,0 +1,3525 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Routed experts on 2-bit tensor-sym planes (cubit moe_w2) for the
@@ -41,6 +41,7 @@ index 0000000..395a43a 100644
 +import functools
 +import os
 +import re
++import time
 +
 +import torch
 +
@@ -633,16 +634,21 @@ index 0000000..395a43a 100644
 +            else _w8m._op_case_fp8)
 +    desc, bufs, ref = case(k13, n13, m_rows=16)
 +    plane = bufs[2]                                   # the w plane
-+    if plane.numel() != tier.w13_bytes:
++    exact = moe_w2_delta.exact_cache_enabled()
++    expected = plane.numel() + (bufs[3].numel() if exact else 0)
++    if expected != tier.w13_bytes:
 +        raise RuntimeError(
-+            f"w8 pool gate: plane {plane.numel()} B != tier.w13_bytes "
++            f"w8 pool gate: staged section {expected} B != tier.w13_bytes "
 +            f"{tier.w13_bytes} B — tier sized for a different format")
 +    slot = tier.n_slots - 1                           # TAIL slot: overruns
 +                                                     # fault here first
 +    tier.pool[slot, :tier.w13_bytes].copy_(
-+        plane.view(-1)[:tier.w13_bytes])
++        torch.cat((plane.view(-1), bufs[3].view(-1))) if exact
++        else plane.view(-1)[:tier.w13_bytes])
 +    desc[0, 2] = tier.pool[slot].data_ptr()           # W ptr now inside the
 +                                                     # pool
++    if exact:
++        desc[0, 3] = tier.pool[slot].data_ptr() + plane.numel()
 +    _launch("w8", k13, desc[0], n13, 1, torch.cuda.current_stream())
 +    torch.cuda.synchronize()
 +    got = bufs[4].float().cpu()
@@ -835,9 +841,23 @@ index 0000000..395a43a 100644
 +    # call site _fp4_tier_for_build runs BEFORE this one and would otherwise
 +    # poison _TIER with FP4 half-sizes.
 +    half = 2 if moe_w2_delta.fp8_store_fp4() else 1
++    # Exact-primary has no resident base scales to share.  Keep the original
++    # block-32 UE8M0 scales in each slot beside the checkpoint FP4 nibbles:
++    # [fp4_13|sc13|fp4_2|sc2].
++    sc13 = n13k13 // 32 if moe_w2_delta.exact_cache_enabled() else 0
++    sc2 = n2k2 // 32 if moe_w2_delta.exact_cache_enabled() else 0
 +    return moe_w2_delta.get_tier(n_experts=E, dev=dev,
-+                                 w13_bytes=n13k13 // half,
-+                                 w2_bytes=n2k2 // half, fp8=True)
++                                 w13_bytes=n13k13 // half + sc13,
++                                 w2_bytes=n2k2 // half + sc2, fp8=True)
++
++
++def _stage_fp8_host(tier, layer_key: int, fp13, sc13, fp2, sc2) -> None:
++    """Stage the w8 tier using its mode-specific slot geometry."""
++    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
++    if moe_w2_delta.exact_cache_enabled():
++        tier.add_layer_host_sections(layer_key, (fp13, sc13), (fp2, sc2))
++    else:
++        tier.add_layer_host_planes(layer_key, fp13, fp2)
 +
 +
 +def _stage_fp4_host(tier, layer_key: int, fp13, sc13, fp2, sc2) -> None:
@@ -1002,7 +1022,13 @@ index 0000000..395a43a 100644
 +    K13, K2 = K13h * 2, K2h * 2
 +    c13len, s13len = N13 * K13 // 4, N13 * K13 // 32
 +    c2len, s2len = N2 * K2 // 4, N2 * K2 // 32
-+    if moe_w2_delta.base_enabled():
++    if moe_w2_delta.exact_cache_enabled():
++        n_keys = _layer_cutoff() + 1
++        exact_slot = ((N13 * K13 // 2 + s13len)
++                      + (N2 * K2 // 2 + s2len))
++        if not pack_has_layer("w8x", key, n_keys, E, exact_slot):
++            return False
++    elif moe_w2_delta.base_enabled():
 +        # host-resident: the pack store serves the base (and the FP4
 +        # need-pool when configured) — probe the sidecars.
 +        n_keys = _layer_cutoff() + 1
@@ -1270,6 +1296,30 @@ index 0000000..395a43a 100644
 +    but ITS pack misses the layer, we also requant (the fp4 sections can
 +    only be rebuilt from the checkpoint bytes)."""
 +    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
++    if moe_w2_delta.exact_cache_enabled():
++        dev = torch.device("cuda")
++        tier = _fp8_tier_for_build(E, dev, N13 * K13, N2 * K2)
++        if tier is None or layer_key not in tier._store:
++            return False
++        f13len, s13len = N13 * K13 // 2, N13 * K13 // 32
++        f2len, s2len = N2 * K2 // 2, N2 * K2 // 32
++        from vllm.model_executor.layers.quantization.utils import (
++            moe_w2_planes_cache as _pc)
++        _LAYERS[layer_key] = dict(
++            N13=N13, K13=K13, N2=N2, K2=K2, E=E, exact=True,
++            tl_idx=_pc.layer_idx_from_name(getattr(layer, "layer_name", "")),
++            off_s13=f13len, off_c2=f13len + s13len,
++            off_s2=f13len + s13len + f2len,
++        )
++        _w8_pool_gate(tier, K13, N13)
++        stub = torch.empty(0, dtype=torch.uint8, device=dev)
++        for name in param_names:
++            layer.register_parameter(
++                name, torch.nn.Parameter(stub, requires_grad=False))
++        logger.info(
++            "moe_w2: layer %d requant SKIPPED — exact FP4-storage cache "
++            "serving from pack (boot-from-pack)", layer_key)
++        return True
 +    if not moe_w2_delta.base_enabled():
 +        return False
 +    dev = torch.device("cuda")
@@ -1322,7 +1372,9 @@ index 0000000..395a43a 100644
 +        return
 +    _budget_logged = True
 +    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
-+    per_layer = E * (N13 * K13 + N2 * K2) * (1 / 4 + 1 / 32)  # codes+scales
++    exact = moe_w2_delta.exact_cache_enabled()
++    per_layer = E * (N13 * K13 + N2 * K2) * (
++        (1 / 2 if exact else 1 / 4) + 1 / 32)
 +    n_layers = _layer_cutoff()
 +    try:
 +        from vllm.config import get_current_vllm_config
@@ -1331,12 +1383,12 @@ index 0000000..395a43a 100644
 +    except Exception:  # noqa: BLE001 — PP unknown: project full depth
 +        pass
 +    total_gib = per_layer * n_layers / 2**30
-+    if moe_w2_delta.base_enabled():
++    if moe_w2_delta.base_enabled() or exact:
 +        logger.info(
 +            "moe_w2 planes: %.2f GiB/layer x %d layers = %.1f GiB -> "
-+            "PINNED HOST RAM (base cache; the GPU holds the "
-+            "VLLM_MOE_W2_BASE_CACHE_GB slot pool)",
-+            per_layer / 2**30, n_layers, total_gib)
++            "PINNED HOST RAM (%s; the GPU holds the expert slot pool)",
++            per_layer / 2**30, n_layers, total_gib,
++            "exact FP4-storage cache" if exact else "2-bit base cache")
 +        # host-side preflight, same rationale as the VRAM one: a pinned
 +        # arena that outgrows host RAM dies mid-load as a bare
 +        # cudaHostAlloc failure (or the OOM-killer takes the engine with
@@ -1379,6 +1431,65 @@ index 0000000..395a43a 100644
 +            "currently free VRAM (%.1f GiB) — weight load will likely "
 +            "OOM; consider VLLM_MOE_W2_BASE_CACHE_GB", total_gib,
 +            free_b / 2**30)
++
++
++def _build_exact_mxfp4_layer(layer, layer_key: int, dev, w13, s13, w2, s2,
++                             E: int, N13: int, K13: int, N2: int, K2: int,
++                             param_names) -> None:
++    """Cold-build one checkpoint-MXFP4 layer into the mandatory exact tier.
++
++    Exact mode serves the original checkpoint E2M1 nibbles and UE8M0 scales
++    through ``moe_w8``; it never reads the legacy 2-bit planes.  Building
++    those planes on GPU first therefore only adds quantization work, VRAM
++    transients, and a planes-cache write whose bytes are discarded.  Repack
++    the checkpoint bytes directly on CPU into the persistent ``w8x`` slot
++    layout instead.  Subsequent boots bypass this function through the pack
++    I/O-skip path in ``_try_skip_requant``.
++    """
++    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
++    from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (
++        mxfp4_to_nibbles, pack_fp4_fragment_major_batch)
++
++    if not moe_w2_delta.exact_cache_enabled():
++        raise RuntimeError("exact MXFP4 builder called outside exact mode")
++    tier = _fp8_tier_for_build(E, dev, N13 * K13, N2 * K2)
++    if tier is None:
++        raise RuntimeError("exact MXFP4 builder has no mandatory w8 tier")
++
++    chunk = max(1, int(os.getenv("VLLM_MOE_W2_EXACT_PACK_CHUNK", "32")))
++    started = time.perf_counter()
++
++    def pack_matrix(weight, scale, N, K):
++        # Outputs stay pageable CPU here. add_layer_host_sections performs the
++        # single copy into the pinned arena (or persistent pack writer), so a
++        # cold build does not consume GPU memory beyond the already-budgeted
++        # exact slot pool.
++        fp = torch.empty(E, N * K // 2, dtype=torch.uint8, device="cpu")
++        sc = torch.empty(E, N * K // 32, dtype=torch.uint8, device="cpu")
++        for e0 in range(0, E, chunk):
++            e1 = min(e0 + chunk, E)
++            fp[e0:e1] = pack_fp4_fragment_major_batch(
++                mxfp4_to_nibbles(weight[e0:e1]))
++            # Batched twin of pack_scales: [B,N,K/32] ->
++            # [B,N/16,K/32,16] -> [B,N*K/32].
++            b = e1 - e0
++            sc[e0:e1] = scale[e0:e1].view(
++                b, N // 16, 16, K // 32).transpose(
++                    2, 3).contiguous().view(b, -1)
++        return fp, sc
++
++    fp13, sc13 = pack_matrix(w13, s13, N13, K13)
++    fp2, sc2 = pack_matrix(w2, s2, N2, K2)
++    _stage_fp8_host(tier, layer_key, fp13, sc13, fp2, sc2)
++    del fp13, sc13, fp2, sc2
++    _w8_pool_gate(tier, K13, N13)
++    empty = torch.empty(0, dtype=torch.uint8, device=dev)
++    _finish_layer(layer, layer_key, dev, empty, empty, empty, empty,
++                  N13, K13, N2, K2, E, param_names)
++    logger.info(
++        "moe_w2 exact cold-pack: layer %d checkpoint FP4+scales packed "
++        "directly on CPU in %.2fs (chunk=%d; q2 requant/cache skipped)",
++        layer_key, time.perf_counter() - started, chunk)
 +
 +
 +def build_layer_planes(layer, layer_key: int) -> None:
@@ -1424,6 +1535,13 @@ index 0000000..395a43a 100644
 +    if _try_skip_requant(layer, layer_key, E, N13, K13, N2, K2,
 +                         ("w13_weight", "w13_weight_scale", "w2_weight",
 +                          "w2_weight_scale")):
++        return
++    if moe_w2_delta.exact_cache_enabled():
++        _build_exact_mxfp4_layer(
++            layer, layer_key, dev, w13, s13, w2, s2,
++            E, N13, K13, N2, K2,
++            ("w13_weight", "w13_weight_scale", "w2_weight",
++             "w2_weight_scale"))
 +        return
 +    # Planes cache (VLLM_MOE_W2_PLANES_CACHE): the mxfp4 requant + FP8
 +    # derivation below is deterministic given (checkpoint, TP layout, zero
@@ -1578,7 +1696,7 @@ index 0000000..395a43a 100644
 +        # shared resident base scales serve both tiers), then the one-shot
 +        # end-to-end POOL parity gate (catches a tier sized for the wrong
 +        # format through a real pool slot, loudly at the first staged layer).
-+        fp8_tier.add_layer_host_planes(layer_key, fp8_13, fp8_2)
++        _stage_fp8_host(fp8_tier, layer_key, fp8_13, sc13, fp8_2, sc2)
 +        del fp8_13, fp8_2
 +        _w8_pool_gate(fp8_tier, K13, N13)
 +
@@ -1698,7 +1816,7 @@ index 0000000..395a43a 100644
 +        # scales serve both tiers), then the one-shot end-to-end POOL parity
 +        # gate (catches a tier sized for the wrong format through a real pool
 +        # slot, loudly at the first staged layer).
-+        fp8_tier.add_layer_host_planes(layer_key, fp8_13, fp8_2)
++        _stage_fp8_host(fp8_tier, layer_key, fp8_13, sc13, fp8_2, sc2)
 +        del fp8_13, fp8_2
 +        _w8_pool_gate(fp8_tier, K13, N13)
 +
@@ -1750,9 +1868,9 @@ index 0000000..395a43a 100644
 +        # Delta planes are CPU u8 (the cache stores CPU tensors), matching
 +        # the build path's CPU-resident fp8_13/fp8_2. Mode-dependent keys:
 +        # fp4-store cache carries fp4u13/fp4u2; fp8-store carries fp8u13/fp8u2.
-+        fp8_tier.add_layer_host_planes(
-+            layer_key, cached[w8k13].view(E, -1),
-+            cached[w8k2].view(E, -1))
++        _stage_fp8_host(
++            fp8_tier, layer_key, cached[w8k13].view(E, -1), sc13,
++            cached[w8k2].view(E, -1), sc2)
 +        _w8_pool_gate(fp8_tier, K13, N13)
 +    _finish_layer(layer, layer_key, dev, planes13, sc13, planes2,
 +                  sc2, N13, K13, N2, K2, E,
@@ -1923,7 +2041,7 @@ index 0000000..395a43a 100644
 +        _stage_fp4_host(tier, layer_key, fp13, sc13, fp2, sc2)
 +        del fp13, fp2
 +    if fp8_tier is not None:
-+        fp8_tier.add_layer_host_planes(layer_key, fp8_13, fp8_2)
++        _stage_fp8_host(fp8_tier, layer_key, fp8_13, sc13, fp8_2, sc2)
 +        del fp8_13, fp8_2
 +        # One-shot end-to-end POOL parity gate (boot hook).
 +        _w8_pool_gate(fp8_tier, K13, N13)
@@ -1943,6 +2061,26 @@ index 0000000..395a43a 100644
 +    from vllm.model_executor.layers.quantization.utils import (
 +        moe_w2_planes_cache as _pc)
 +    _tl = _pc.layer_idx_from_name(getattr(layer, "layer_name", ""))
++    if moe_w2_delta.exact_cache_enabled():
++        tier = moe_w2_delta._TIER
++        if tier is None or layer_key not in tier._store:
++            raise RuntimeError(
++                f"moe_w2 exact cache: layer {layer_key} was not staged")
++        f13len, s13len = N13 * K13 // 2, N13 * K13 // 32
++        f2len, s2len = N2 * K2 // 2, N2 * K2 // 32
++        _LAYERS[layer_key] = dict(
++            N13=N13, K13=K13, N2=N2, K2=K2, E=E, exact=True,
++            tl_idx=_tl, off_s13=f13len, off_c2=f13len + s13len,
++            off_s2=f13len + s13len + f2len)
++        del planes13, sc13, planes2, sc2
++        stub = torch.empty(0, dtype=torch.uint8, device=dev)
++        for name in param_names:
++            layer.register_parameter(
++                name, torch.nn.Parameter(stub, requires_grad=False))
++        logger.info(
++            "moe_w2: layer %d exact FP4-storage HOST-staged (%.2f GiB)",
++            layer_key, E * tier.slot_bytes / 2**30)
++        return
 +    if moe_w2_delta.base_enabled():
 +        # BASE cache (inverted delta): the 2-bit planes go to PINNED HOST RAM
 +        # instead of staying GPU-resident; the GPU holds only the base tier's
@@ -2500,6 +2638,55 @@ index 0000000..395a43a 100644
 +
 +
 +@triton.jit
++def _desc_build_kernel_exactcache(
++    eids_ptr, npost_ptr, slot_ptr, miss_ptr, d_ptr,
++    a1b, as1b, c13b, a2b, as2b, c2b,
++    poolb, slot_bytes, off_s13, off_c2, off_s2,
++    a1_rb, as1_rb, c13_rb, a2_rb, as2_rb, c2_rb,
++    n_experts, pairs, cap6, mblock,
++    BLOCK: tl.constexpr,
++):
++    """Build w8 descriptors for the mandatory exact FP4-storage cache.
++
++    Slot layout is [fp4_13|sc13|fp4_2|sc2].  Misses write m=0, increment
++    the shared counter, and are zero-weighted by the epilogue until the
++    runner fetches and replays the step.
++    """
++    p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    mask = p < pairs
++    e = tl.load(eids_ptr + p, mask=mask, other=0).to(tl.int64)
++    e = tl.minimum(tl.maximum(e, 0), n_experts - 1)
++    slot = tl.load(slot_ptr + e, mask=mask, other=-1).to(tl.int64)
++    npost = tl.load(npost_ptr).to(tl.int64)
++    live = p < npost // mblock
++    hit = slot >= 0
++    m = tl.where(live & hit, mblock, 0).to(tl.int64)
++    tl.atomic_add(miss_ptr, tl.sum(tl.where(mask & live & ~hit, 1, 0)))
++    row = p.to(tl.int64) * mblock
++    sbase = poolb + tl.maximum(slot, 0) * slot_bytes
++    for gi in tl.static_range(2):
++        # d[2]/d[3] are the native-FP8/w8 tables.  d[0]/d[1] deliberately
++        # remain unused: there is no approximate resident base in this mode.
++        d = d_ptr + (2 + gi) * cap6 + p * 6
++        if gi == 0:
++            b, s, a, as_, c = (
++                sbase, sbase + off_s13,
++                a1b + row * a1_rb, as1b + row * as1_rb,
++                c13b + row * c13_rb)
++        else:
++            b, s, a, as_, c = (
++                sbase + off_c2, sbase + off_s2,
++                a2b + row * a2_rb, as2b + row * as2_rb,
++                c2b + row * c2_rb)
++        tl.store(d + 0, a, mask=mask)
++        tl.store(d + 1, as_, mask=mask)
++        tl.store(d + 2, b, mask=mask)
++        tl.store(d + 3, s, mask=mask)
++        tl.store(d + 4, c, mask=mask)
++        tl.store(d + 5, m, mask=mask)
++
++
++@triton.jit
 +def _desc_build_kernel_base_delta(
 +    eids_ptr, npost_ptr, bslot_ptr, fslot_ptr, miss_ptr, d_ptr,
 +    a1b, as1b, c13b, a2b, as2b, c2b,
@@ -2842,6 +3029,7 @@ index 0000000..395a43a 100644
 +    _fp8_boot_guard()
 +
 +    st = _LAYERS[layer_key]
++    exact_mode = st.get("exact", False)
 +    T, H = x.shape
 +    # adaptive expert top-p (env-gated; identity when off). Must run before
 +    # moe_align/mark_seen/route_log so dropped experts are neither fetched
@@ -2893,14 +3081,15 @@ index 0000000..395a43a 100644
 +    # decode cubin / "w2" tier) -- exactly like FP8-off. This predicate
 +    # gates every decode-delta branch below so FP8 decode skips all FP4
 +    # tier machinery (slot/pool setup, FP4 desc build, w4/w4q launches).
-+    fp8_prefill_only = moe_w2_delta.fp8_enabled()
++    fp8_prefill_only = moe_w2_delta.fp8_enabled() and not exact_mode
 +    # AFRAG (prefill): the GEMM reads fragment-major activations from the
 +    # dedicated a1f/a2f buffers (filled by the single-pass triton repack
 +    # below); point the w2 desc 'a' fields there. The w4 tier never reads
 +    # AFRAG: decode is row-major anyway and the prefill-FP4 sub-entries
 +    # take the row-major bases explicitly (the repack copies OUT of a1/a2,
 +    # leaving them valid).
-+    use_afrag = prefill and _afrag_ok
++    # w8 consumes row-major activations. AFRAG is a w2-prefill optimization.
++    use_afrag = prefill and _afrag_ok and not exact_mode
 +    a1_base = ws["a1f"] if use_afrag else ws["a1"]
 +    a2_base = ws["a2f"] if use_afrag else ws["a2"]
 +    d = ws["desc"]
@@ -2915,7 +3104,40 @@ index 0000000..395a43a 100644
 +    if torch.cuda.is_current_stream_capturing():
 +        # first capture freezes the workspace sizes (see _workspaces)
 +        _WS["frozen"] = True
-+    if base_mode:
++    if exact_mode:
++        # Mandatory FP4-storage cache: there is no resident 2-bit fallback.
++        # Eager forwards fetch the layer working set before the GEMMs; captured
++        # decode graphs record misses in-graph for the runner's strict replay.
++        tier = moe_w2_delta._TIER
++        if tier is None or tier.n_slots <= 0:
++            raise RuntimeError("moe_w2 exact cache is not initialized")
++        use_w8 = True
++        if torch.cuda.is_current_stream_capturing():
++            tier.notify_capture()
++        else:
++            tier.ensure_resident(layer_key, topk_ids.view(-1))
++        moe_w2_delta.mark_seen(
++            tier.seen[layer_key], topk_ids.view(-1).long())
++        if layer_key == 0:
++            tier.miss_count.zero_()
++        slot_row = tier.slot_table[layer_key]
++        _desc_build_kernel_exactcache[(triton.cdiv(pairs, 256),)](
++            expert_blocks, num_post, slot_row, tier.miss_count, d,
++            a1_base.data_ptr(), ws["as1"].data_ptr(),
++            ws["c13"].data_ptr(), a2_base.data_ptr(),
++            ws["as2"].data_ptr(), ws["c2"].data_ptr(),
++            tier.pool.data_ptr(), tier.slot_bytes,
++            st["off_s13"], st["off_c2"], st["off_s2"],
++            st["K13"], (st["K13"] // 32) * 4, 4 * st["K2"],
++            st["K2"], (st["K2"] // 32) * 4, 2 * st["K13"],
++            st["E"], pairs, cap * 6, mblock, BLOCK=256)
++        e_pair = expert_blocks.to(torch.long).clamp_(0, st["E"] - 1)
++        resident = slot_row[e_pair] >= 0
++        miss_rows = resident.repeat_interleave(mblock)[:slots]
++        # Downstream w4 launch predicates key off tier. Exact dispatch is w8
++        # only; retain use_w8 and deliberately hide the tier from those paths.
++        tier = None
++    elif base_mode:
 +        # BASE cache: 2-bit planes come from the base tier's GPU pool; a live
 +        # pair with a non-resident expert contributes zero and bumps the miss
 +        # counter (runner fetches + replays). Prefill fetches its whole layer
@@ -3209,7 +3431,8 @@ index 0000000..395a43a 100644
 +    # filler (never read). Capacity is fine: pairs*16 <= slots <= a1.shape[0]-4.
 +    if use_afrag:
 +        _afrag_repack(ws["a1"], ws["a1f"], pairs, st["K13"])
-+    _launch(w2tier, st["K13"], d[0], st["N13"], pairs, stream)
++    if not exact_mode:
++        _launch(w2tier, st["K13"], d[0], st["N13"], pairs, stream)
 +    # split-FP4 dispatch: both residency modes fill ws["desc4s"] (classic:
 +    # _desc_build_kernel_w4s against resident planes; base cache:
 +    # _desc_build_kernel_base_delta_split against the coupled base slots).
@@ -3240,7 +3463,8 @@ index 0000000..395a43a 100644
 +    _quant_a32(act, ws["a2"][:slots], ws["as2"][:slots], _G2)
 +    if use_afrag:
 +        _afrag_repack(ws["a2"], ws["a2f"], pairs, st["K2"])
-+    _launch(w2tier, st["K2"], d[1], st["N2"], pairs, stream)
++    if not exact_mode:
++        _launch(w2tier, st["K2"], d[1], st["N2"], pairs, stream)
 +    if tier is not None and not prefill and not fp8_prefill_only:
 +        if use_w4s:
 +            _launch("w4q", st["K2"], ws["desc4s"][1], st["N2"], pairs, stream)

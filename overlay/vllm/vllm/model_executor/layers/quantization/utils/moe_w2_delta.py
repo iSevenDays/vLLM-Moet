@@ -218,6 +218,19 @@ if _FP8_STORE not in ("fp8", "fp4"):
     raise ValueError(
         f"VLLM_MOE_W2_FP8_STORE must be 'fp8' or 'fp4', got {_FP8_STORE!r}")
 
+# Exact-primary expert cache.  Unlike the optional FP8 prefill tier, this is
+# the model's ONLY expert-weight source: each slot stores the checkpoint FP4
+# nibbles plus its original block-32 scales, and both prefill and decode run
+# the native-Ada w8 kernel (FP4 storage -> exact E4M3 expansion in registers).
+# A miss is therefore a correctness event, handled by the same fetch/replay
+# contract as the host 2-bit base cache.
+_EXACT_CACHE = os.getenv("VLLM_MOE_W2_EXACT_CACHE", "0").lower() not in (
+    "0", "", "false", "no", "off")
+
+
+def exact_cache_enabled() -> bool:
+    return _EXACT_CACHE
+
 
 def fp8_store_fp4() -> bool:
     """FP4-STORAGE mode for the w8 tier (VLLM_MOE_W2_FP8_STORE=fp4): slots
@@ -241,6 +254,18 @@ def fp8_enabled() -> bool:
     nibbles instead of the requant pipeline)."""
     return _FP8_DELTA_ON and (_FP8_GB > 0 or _FP8_GB_RAW in (
         "auto", "-1", "-1.0"))
+
+
+if _EXACT_CACHE:
+    if not fp8_enabled() or _FP8_STORE != "fp4":
+        raise ValueError(
+            "VLLM_MOE_W2_EXACT_CACHE=1 requires "
+            "VLLM_MOE_W2_FP8_DELTA=1, VLLM_MOE_W2_FP8_DELTA_GB=<GiB>, "
+            "and VLLM_MOE_W2_FP8_STORE=fp4")
+    if _FP8_GB_RAW in ("auto", "-1", "-1.0"):
+        raise ValueError(
+            "the exact expert cache must be allocated before KV sizing; "
+            "set an explicit VLLM_MOE_W2_FP8_DELTA_GB (not auto)")
 
 
 class DeltaTier:
@@ -428,7 +453,7 @@ class DeltaTier:
         # Dumps stay blocked until the stash is consumed (or absent).
         self._heat_preloaded = False
         self._heat_pending: list | None = None
-        if _POOL_HEAT and _POOL_HEAT_DIR and tag == "base":
+        if _POOL_HEAT and _POOL_HEAT_DIR and tag in ("base", "w8x"):
             self._heat_pending = self._read_heat_file()
         # recency-decayed routing frequency per expert (drives the freq policy)
         self._freq = torch.zeros(n_layers, n_experts, dtype=torch.float32)
@@ -1782,6 +1807,10 @@ _TIER: DeltaTier | None = None
 # own `seen` tensor (the forward marks both), own manager, own policy.
 _BASE_GB = float(os.getenv("VLLM_MOE_W2_BASE_CACHE_GB", "0"))
 _BASE_TIER: DeltaTier | None = None
+if _EXACT_CACHE and _BASE_GB > 0:
+    raise ValueError(
+        "VLLM_MOE_W2_EXACT_CACHE=1 is a primary cache and cannot coexist "
+        "with VLLM_MOE_W2_BASE_CACHE_GB>0")
 
 # Miss tolerance: a decode step with <= TOL missing routed (layer, expert)
 # pairs keeps its logits (the missing pairs contributed zero) instead of
@@ -1800,6 +1829,10 @@ _base_tol_mtime = -1.0
 
 
 def base_miss_tol() -> int:
+    # Exact-primary has no approximate fallback: every missing expert must be
+    # fetched and replayed before logits can escape the runner.
+    if exact_cache_enabled():
+        return 0
     global _base_tol_dyn, _base_tol_mtime
     if not _BASE_MISS_TOL_FILE:
         return _BASE_MISS_TOL
@@ -1861,6 +1894,8 @@ def fp_thresh() -> int:
 
 def fp_continue(passes: int, max_miss: int) -> bool:
     """Should the runner run another replay pass? (adaptive policy above)"""
+    if exact_cache_enabled():
+        return max_miss > 0 and passes < _FP_MAX
     if max_miss <= base_miss_tol():
         return False            # inside the tolerance band (or miss-free)
     if passes == 0:
@@ -1868,6 +1903,15 @@ def fp_continue(passes: int, max_miss: int) -> bool:
     if passes >= _FP_MAX:
         return False            # hard bound on ping-pong
     return max_miss <= fp_thresh()
+
+
+def require_exact_converged(max_miss: int) -> None:
+    """Refuse to emit logits with an unresolved exact-cache miss."""
+    if exact_cache_enabled() and max_miss > 0:
+        raise RuntimeError(
+            f"moe_w2 exact cache failed to converge after {_FP_MAX} replay "
+            f"passes ({max_miss} routed expert pairs still missing); raise "
+            "VLLM_MOE_W2_FP8_DELTA_GB or reduce speculative tokens/sequences")
 
 
 # Base-cache KPI cadence: every N runner steps log the per-STEP replay rate,
@@ -1925,6 +1969,13 @@ def base_enabled() -> bool:
     return _BASE_GB > 0
 
 
+def mandatory_tier() -> DeltaTier | None:
+    """Tier whose misses require a correctness replay, if one is active."""
+    if exact_cache_enabled():
+        return _TIER
+    return _BASE_TIER
+
+
 def check_pool_floor(top_k: int, n_spec: int, max_num_seqs: int) -> None:
     """Boot-time guard: refuse to serve when a pool is sized below its
     WORKING-SET floor (VLLM_MOE_W2_FORCE_POOL=1 downgrades to a warning).
@@ -1944,22 +1995,28 @@ def check_pool_floor(top_k: int, n_spec: int, max_num_seqs: int) -> None:
     """
     import math
     force = os.getenv("VLLM_MOE_W2_FORCE_POOL", "0") == "1"
-    seq_f = math.sqrt(float(min(max(max_num_seqs, 1), 4)))
-    t = _BASE_TIER
+    # Exact-primary cannot assume overlap between concurrent requests: the
+    # first pass may route an independent expert union for each sequence.
+    # The approximate 2-bit base keeps its empirically calibrated sqrt rule.
+    seq_f = (float(min(max(max_num_seqs, 1), 4))
+             if exact_cache_enabled()
+             else math.sqrt(float(min(max(max_num_seqs, 1), 4))))
+    t = mandatory_tier()
     if t is not None and len(t._store) > 0:
         pairs = int(len(t._store) * top_k * (1 + n_spec) * seq_f)
-        hard = int(1.15 * pairs)
-        comfort = int(1.40 * pairs)
+        hard = pairs if exact_cache_enabled() else int(1.15 * pairs)
+        comfort = (int(1.05 * pairs) if exact_cache_enabled()
+                   else int(1.40 * pairs))
         gib = t.n_slots * t.slot_bytes / 2**30
         need_gib = hard * t.slot_bytes / 2**30
         if t.n_slots < hard:
             msg = (
-                f"moe_w2 BASE cache pool is BELOW the working-set floor: "
+                f"moe_w2 mandatory cache pool is BELOW the working-set floor: "
                 f"{t.n_slots} slots ({gib:.1f} GiB) < {hard} required "
                 f"(~{need_gib:.1f} GiB) for {len(t._store)} MoE layers x "
                 f"top-{top_k} x (1+{n_spec} spec) x {max_num_seqs} seqs. "
                 f"Steps will keep ZEROED expert contributions (silent "
-                f"quality corruption). Raise VLLM_MOE_W2_BASE_CACHE_GB, "
+                f"quality corruption). Raise the mandatory expert-cache GiB, "
                 f"reduce num_speculative_tokens/max_num_seqs, or set "
                 f"VLLM_MOE_W2_FORCE_POOL=1 to serve anyway.")
             if not force:
@@ -2052,7 +2109,7 @@ def check_pool_floor(top_k: int, n_spec: int, max_num_seqs: int) -> None:
     try:
         from vllm.config import get_current_vllm_config
         pc = get_current_vllm_config().parallel_config
-        if _BASE_TIER is not None and (
+        if mandatory_tier() is not None and (
                 getattr(pc, "use_ubatching", False)
                 or getattr(pc, "ubatch_size", 0)):
             raise ValueError(
@@ -2077,7 +2134,7 @@ def spec_suppressed() -> bool:
     """Spec-guard latch (VLLM_MOE_W2_SPEC_GUARD): True while the base pool
     is too cold for speculation to pay — the runner then skips scheduling
     drafts. Always False when the guard or the base cache is off."""
-    t = _BASE_TIER
+    t = mandatory_tier()
     return t is not None and t._spec_suppressed
 
 
@@ -2187,12 +2244,27 @@ def get_tier(n_layers=None, n_experts=256, dev=None,
             # resident base scale (no slot scale section). tag "w8" keeps the
             # pack store separate from the FP4 tiers. Pool sized by the FP8
             # env (VLLM_MOE_W2_FP8_DELTA_GB). Mutually exclusive with FP4.
+            exact = exact_cache_enabled()
             _TIER = DeltaTier(
                 n_layers, n_experts, dev or torch.device("cuda"),
                 w13_bytes=W8_13_BYTES if w13_bytes is None else w13_bytes,
                 w2_bytes=W8_2_BYTES if w2_bytes is None else w2_bytes,
-                pool_gb=_FP8_GB, policy=policy, tag="w8",
-                host_pinned=not base_enabled(), defer_pool=True)
+                pool_gb=_FP8_GB,
+                policy=(os.getenv("VLLM_MOE_W2_DELTA_POLICY", "freq")
+                        if exact else policy),
+                tag="w8x" if exact else "w8",
+                host_pinned=True if exact else not base_enabled(),
+                defer_pool=not exact)
+            if exact:
+                # Same in-graph miss/replay ABI as the host base cache.
+                _TIER.miss_count = torch.zeros(
+                    1, dtype=torch.int32, device=_TIER.dev)
+                logger.info(
+                    "moe_w2 exact cache: %d slots x %.2f MiB (%.2f GiB), "
+                    "FP4 checkpoint storage + native FP8 MMA; misses are "
+                    "strict fetch/replay events",
+                    _TIER.n_slots, _TIER.slot_bytes / 2**20,
+                    _TIER.n_slots * _TIER.slot_bytes / 2**30)
         else:
             # Split quintal slots have a DIFFERENT geometry than full-FP4
             # slots; a distinct pack tag ("fp4q"; the superseded 2-bit

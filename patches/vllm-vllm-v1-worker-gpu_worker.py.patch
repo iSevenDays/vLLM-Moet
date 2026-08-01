@@ -1,5 +1,5 @@
 diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
-index 03433ed..b8da4c7 100644
+index 03433ed..5e58dfd 100644
 --- a/vllm/v1/worker/gpu_worker.py
 +++ b/vllm/v1/worker/gpu_worker.py
 @@ -412,6 +412,29 @@
@@ -32,7 +32,7 @@ index 03433ed..b8da4c7 100644
          if self.vllm_config.weight_transfer_config is not None:
              self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
                  self.vllm_config.weight_transfer_config,
-@@ -720,6 +743,44 @@
+@@ -720,6 +743,45 @@
          ):
              self.model_runner._init_kv_zero_meta()
  
@@ -56,8 +56,9 @@ index 03433ed..b8da4c7 100644
 +        try:
 +            from vllm.model_executor.layers.quantization.utils import (
 +                moe_w2_delta)
-+            if moe_w2_delta._BASE_TIER is not None:
-+                moe_w2_delta._BASE_TIER.preload_pool()
++            _mandatory = moe_w2_delta.mandatory_tier()
++            if _mandatory is not None:
++                _mandatory.preload_pool()
 +        except Exception as e:  # noqa: BLE001 - warm-start is best-effort
 +            logger.warning("moe_w2 pool warm-start failed: %s", e)
 +
@@ -77,7 +78,7 @@ index 03433ed..b8da4c7 100644
      @instrument(span_name="Warmup (GPU)")
      def compile_or_warm_up_model(self) -> CompilationTimes:
          warmup_sizes: list[int] = []
-@@ -905,6 +966,16 @@
+@@ -905,6 +967,16 @@
      def get_model(self) -> nn.Module:
          return self.model_runner.get_model()
  
@@ -94,7 +95,7 @@ index 03433ed..b8da4c7 100644
      def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
          return self.model_runner.get_supported_tasks()
  
-@@ -1024,6 +1095,8 @@
+@@ -1024,6 +1096,8 @@
              if isinstance(
                  output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
              ):
@@ -103,7 +104,7 @@ index 03433ed..b8da4c7 100644
                  return output
  
          assert isinstance(output, IntermediateTensors)
-@@ -1033,14 +1106,68 @@
+@@ -1033,14 +1107,68 @@
              and not get_pp_group().is_last_rank
          )
  

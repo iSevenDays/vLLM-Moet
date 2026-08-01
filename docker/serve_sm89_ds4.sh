@@ -193,6 +193,8 @@ CUSTOM_ALL_REDUCE=${CUSTOM_ALL_REDUCE:-1}  # 1 = keep vLLM's P2P custom all-redu
                              # needs the open-gpu-kernel-modules P2P patch on RTX 4090 D - see
                              # header section 2. Set 0 if your driver lacks that patch.
 RESIDENCY=${RESIDENCY:-gpu}  # 'host' = 2-bit base in pinned RAM + GPU pool (RAM-heavy);
+                             # 'exact' = checkpoint FP4 in host RAM + mandatory GPU
+                             # cache; native FP8 MMA for BOTH prefill and decode;
                              # 'gpu'  = base sharded ONTO the GPUs, no host cache (VRAM-heavy,
                              # low RAM). TP, RESIDENCY, and SCALE_REFIT identify the quant cache.
 FORCE_RESIDENT=${FORCE_RESIDENT:-1}  # gpu residency: set 1 to bypass the boot-guard VRAM-budget
@@ -203,6 +205,7 @@ READY_TIMEOUT_S=${READY_TIMEOUT_S:-1800}  # engine-ready wait (vLLM default 600)
                              # first-run quant is KILLED at 600s -> raise it.
 BASE_GB=${BASE_GB:-20}       # host residency: GPU expert-pool GiB/rank (THE speed knob).
                              # gpu residency forces BASE_CACHE_GB=0 (base lives on the GPUs).
+EXACT_GB=${EXACT_GB:-30}     # exact residency: FP4-storage expert pool GiB/rank.
 STORE=${STORE:-$CACHE/packs} # host residency only: on-disk quant pack (real fs, NOT overlayfs)
 ARENA_GB=${ARENA_GB:-14}     # host residency only: pinned host-RAM cache over the pack, per rank
 MEM_GB=${MEM_GB:-428}        # current host's HARD container RAM cap
@@ -215,6 +218,15 @@ IMG=${IMG:-vllm-moet-sm89:v0251}  # canonical living tag (vLLM 0.25.1 lineage),
                              # KV-group allocator, and DSv4 specialized router (validated
                              # 2026-07-24: +27% short decode, +66% c4 aggregate). Pre-native
                              # rollback image: IMG=vllm-moet-sm89:v0251-pre-native.
+
+if [ "$RESIDENCY" = exact ]; then
+  if [ "$SCALE_REFIT" != 0 ]; then
+    echo "FATAL: RESIDENCY=exact requires SCALE_REFIT=0 (checkpoint FP4 scales)" >&2
+    exit 1
+  fi
+  PLANES_SUBDIR=planes-exact
+  FP8_DELTA_GB=$EXACT_GB
+fi
 
 mkdir -p "$CACHE/$PLANES_SUBDIR" "$JIT_CACHE" "$STORE"
 docker rm -f "$NAME" 2>/dev/null || true
@@ -254,6 +266,9 @@ fi
 if [ "$RESIDENCY" = gpu ]; then
   RESVOL=""
   RESENV="-e VLLM_MOE_W2_BASE_CACHE_GB=0 -e VLLM_MOE_W2_PLANES_CACHE=/plane-cache -e VLLM_MOE_W2_FORCE_RESIDENT=$FORCE_RESIDENT"
+elif [ "$RESIDENCY" = exact ]; then
+  RESVOL="-v $STORE:/packs"
+  RESENV="-e VLLM_MOE_W2_BASE_CACHE_GB=0 -e VLLM_MOE_W2_PLANES_CACHE=/plane-cache -e VLLM_MOE_W2_STORE_DIR=/packs -e VLLM_MOE_W2_BASE_RAM_GB=$ARENA_GB"
 else
   RESVOL="-v $STORE:/packs"
   RESENV="-e VLLM_MOE_W2_BASE_CACHE_GB=$BASE_GB -e VLLM_MOE_W2_PLANES_CACHE=/plane-cache -e VLLM_MOE_W2_STORE_DIR=/packs -e VLLM_MOE_W2_BASE_RAM_GB=$ARENA_GB"
@@ -277,6 +292,9 @@ fi
 # the 0.5 GiB test) and LOUD on garbage.
 if awk -v g="$FP8_DELTA_GB" 'BEGIN { if (g+0 != g) exit 2; exit !(g+0 > 0) }'; then
   DELTA_ENV="-e VLLM_MOE_W2_FP8_DELTA=1 -e VLLM_MOE_W2_FP8_DELTA_GB=$FP8_DELTA_GB -e VLLM_MOE_W2_DELTA_GB=0 -e VLLM_MOE_W2_DELTA_SPLIT=0"
+  if [ "$RESIDENCY" = exact ]; then
+    DELTA_ENV="$DELTA_ENV -e VLLM_MOE_W2_EXACT_CACHE=1 -e VLLM_MOE_W2_FP8_STORE=fp4"
+  fi
 elif [ $? -eq 2 ]; then
   echo "FATAL: FP8_DELTA_GB='$FP8_DELTA_GB' is not numeric" >&2; exit 1
 else

@@ -655,8 +655,9 @@ def pack_has_layer(tag: str, layer_key: int, n_layers: int, n_experts: int,
 def make_store(tag: str, n_layers: int, n_experts: int, slot_bytes: int,
                pinned: bool):
     """Store factory: pack-file backends when VLLM_MOE_W2_STORE_DIR is set
-    (plus a pinned arena for the BASE tier when VLLM_MOE_W2_BASE_RAM_GB
-    is set), else the classic pinned/pageable host store. Env read at call
+    (plus a pinned arena for the mandatory BASE or exact-w8 tier when
+    VLLM_MOE_W2_BASE_RAM_GB is set), else the classic pinned/pageable host
+    store. Env read at call
     time so tests can toggle backends without reimporting the module."""
     if os.getenv("VLLM_MOE_W2_BASE_NVME_RATIO", "").strip():
         logger.error(
@@ -669,7 +670,7 @@ def make_store(tag: str, n_layers: int, n_experts: int, slot_bytes: int,
     if not dir_:
         return PinnedHostStore(slot_bytes, pinned=pinned)
     ram_raw = os.getenv("VLLM_MOE_W2_BASE_RAM_GB", "").strip().lower()
-    if tag == "base" and ram_raw not in ("", "0", "0.0"):
+    if tag in ("base", "w8x") and ram_raw not in ("", "0", "0.0"):
         stride = (slot_bytes + _ALIGN - 1) // _ALIGN * _ALIGN
         pack_gib = n_layers * n_experts * stride / 2**30
         ram_gb = 0.25 * pack_gib if ram_raw == "auto" else float(ram_raw)

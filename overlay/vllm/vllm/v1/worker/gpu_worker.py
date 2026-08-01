@@ -763,8 +763,9 @@ class Worker(WorkerBase):
         try:
             from vllm.model_executor.layers.quantization.utils import (
                 moe_w2_delta)
-            if moe_w2_delta._BASE_TIER is not None:
-                moe_w2_delta._BASE_TIER.preload_pool()
+            _mandatory = moe_w2_delta.mandatory_tier()
+            if _mandatory is not None:
+                _mandatory.preload_pool()
         except Exception as e:  # noqa: BLE001 - warm-start is best-effort
             logger.warning("moe_w2 pool warm-start failed: %s", e)
 
