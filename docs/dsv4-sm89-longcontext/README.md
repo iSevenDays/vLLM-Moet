@@ -204,11 +204,18 @@ measurements (§3) — black-box request/response, unaffected. The
    `top_k_per_row_decode`) has no trace — **selection during generation has
    never been observed**, and the symptom is a generation failure.
 2. The archived `BRIEFING.md` §3b "needle absolute token pos" column
-   (194/1695/2324/4843/9492) comes from the same estimate; `--abs-pos N` is
+   (194/1695/2324/4843/9492) comes from the same estimate; `--abs-pos N` was
    converted to `depth = N/L` and applied as a byte fraction. The pass/fail
    pattern still refutes "fixed position" and "fixed length" (those need only
    *some* monotone axis) but **the axis values are wrong** — recompute before
-   fitting any threshold.
+   fitting any threshold. **FIXED 2026-08-01 (T1):** `needle_digits_probe.py`
+   now reports the measured `needle_token_pos` (anchor = the digits, the column
+   a trace watches) and `needle_token_frac`, plus `position_measured`; the
+   unsound `needle_abs_pos_est = int(pt × depth)` field is removed. `--abs-pos N`
+   now places by **token** (tokenize → insert → re-tokenize → verify ±2, recorded
+   as `placed_ok`). Verified: `ask/8192/0.5` → digits @ token **3,871**, ratio-4
+   col **967** (was 4,843 / 1,210). Item 3 below (recompute the §3b axis) is still
+   open.
 
 ---
 
@@ -383,10 +390,16 @@ Otherwise every future position claim inherits the §2 error.
    needs `/root/autostart/CLAUDE.md` mounted to reproduce the filler blob exactly
    at prompt sizes above ~29 KB (below that the file falls beyond truncation and
    is irrelevant).
-1. `needle_digits_probe.py` must report the **measured** token position of the
-   needle, not `int(pt × depth)`.
-2. `--abs-pos` must place by **token** position (tokenize, insert, verify), not
-   by converting to a byte fraction.
+1. ~~`needle_digits_probe.py` must report the **measured** token position of the
+   needle, not `int(pt × depth)`.~~ **DONE (T1, 2026-08-01).** Records now carry
+   `needle_token_pos` / `needle_token_frac` (anchor = digits) + `position_measured`.
+2. ~~`--abs-pos` must place by **token** position (tokenize, insert, verify), not
+   by converting to a byte fraction.~~ **DONE (T1, 2026-08-01).** `--abs-pos N`
+   binary-searches the byte offset that puts the anchor at token N and records
+   `placed_ok` (within ±2). Needs the model tokenizer on the host (`pip install
+   tokenizers`; loads `tokenizer.json`, byte-identical to AutoTokenizer
+   `add_special_tokens=False`); without it positions are `UNMEASURED` and
+   `--abs-pos` errors loudly.
 3. Recompute the archived §3b position axis and restate the two refutations
    against it.
 

@@ -425,7 +425,7 @@ After **every** task:
 
 | task | status | result |
 |---|---|---|
-| T1 probe position hygiene | TODO | |
+| T1 probe position hygiene | DONE | probe reports measured `needle_token_pos` (digits @ 3871 @ ask/8192/0.5, ratio-4 col 967; not 4843/1210); `--abs-pos` places by token (`placed_ok`, ±2 verified 200/2000/3871/6000); `needle_abs_pos_est` removed. Live smoke reproduces FAIL/digits_only. Needs host `pip install tokenizers`. |
 | T2 `local_blocks` parity (H1) | TODO | |
 | T3 make trace usable | TODO | |
 | T4 retrace correct column (decisive) | TODO | |

@@ -56,15 +56,17 @@ in length (pt 8316 passes while 5100 and 6650 fail).
 Filler is the same realistic repo text needle_sweep uses. CAUTION: the repo
 elsewhere claims random-WORD filler "does not reproduce the failure" -- that is
 WRONG at >=10K tokens, where tools/needle_probe.py reproduces it plainly and
-more severely at depth 0.1 than 0.5 (STATUS 5.16). `--abs-pos` places the needle at an absolute
-token position instead of a depth fraction, which is how the "fixed position"
-and "fixed length" hypotheses were both refuted.
+more severely at depth 0.1 than 0.5 (STATUS 5.16). `--abs-pos N` places the
+needle's anchor (the digits) at an ABSOLUTE TOKEN position N -- tokenize, insert,
+re-tokenize, verify within +-2 -- so it is independent of the filler's byte/token
+density. (It previously converted N to a byte fraction, which is how the §2
+wrong-column error arose.) Every record reports the MEASURED `needle_token_pos`.
 
 Usage:
   python3 tools/needle_digits_probe.py --endpoint http://127.0.0.1:8011 \
       --lengths 3072,5120,8192 --variant ask --out /tmp/needle.json
   python3 tools/needle_digits_probe.py --lengths 8192 \
-      --variant ask --abs-pos 194,1695,4843,9492
+      --variant ask --abs-pos 1000,3871,8000
 """
 import argparse
 import json
@@ -171,11 +173,26 @@ def build_spec(variant, L, run):
     raise SystemExit(f"unknown variant: {variant}")
 
 
-def build_context(target_bytes, lines, depths, blob, question):
+def _filler_text(target_bytes, lines, question, blob):
+    """The repeated filler truncated to target_bytes minus prompt overhead.
+
+    Byte-for-byte identical to the original inline build_context math, so prompts
+    stay comparable to historical needle_sweep runs. Shared so the measured/token
+    placement path cannot drift from it."""
     overhead = sum(len(l.encode()) for l in lines) + len(question.encode()) + 64
     fill = max(1, target_bytes - overhead)
     enc = blob.encode("utf-8", "ignore")
-    text = (enc * ((fill // len(enc)) + 1))[:fill].decode("utf-8", "ignore")
+    return (enc * ((fill // len(enc)) + 1))[:fill].decode("utf-8", "ignore")
+
+
+def build_context(target_bytes, lines, depths, blob, question):
+    """Insert needles at BYTE fractions (`depths`) of the filler.
+
+    Kept as the entry point verify_needle_token_position.py imports. New runs
+    that need a MEASURED token position (or token-based placement) use
+    build_context_measured, which shares this filler math.
+    """
+    text = _filler_text(target_bytes, lines, question, blob)
     out = text
     # deepest-first so earlier byte offsets stay valid as we insert
     for line, depth in sorted(zip(lines, depths), key=lambda x: -x[1]):
@@ -184,15 +201,201 @@ def build_context(target_bytes, lines, depths, blob, question):
     return out + "\n\n" + question
 
 
+# ---------------------------------------------------------------------------
+# Tokenization + MEASURED needle positions
+#
+# The needle is inserted at a BYTE fraction of the filler but reported
+# historically as int(prompt_tokens * depth) -- a TOKEN fraction. Those differ
+# whenever the filler's halves tokenize at different densities (markdown +
+# Python is denser up front), which pointed the §5.19 rank trace 243 ratio-4
+# columns away from the needle (README §2). Below we load the model's own
+# tokenizer.json on the CPU and locate the needle's ANCHOR -- the digits when
+# the code has them (the column a trace watches), else the line start -- by
+# token. `tokenizers` is preferred (loads tokenizer.json directly; on this
+# model add_bos/eos=false so it is byte-identical to AutoTokenizer's
+# add_special_tokens=False path, verified to reproduce 9682/3871/967).
+# ---------------------------------------------------------------------------
+
+DEFAULT_TOKENIZER_DIR = "/root/models/DeepSeek-V4-Flash-0731"
+
+
+class _TokCount:
+    """Adapter: count_ids(str) -> number of tokens, no specials added."""
+
+    def __init__(self, count_fn, source):
+        self._count = count_fn
+        self.source = source
+
+    def count_ids(self, text):
+        return self._count(text)
+
+
+def load_tokenizer(tokenizer_dir):
+    """Return (_TokCount | None, source_or_reason).
+
+    Tries the standalone `tokenizers` lib (tokenizer.json), then
+    `transformers.AutoTokenizer`; returns (None, reason) if neither imports so
+    callers can degrade loudly instead of silently re-emitting the bad estimate.
+    """
+    import os
+
+    json_path = tokenizer_dir
+    if os.path.isdir(tokenizer_dir):
+        json_path = os.path.join(tokenizer_dir, "tokenizer.json")
+    try:
+        from tokenizers import Tokenizer  # type: ignore
+
+        tk = Tokenizer.from_file(json_path)
+        return _TokCount(lambda s: len(tk.encode(s).ids),
+                         f"tokenizers:{json_path}"), "ok"
+    except Exception as e1:  # noqa: BLE001
+        pass
+    try:
+        from transformers import AutoTokenizer  # type: ignore
+
+        tk = AutoTokenizer.from_pretrained(tokenizer_dir,
+                                           trust_remote_code=True)
+        return _TokCount(
+            lambda s: len(tk(s, add_special_tokens=False)["input_ids"]),
+            f"transformers:{tokenizer_dir}"), "ok"
+    except Exception as e2:  # noqa: BLE001
+        return None, f"tokenizers import failed ({e1!r}); transformers failed ({e2!r})"
+
+
+def _anchor_in_line(line, digits):
+    """Byte offset within `line` of the position a trace should watch: the
+    digits when the code has them, else the line start (0)."""
+    if digits and digits in line:
+        return line.index(digits)
+    return 0
+
+
+def _nth_find(haystack, needle, n):
+    """Byte offset of the (0-indexed) n-th occurrence of `needle`, else -1."""
+    start, idx = 0, -1
+    for _ in range(n + 1):
+        idx = haystack.find(needle, start)
+        if idx < 0:
+            return -1
+        start = idx + 1
+    return idx
+
+
+def _find_byte_for_token(out, line, anchor_off, target, tok):
+    """Byte offset `at` in `out` at which inserting `line` puts its anchor (at
+    line-relative byte `anchor_off`) at ~`target` tokens.
+
+    The anchor's prefix in the final ctx is `out[:at] + "\\n\\n" + line[:anchor_off]`;
+    we tokenize exactly that, so the result matches how the position is later
+    measured. Token count is monotone non-decreasing in `at`, so binary search.
+    """
+    pad = "\n\n"
+    pre = line[:anchor_off]
+
+    def prefix_tok(at):
+        return tok.count_ids(out[:at] + pad + pre)
+
+    n = len(out)
+    if prefix_tok(n) <= target:
+        return n
+    lo, hi = 0, n
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if prefix_tok(mid) < target:
+            lo = mid + 1
+        else:
+            hi = mid
+    cands = [x for x in (lo - 1, lo) if 0 <= x <= n]
+    return min(cands, key=lambda x: abs(prefix_tok(x) - target))
+
+
+def build_context_measured(target_bytes, lines, placements, blob, question,
+                           digits, tok):
+    """Build the context and MEASURE each needle's anchor token position.
+
+    placements: list parallel to `lines`; each is ("depth", frac) or ("tok", N).
+      - ("depth", frac): insert at byte fraction `frac` of the filler (legacy).
+      - ("tok", N): insert so the line's anchor (digits if present else start)
+        lands at token position N. Processed shallowest-first so each anchor's
+        prefix already contains every shallower needle; requires `tok`.
+    digits: the digits substring used as anchor when present (may be None).
+    tok: _TokCount or None (depth mode still works without it).
+
+    Returns (ctx, total_tokens_or_None, positions) where positions is a list
+    parallel to `lines` of {line_byte, line_token, anchor_byte, anchor_token,
+    placed_target, placed_ok}. anchor_* are the digits position when digits are
+    in the line, else the line-start position.
+    """
+    text = _filler_text(target_bytes, lines, question, blob)
+    n_lines = len(lines)
+    tok_mode = any(m == "tok" for m, _ in placements)
+    if tok_mode and tok is None:
+        raise SystemExit(
+            "--abs-pos needs a tokenizer to place by token; install `tokenizers`"
+            " (pip) or pass --tokenizer <model-dir>.")
+
+    out = text
+    if tok_mode:
+        for i in sorted(range(n_lines), key=lambda i: placements[i][1]):
+            line = lines[i]
+            at = _find_byte_for_token(out, line,
+                                      _anchor_in_line(line, digits),
+                                      placements[i][1], tok)
+            out = out[:at] + "\n\n" + line + "\n\n" + out[at:]
+    else:
+        for line, (m, frac) in sorted(zip(lines, placements),
+                                      key=lambda x: -x[1][1]):
+            at = int(len(text) * frac)
+            out = out[:at] + "\n\n" + line + "\n\n" + out[at:]
+    ctx = out + "\n\n" + question
+
+    total = tok.count_ids(ctx) if tok is not None else None
+    positions = []
+    for i, line in enumerate(lines):
+        lb = _nth_find(ctx, line, i)
+        anchor_off = _anchor_in_line(line, digits)
+        ab = lb + anchor_off if lb >= 0 else -1
+        line_tok = tok.count_ids(ctx[:lb]) if (tok is not None and lb >= 0) else None
+        anchor_tok = (tok.count_ids(ctx[:ab])
+                      if (tok is not None and lb >= 0) else None)
+        placed_target = placements[i][1] if placements[i][0] == "tok" else None
+        placed_ok = (abs(anchor_tok - placed_target) <= 2
+                     if (placed_target is not None and anchor_tok is not None)
+                     else None)
+        positions.append({
+            "line_byte": lb, "line_token": line_tok,
+            "anchor_byte": ab, "anchor_token": anchor_tok,
+            "placed_target": placed_target, "placed_ok": placed_ok,
+        })
+    return ctx, total, positions
+
+
 def norm(s):
     return re.sub(r"[^a-z0-9]", "", s.lower())
 
 
-def one(base, model, L, variant, run, depth, blob, bpt, max_tok, top_n,
+def one(base, model, L, variant, run, place, blob, bpt, tok, max_tok, top_n,
         timeout, log):
+    """Run one request. `place` is ("depth", frac) or ("tok", abs_token_pos);
+    a token placement puts the needle's anchor (digits if present) at that
+    absolute token position and requires `tok`."""
     lines, mdepths, question, expected, label = build_spec(variant, L, run)
-    depths = mdepths if mdepths is not None else [depth]
-    ctx = build_context(max(1, int(L * bpt)), lines, depths, blob, question)
+    if place[0] == "tok":
+        if len(lines) != 1:
+            raise SystemExit(
+                f"--abs-pos is single-needle, but variant {variant!r} inserts "
+                f"{len(lines)} needle lines")
+        placements = [place]
+        req_depths = [None]
+    else:
+        req_depths = mdepths if mdepths is not None else [place[1]]
+        placements = [("depth", d) for d in req_depths]
+
+    code = needle_code(L, run)
+    word, digits = code.split("-", 1)
+    ctx, total_tok, positions = build_context_measured(
+        max(1, int(L * bpt)), lines, placements, blob, question, digits, tok)
+
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": ctx}],
@@ -209,6 +412,7 @@ def one(base, model, L, variant, run, depth, blob, bpt, max_tok, top_n,
     except Exception as e:
         log(f"[needle] L={L} {variant} run{run}: ERROR {type(e).__name__}: {e}")
         return {"length": L, "variant": variant, "run": run,
+                "place_mode": place[0],
                 "error": f"{type(e).__name__}: {e}"}
     dt = time.perf_counter() - t0
 
@@ -222,14 +426,31 @@ def one(base, model, L, variant, run, depth, blob, bpt, max_tok, top_n,
               for p in lp]
 
     # THE decomposition: correct is not one bit, it is word vs digits.
-    code = needle_code(L, run)
-    word, digits = code.split("-")
     word_present = word.lower() in ans.lower()
     digits_present = digits in ans
     correct = norm(expected) in norm(ans)
+
+    pos0 = positions[0] if positions else {}
     rec = {
-        "length": L, "variant": variant, "run": run, "depth": depths,
-        "actual_prompt_tokens": pt, "needle_abs_pos_est": [int(pt * x) for x in depths],
+        "length": L, "variant": variant, "run": run,
+        "place_mode": place[0], "depth": req_depths,
+        "actual_prompt_tokens": pt,
+        "context_tokens": total_tok,
+        "position_measured": total_tok is not None,
+        # The anchor = digits (the ratio-4 column a trace watches) when the
+        # code has them, else the needle line start. These REPLACE the unsound
+        # needle_abs_pos_est = int(pt * depth) that pointed traces 243 columns
+        # away from the needle (README §2).
+        "needle_token_pos": [p["anchor_token"] for p in positions],
+        "needle_token_frac": ([round(p["anchor_token"] / total_tok, 4)
+                               for p in positions] if total_tok
+                              else [None] * len(positions)),
+        "needle_byte_pos": [p["anchor_byte"] for p in positions],
+        "needle_byte_frac": [round(p["anchor_byte"] / len(ctx), 4)
+                             for p in positions],
+        "needle_line_token_pos": [p["line_token"] for p in positions],
+        "placed_target": pos0.get("placed_target"),
+        "placed_ok": pos0.get("placed_ok"),
         "true_code": code, "expected": expected, "answer": ans,
         "correct": correct, "word_present": word_present,
         "digits_present": digits_present,
@@ -237,10 +458,13 @@ def one(base, model, L, variant, run, depth, blob, bpt, max_tok, top_n,
                  "digits_only" if word_present else "word_and_digits"),
         "wall_s": round(dt, 2), "tokens": tokens,
     }
+    ptag = (f" place_tok={pos0.get('placed_target')} ok={pos0.get('placed_ok')}"
+            if place[0] == "tok" else "")
     log(f"[needle] L={L:>6} {variant:<9} pt={pt:<6} "
         f"{'PASS' if correct else 'FAIL':<4} word={str(word_present):<5} "
         f"digits={str(digits_present):<5} lost={rec['lost']:<15} "
-        f"({dt:.0f}s) want={label!r} got={ans[:44]!r}")
+        f"ntok@anchor={pos0.get('anchor_token')}{ptag} "
+        f"({dt:.0f}s) want={label!r} got={ans[:40]!r}")
     return rec
 
 
@@ -252,8 +476,16 @@ def main():
     ap.add_argument("--variant", default="ask", choices=VARIANTS)
     ap.add_argument("--depth", type=float, default=0.5)
     ap.add_argument("--abs-pos", default=None,
-                    help="comma-separated ABSOLUTE token positions; overrides "
-                         "--depth (depth = pos / measured prompt_tokens)")
+                    help="comma-separated ABSOLUTE TOKEN positions for the "
+                         "needle's anchor (digits if present, else line start); "
+                         "one request per position. Places BY TOKEN (tokenize, "
+                         "insert, verify within +-2) -- NOT by byte fraction. "
+                         "Overrides --depth; single-needle variants only.")
+    ap.add_argument("--tokenizer", default=DEFAULT_TOKENIZER_DIR,
+                    help="model dir (with tokenizer.json) or tokenizer.json "
+                         "path used to MEASURE needle token positions and to "
+                         "place --abs-pos. Pass '' to disable (positions become "
+                         "UNMEASURED and --abs-pos errors).")
     ap.add_argument("--runs", type=int, default=1)
     ap.add_argument("--bpt", type=float, default=3.6,
                     help="bytes/token for sizing; 3.6 matches needle_sweep so "
@@ -270,22 +502,28 @@ def main():
     blob = filler_blob(files, log)
     log(f"[needle] filler {len(blob.encode()):,} bytes; variant={a.variant}")
 
+    if a.tokenizer:
+        tok, tok_status = load_tokenizer(a.tokenizer)
+        if tok is None:
+            log(f"[needle] WARNING: tokenizer unavailable ({tok_status}); "
+                f"needle_token_pos will be UNMEASURED and --abs-pos will error. "
+                f"Install `tokenizers` (pip) or fix --tokenizer.")
+        else:
+            log(f"[needle] tokenizer: {tok.source}")
+    else:
+        tok = None
+        log("[needle] tokenizer disabled (--tokenizer ''); positions UNMEASURED")
+
+    abs_positions = [int(x) for x in a.abs_pos.split(",")] if a.abs_pos else []
     lengths = [int(x) for x in a.lengths.split(",") if x]
     results = []
     for L in lengths:
-        # An absolute position needs prompt_tokens, which is only known after a
-        # request; bpt*L is a good enough estimate to convert, and the record
-        # reports the measured position so the estimate is auditable.
-        if a.abs_pos:
-            est_pt = L * a.bpt / a.bpt  # == L; refined by actual_prompt_tokens
-            depths = [min(0.999, max(0.0, int(p) / max(1, est_pt)))
-                      for p in a.abs_pos.split(",")]
-        else:
-            depths = [a.depth]
-        for depth in depths:
+        places = ([("tok", n) for n in abs_positions]
+                  if abs_positions else [("depth", a.depth)])
+        for place in places:
             for run in range(a.runs):
                 results.append(one(a.endpoint, a.model, L, a.variant, run,
-                                   depth, blob, a.bpt, a.max_tokens,
+                                   place, blob, a.bpt, tok, a.max_tokens,
                                    a.top_logprobs, a.timeout, log))
 
     ok = [r for r in results if r.get("correct")]
