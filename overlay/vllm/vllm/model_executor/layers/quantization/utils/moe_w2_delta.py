@@ -1789,11 +1789,20 @@ class DeltaTier:
 def mark_seen(seen_row, ids):
     """Record routed experts into a layer's seen row from the forward. Token
     COUNTS when observability is on (token-weighted hit-rate / capture), else a
-    cheap binary flag. `ids` = flattened topk_ids (int64). Graph-capture-safe."""
+    cheap binary flag. `ids` = flattened topk_ids (int64). Invalid/padded
+    router rows are ignored without data-dependent indexing so this remains
+    graph-capture-safe."""
+    valid = (ids >= 0) & (ids < seen_row.numel())
+    safe_ids = ids.clamp(0, seen_row.numel() - 1)
+    values = valid.to(dtype=seen_row.dtype)
     if _COUNT:
-        seen_row.index_add_(0, ids, torch.ones_like(ids, dtype=seen_row.dtype))
+        seen_row.index_add_(0, safe_ids, values)
     else:
-        seen_row.index_fill_(0, ids, 1)
+        # A masked index_fill_ would still mark whichever endpoint receives an
+        # invalid clamped ID.  amax preserves binary semantics even when valid
+        # IDs repeat and contributes zero for every padded entry.
+        seen_row.scatter_reduce_(
+            0, safe_ids, values, reduce="amax", include_self=True)
 
 
 _TIER: DeltaTier | None = None
