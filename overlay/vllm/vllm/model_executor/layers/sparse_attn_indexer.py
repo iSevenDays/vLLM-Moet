@@ -51,6 +51,66 @@ logger = init_logger(__name__)
 
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
+# --- Indexer score-rank trace (opt-in diagnostic) --------------------------
+# Long-context exact recall on sm_89 needs far more selection coverage
+# (index_topk / candidates) than the architecture targets, and every indirect
+# test of the score path came back clean. This trace answers the question
+# directly instead: for a KNOWN needle token position, where does its compressed
+# entry actually RANK among the candidates, and does it survive the top-k?
+#
+#   VLLM_DSV4_INDEXER_TRACE=1        enable (default off; zero cost when off)
+#   VLLM_DSV4_INDEXER_TRACE_POS=<n>  the needle's ABSOLUTE token position
+#   VLLM_DSV4_INDEXER_TRACE_MIN_N=<n> only trace rows with >= n candidates, so
+#                                    only the final prefill chunk (whose query
+#                                    is the real question) reports
+#   VLLM_DSV4_INDEXER_TRACE_MAX=<n>  cap emissions (default 24)
+#
+# Columns of `logits` index the indexer's COMPRESSED K cache, so the needle's
+# entry is `pos // compress_ratio`. This free function does not know the layer's
+# ratio, so both candidate columns are reported (ratio 4 and ratio 128); read
+# the one matching the layer. Costs a host sync -- diagnostic runs only.
+_IX_TRACE = os.getenv("VLLM_DSV4_INDEXER_TRACE", "0") == "1"
+_IX_TRACE_POS = int(os.getenv("VLLM_DSV4_INDEXER_TRACE_POS", "-1"))
+_IX_TRACE_MIN_N = int(os.getenv("VLLM_DSV4_INDEXER_TRACE_MIN_N", "0"))
+_IX_TRACE_MAX = int(os.getenv("VLLM_DSV4_INDEXER_TRACE_MAX", "24"))
+_ix_trace_emitted = 0
+
+
+def _trace_indexer_rank(logits, topk_indices, cu_seqlen_ks, cu_seqlen_ke, k):
+    """Report the score rank of the needle's compressed entry. Opt-in only."""
+    global _ix_trace_emitted
+    if _ix_trace_emitted >= _IX_TRACE_MAX or _IX_TRACE_POS < 0:
+        return
+    try:
+        row = logits.shape[0] - 1  # last query row of the chunk
+        ks = int(cu_seqlen_ks[row].item())
+        ke = int(cu_seqlen_ke[row].item())
+        n = ke - ks
+        if n < _IX_TRACE_MIN_N or n <= 0:
+            return
+        valid = logits[row, ks:ke].float()
+        sel = set(int(x) for x in topk_indices[row].tolist() if x >= 0)
+        parts = []
+        for ratio in (4, 128):
+            col = _IX_TRACE_POS // ratio
+            if not (ks <= col < ke):
+                parts.append(f"r{ratio}:col={col}(out-of-range)")
+                continue
+            score = valid[col - ks]
+            # rank 0 == highest scoring; strictly-greater count
+            rank = int((valid > score).sum().item())
+            parts.append(
+                f"r{ratio}:col={col} score={score.item():.4f} rank={rank}/{n} "
+                f"pct={rank / max(1, n):.1%} selected={col in sel}")
+        _ix_trace_emitted += 1
+        logger.info(
+            "DSv4 indexer rank trace [%d/%d]: row=%d candidates=%d k=%d "
+            "needle_pos=%d | %s", _ix_trace_emitted, _IX_TRACE_MAX, row, n, k,
+            _IX_TRACE_POS, "  ".join(parts))
+    except Exception as e:  # never let a diagnostic break serving
+        logger.warning("DSv4 indexer rank trace failed: %s: %s",
+                       type(e).__name__, e)
+
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
 
@@ -600,6 +660,9 @@ def sparse_attn_indexer(
                     logits.stride(1),
                     topk_tokens,
                 )
+                if _IX_TRACE:
+                    _trace_indexer_rank(logits, topk_indices, cu_seqlen_ks,
+                                        cu_seqlen_ke, topk_tokens)
 
             _merge_dcp_topk_global(
                 logits,

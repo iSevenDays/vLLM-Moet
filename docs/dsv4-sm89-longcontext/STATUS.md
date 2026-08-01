@@ -993,6 +993,67 @@ hypothesis — `digitspad` exists only to kill §5.17. Keep doing that: on this
 system a plausible story fits the data far more often than it is true, and the
 cheap falsifier is always worth writing before the expensive confirmation.
 
+### 5.19 MEASURED, not inferred: the needle's entry ranks near the k=512 cut
+
+Stopped inferring from answers and instrumented the selection directly. New
+opt-in trace in `overlay/vllm/vllm/model_executor/layers/sparse_attn_indexer.py`
+reports, for a known needle token position, the score RANK of its compressed
+entry among the live candidates and whether it survived the top-k:
+
+    VLLM_DSV4_INDEXER_TRACE=1
+    VLLM_DSV4_INDEXER_TRACE_POS=<absolute needle token position>
+    VLLM_DSV4_INDEXER_TRACE_MIN_N=<n>   # only the final prefill chunk
+    VLLM_DSV4_INDEXER_TRACE_MAX=<n>
+
+Zero cost when off. On the FAILING `ask` request (pt 9686, needle at abs 4843 ->
+ratio-4 column 1210, 2088 candidates, k=512, production config):
+
+| trace | rank / 2088 | pct | selected |
+|------:|------------:|----:|:--------:|
+| 9  | 112  | 5.4%  | **True**  |
+| 10 | 592  | 28.4% | False |
+| 11 | 523  | 25.0% | False |
+| 12 | 1003 | 48.0% | False |
+| 13 | 693  | 33.2% | False |
+| 14 | 184  | 8.8%  | **True**  |
+| 15 | 125  | 6.0%  | **True**  |
+| 16 | 492  | 23.6% | **True**  |
+
+**The needle's entry is selected in only about half the ratio-4 layers.** Its
+rank swings between 5% and 48% across layers while the cut sits at
+512/2088 = 24.5%, so the layers ranking it 25-48% drop it entirely.
+
+Three things this settles:
+
+1. **The top-k is correct, confirmed from live serving.** rank 492 -> selected,
+   rank 523 -> not selected: the boundary is exactly 512. Third independent
+   confirmation (after `tools/test_indexer_topk_selection.py` and the paged
+   suite), and the last plausible place for a selection bug.
+2. **The scores are not broken.** The needle frequently ranks in the top 5-10%;
+   this is a plausible relevance ordering, not garbage. So "the sm89 indexer
+   produces bad scores" is NOT supported — it produces *variable* scores that
+   straddle a narrow cut.
+3. **The mechanism is marginal selection, now measured rather than argued.** It
+   explains the whole picture directly: `index_topk=2048` (coverage 98% at this
+   length) captures the entry in every layer -> 6/6 pass (§5.15); a digit-naming
+   query raises the entry's score in more layers -> `digitsonly`/`digitspad`
+   pass (§5.18); and any numerically-transparent perturbation (chunk size)
+   reshuffles which layers land inside the cut -> the coin-flips of §5.14.
+
+**Consequence for the "sm89 defect" framing.** There may be no sm89-specific
+defect here at all. Exact 4-digit recall from a ~10K adversarial context under a
+generic query may simply exceed what `index_topk=512` delivers on ANY hardware —
+upstream has only ever validated the easy random-word needle (§5.16). Deciding
+this needs the same trace run on a Blackwell box (identical prompt, identical
+needle position): if the entry ranks comfortably inside 512 there and marginally
+here, the port is implicated; if it straddles the cut there too, this is an
+architectural property of DSA at k=512 and the fix is a higher `index_topk`
+(quality-validated) rather than a kernel hunt.
+
+Trace limitations to know: both TP ranks emit, so each line appears twice; the
+trace labels emissions by counter, not by layer id (add the layer prefix if
+per-layer attribution matters); and it costs a host sync, so it is diagnostic-only.
+
 ## 6. KV capacity: runtime fits three full contexts; printed metrics were wrong
 
 - Startup reported 912,691 tokens/3.482x; `/metrics` reported

@@ -1,5 +1,5 @@
 diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
-index ceb52e5..d7be66a 100644
+index ceb52e5..6c0ad51 100644
 --- a/vllm/model_executor/layers/sparse_attn_indexer.py
 +++ b/vllm/model_executor/layers/sparse_attn_indexer.py
 @@ -1,13 +1,18 @@
@@ -22,7 +22,7 @@ index ceb52e5..d7be66a 100644
  from vllm.config import get_current_vllm_config
  from vllm.distributed import get_dcp_group
  from vllm.forward_context import get_forward_context
-@@ -34,6 +39,12 @@
+@@ -34,14 +39,111 @@
      DeepseekV32IndexerMetadata,
  )
  from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
@@ -35,8 +35,69 @@ index ceb52e5..d7be66a 100644
  from vllm.v1.worker.workspace import current_workspace_manager
  
  logger = init_logger(__name__)
-@@ -42,6 +53,37 @@
  
+ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
+ 
++# --- Indexer score-rank trace (opt-in diagnostic) --------------------------
++# Long-context exact recall on sm_89 needs far more selection coverage
++# (index_topk / candidates) than the architecture targets, and every indirect
++# test of the score path came back clean. This trace answers the question
++# directly instead: for a KNOWN needle token position, where does its compressed
++# entry actually RANK among the candidates, and does it survive the top-k?
++#
++#   VLLM_DSV4_INDEXER_TRACE=1        enable (default off; zero cost when off)
++#   VLLM_DSV4_INDEXER_TRACE_POS=<n>  the needle's ABSOLUTE token position
++#   VLLM_DSV4_INDEXER_TRACE_MIN_N=<n> only trace rows with >= n candidates, so
++#                                    only the final prefill chunk (whose query
++#                                    is the real question) reports
++#   VLLM_DSV4_INDEXER_TRACE_MAX=<n>  cap emissions (default 24)
++#
++# Columns of `logits` index the indexer's COMPRESSED K cache, so the needle's
++# entry is `pos // compress_ratio`. This free function does not know the layer's
++# ratio, so both candidate columns are reported (ratio 4 and ratio 128); read
++# the one matching the layer. Costs a host sync -- diagnostic runs only.
++_IX_TRACE = os.getenv("VLLM_DSV4_INDEXER_TRACE", "0") == "1"
++_IX_TRACE_POS = int(os.getenv("VLLM_DSV4_INDEXER_TRACE_POS", "-1"))
++_IX_TRACE_MIN_N = int(os.getenv("VLLM_DSV4_INDEXER_TRACE_MIN_N", "0"))
++_IX_TRACE_MAX = int(os.getenv("VLLM_DSV4_INDEXER_TRACE_MAX", "24"))
++_ix_trace_emitted = 0
++
++
++def _trace_indexer_rank(logits, topk_indices, cu_seqlen_ks, cu_seqlen_ke, k):
++    """Report the score rank of the needle's compressed entry. Opt-in only."""
++    global _ix_trace_emitted
++    if _ix_trace_emitted >= _IX_TRACE_MAX or _IX_TRACE_POS < 0:
++        return
++    try:
++        row = logits.shape[0] - 1  # last query row of the chunk
++        ks = int(cu_seqlen_ks[row].item())
++        ke = int(cu_seqlen_ke[row].item())
++        n = ke - ks
++        if n < _IX_TRACE_MIN_N or n <= 0:
++            return
++        valid = logits[row, ks:ke].float()
++        sel = set(int(x) for x in topk_indices[row].tolist() if x >= 0)
++        parts = []
++        for ratio in (4, 128):
++            col = _IX_TRACE_POS // ratio
++            if not (ks <= col < ke):
++                parts.append(f"r{ratio}:col={col}(out-of-range)")
++                continue
++            score = valid[col - ks]
++            # rank 0 == highest scoring; strictly-greater count
++            rank = int((valid > score).sum().item())
++            parts.append(
++                f"r{ratio}:col={col} score={score.item():.4f} rank={rank}/{n} "
++                f"pct={rank / max(1, n):.1%} selected={col in sel}")
++        _ix_trace_emitted += 1
++        logger.info(
++            "DSv4 indexer rank trace [%d/%d]: row=%d candidates=%d k=%d "
++            "needle_pos=%d | %s", _ix_trace_emitted, _IX_TRACE_MAX, row, n, k,
++            _IX_TRACE_POS, "  ".join(parts))
++    except Exception as e:  # never let a diagnostic break serving
++        logger.warning("DSv4 indexer rank trace failed: %s: %s",
++                       type(e).__name__, e)
++
  # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
  MXFP4_BLOCK_SIZE = 32
 +
@@ -73,7 +134,7 @@ index ceb52e5..d7be66a 100644
  
  
  def _assert_cutedsl_dcp_merge_supported(
-@@ -291,6 +333,36 @@
+@@ -291,6 +393,36 @@
      return kv_cache.unsqueeze(-2)
  
  
@@ -110,7 +171,7 @@ index ceb52e5..d7be66a 100644
  @eager_break_during_capture
  def sparse_attn_indexer(
      hidden_states: torch.Tensor,
-@@ -313,6 +385,8 @@
+@@ -313,6 +445,8 @@
      dcp_world_size: int = 1,
      cp_kv_cache_interleave_size: int = 1,
      skip_topk_buffer_clear: bool = False,
@@ -119,7 +180,7 @@ index ceb52e5..d7be66a 100644
  ) -> torch.Tensor:
      # careful! this will be None in dummy run
      attn_metadata = get_forward_context().attn_metadata
-@@ -332,11 +406,52 @@
+@@ -332,11 +466,52 @@
          )
  
          # Dummy allocation to simulate for peak logits tensor memory during inference.
@@ -177,7 +238,7 @@ index ceb52e5..d7be66a 100644
  
          return sparse_attn_indexer_fake(
              hidden_states,
-@@ -355,6 +470,9 @@
+@@ -355,6 +530,9 @@
              topk_indices_buffer,
              skip_k_cache_insert,
              use_fp4_cache,
@@ -187,10 +248,21 @@ index ceb52e5..d7be66a 100644
          )
      attn_metadata_narrowed = attn_metadata[k_cache_prefix]
      assert isinstance(attn_metadata_narrowed, DeepseekV32IndexerMetadata)
-@@ -493,6 +611,17 @@
+@@ -482,6 +660,9 @@
+                     logits.stride(1),
+                     topk_tokens,
+                 )
++                if _IX_TRACE:
++                    _trace_indexer_rank(logits, topk_indices, cu_seqlen_ks,
++                                        cu_seqlen_ke, topk_tokens)
+ 
+             _merge_dcp_topk_global(
+                 logits,
+@@ -492,6 +673,17 @@
+                 cp_kv_cache_interleave_size,
                  row_starts=chunk.cu_seqlen_ks,
              )
- 
++
 +            if dcp_world_size > 1:
 +                # Local winners -> global ids -> group-wide top-k. The score
 +                # gather needs workspace columns, so rebase the per-request
@@ -201,11 +273,10 @@ index ceb52e5..d7be66a 100644
 +                    cp_kv_cache_interleave_size,
 +                    col_offset=chunk.cu_seqlen_ks,
 +                )
-+
+ 
      if has_decode:
          decode_metadata = attn_metadata_narrowed.decode
-         assert decode_metadata is not None
-@@ -570,17 +699,29 @@
+@@ -570,17 +762,29 @@
                  clean_logits=False,
              )
          num_rows = logits.shape[0]
@@ -238,7 +309,7 @@ index ceb52e5..d7be66a 100644
              512,
              1024,
              2048,
-@@ -595,7 +736,7 @@
+@@ -595,7 +799,7 @@
                  seq_lens,
                  topk_indices,
                  topk_workspace,
@@ -247,7 +318,7 @@ index ceb52e5..d7be66a 100644
                  attn_metadata_narrowed.max_seq_len,
              )
          elif use_persistent_topk:
-@@ -608,8 +749,8 @@
+@@ -608,8 +812,8 @@
                  seq_lens,
                  topk_indices,
                  topk_workspace,
@@ -258,7 +329,7 @@ index ceb52e5..d7be66a 100644
              )
          else:
              ops.top_k_per_row_decode(
-@@ -620,7 +761,33 @@
+@@ -620,7 +824,33 @@
                  num_rows,
                  logits.stride(0),
                  logits.stride(1),
@@ -293,7 +364,7 @@ index ceb52e5..d7be66a 100644
              )
  
          if decode_metadata.global_seq_lens is not None:
-@@ -668,6 +835,8 @@
+@@ -668,6 +898,8 @@
      dcp_world_size: int = 1,
      cp_kv_cache_interleave_size: int = 1,
      skip_topk_buffer_clear: bool = False,
@@ -302,7 +373,7 @@ index ceb52e5..d7be66a 100644
  ) -> torch.Tensor:
      return topk_indices_buffer
  
-@@ -731,6 +900,46 @@
+@@ -731,6 +963,46 @@
                  "the current vLLM environment."
              )
  
@@ -349,7 +420,7 @@ index ceb52e5..d7be66a 100644
      def forward_native(
          self,
          hidden_states: torch.Tensor,
-@@ -781,6 +990,7 @@
+@@ -781,6 +1053,7 @@
              self.dcp_rank,
              self.dcp_world_size,
              self.cp_kv_cache_interleave_size,
@@ -357,7 +428,7 @@ index ceb52e5..d7be66a 100644
          )
  
      def forward_xpu(
-@@ -800,6 +1010,9 @@
+@@ -800,6 +1073,9 @@
          weights: torch.Tensor,
      ):
          assert not self.use_fp4_cache, "AMD platform doesn't support fp4 cache yet"

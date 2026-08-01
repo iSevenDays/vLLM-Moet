@@ -68,12 +68,37 @@ docker run --rm --gpus '"device=0"' \
 Expected on sm_89: **30 passed, 6 skipped, 0 failed**. The 6 skips are the
 datacenter-Blackwell-only MXFP4 indexer cache.
 
+## Live observability: indexer score-rank trace
+
+The one measurement that discriminated every remaining hypothesis (STATUS 5.19).
+For a KNOWN needle token position it reports the score RANK of that token's
+compressed entry among the live candidates, and whether it survived the top-k.
+Opt-in, zero cost when off, costs a host sync when on.
+
+```bash
+EXTRA_DOCKER_ENV="-e VLLM_DSV4_INDEXER_TRACE=1 \
+  -e VLLM_DSV4_INDEXER_TRACE_POS=4843 \
+  -e VLLM_DSV4_INDEXER_TRACE_MIN_N=2000 \
+  -e VLLM_DSV4_INDEXER_TRACE_MAX=16 \
+  -v $PWD/overlay/vllm/vllm/model_executor/layers/sparse_attn_indexer.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer.py:ro" \
+  ... ./docker/serve_sm89_ds4.sh
+docker logs <name> 2>&1 | grep "indexer rank trace"
+```
+
+`MIN_N` filters to the final prefill chunk (whose query is the real question).
+Note `EXTRA_MOUNTS` is **not** a knob in `serve_sm89_ds4.sh` — pass `-v` through
+`EXTRA_DOCKER_ENV`, which is spliced raw into `docker run`, or the edit silently
+does not reach the container.
+
 ## Two traps that cost real time
 
 1. **`torch.ops._C` is registered lazily on `import vllm`.** Probing it before
    that import reports every custom op as missing — a silent false negative.
    Import vLLM first, then check.
-2. **`cooperative_topk` has no sm_89 kernel image** and *poisons the CUDA
+2. **`EXTRA_MOUNTS` does not exist** in `docker/serve_sm89_ds4.sh`. Passing it
+   is silently ignored and your modified file never reaches the container — a
+   whole 7-minute boot wasted. Smuggle mounts through `EXTRA_DOCKER_ENV`.
+3. **`cooperative_topk` has no sm_89 kernel image** and *poisons the CUDA
    context* when called, so every later case in the same process fails with
    confusing errors. Serving gates it behind `has_device_capability(90)`;
    harnesses must skip it below sm_90 to match.
