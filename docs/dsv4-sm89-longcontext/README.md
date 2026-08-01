@@ -199,10 +199,16 @@ measurements (§3) — black-box request/response, unaffected. The
 **unmeasured**, and the central mechanism claim of §5.18–5.19 rests on it.
 
 ### Two further instrument defects
-1. `_trace_indexer_rank` is called **only from the prefill branch**
-   (`sparse_attn_indexer.py:663`). The decode branch (`persistent_topk` /
-   `top_k_per_row_decode`) has no trace — **selection during generation has
-   never been observed**, and the symptom is a generation failure.
+1. `_trace_indexer_rank` was called **only from the prefill branch**, so
+   selection during generation had never been observed (and the symptom is a
+   generation failure). **Fixed 2026-08-01 (T3):** the trace is now labeled by
+   **layer** (resolved `k_cache_prefix`), emitted from **TP rank 0 only** (both
+   ranks ran it, so every line was doubled), sweeps a **±`SPAN`** window of
+   ratio-4 columns (`VLLM_DSV4_INDEXER_TRACE_SPAN`, default 2 — the exact column
+   is 967–968), and **also fires on the decode branch** after
+   `persistent_topk`/`top_k_per_row_decode` (own cap
+   `VLLM_DSV4_INDEXER_TRACE_DECODE_MAX`). The `sel` (selected) flag is the robust
+   headline signal. *Observation* of decode selection is still pending — T4.
 2. The archived `BRIEFING.md` §3b "needle absolute token pos" column
    (194/1695/2324/4843/9492) comes from the same estimate; `--abs-pos N` was
    converted to `depth = N/L` and applied as a byte fraction. The pass/fail
