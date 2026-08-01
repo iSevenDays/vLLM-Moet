@@ -341,14 +341,16 @@ compressed-attention K-cache path.
 ## 5. Hypotheses, ranked by posterior × cheapness to falsify
 
 **H1 — Selection policy differs from the reference: missing always-included
-local/recent compressed blocks.** The checkpoint concatenates the raw 128-token
-window with `compress_topk_idxs` sharing one softmax (`model.py:520`).
-llama.cpp *additionally* models `indexer.local_blocks`
-(`llama.cpp/src/llama-arch.cpp:260–261`), which has no obvious counterpart here.
-If the port admits *only* the top-k from the compressed segment, recent-but-not-
-top-k entries are dropped where the reference keeps them — and that produces our
-symptom shape directly. **Highest-value structural lead.**
-*Falsifier:* V3, CPU, no boot.
+local/recent compressed blocks.** ~~Highest-value structural lead.~~
+**REFUTED 2026-08-01 (T2, CPU).** All three implementations assemble the attend
+set as `[sliding window] + [top-k compressed]`; none always-includes recent
+compressed blocks. The trained checkpoint itself has no `local_blocks`
+(`model.py:520` = `cat([window, topk])`; `Indexer` is pure top-k, `:433`); the
+port matches it (`combine_topk_swa_indices` kernel writes `topk_len + swa_len`);
+and `indexer.local_blocks` in llama.cpp **defaults to 0** and is consumed only by
+`minimax-m3.cpp` — `dflash.cpp` does not reference it at all. The lead was an
+artifact of a llama-arch key that exists for MiniMax-M3. Full side-by-side + the
+reproduce commands: [`runlogs/T2_local_blocks_parity.md`](runlogs/T2_local_blocks_parity.md).
 
 **H2 — The digit entry is in fact selected and the mechanism story is wrong.**
 §5.18's "query content raises the digit entry's score" was inferred from

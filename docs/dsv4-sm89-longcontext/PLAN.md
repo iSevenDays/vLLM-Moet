@@ -426,7 +426,7 @@ After **every** task:
 | task | status | result |
 |---|---|---|
 | T1 probe position hygiene | DONE | probe reports measured `needle_token_pos` (digits @ 3871 @ ask/8192/0.5, ratio-4 col 967; not 4843/1210); `--abs-pos` places by token (`placed_ok`, ±2 verified 200/2000/3871/6000); `needle_abs_pos_est` removed. Live smoke reproduces FAIL/digits_only. Needs host `pip install tokenizers`. |
-| T2 `local_blocks` parity (H1) | TODO | |
+| T2 `local_blocks` parity (H1) | DONE | **H1 REFUTED** (CPU). All three = `[window]+[top-k compressed]`; none has local_blocks. Checkpoint `model.py:520` cat([win,topk]), Indexer pure topk (:433); port kernel writes `topk_len+swa_len`; llama.cpp `indexer_local_blocks`=0 default, read ONLY in minimax-m3.cpp — dflash.cpp doesn't reference it. Lead was a MiniMax-M3 llama-arch key. → runlogs/T2_local_blocks_parity.md. Go T3. |
 | T3 make trace usable | TODO | |
 | T4 retrace correct column (decisive) | TODO | |
 | T5 cross-chunk compressor (H3) | TODO | |
