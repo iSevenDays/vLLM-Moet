@@ -818,6 +818,70 @@ already verified is correct by score.
 
 Artifacts: `docs/dsv4-sm89-longcontext/runlogs/needle_topk2048_*.json`.
 
+### 5.16 CORRECTION to 5.15's "26x gap", plus a cheaper like-for-like reproducer
+
+Two things in 5.15 needed fixing, and fixing them produced a better metric.
+
+**(a) The "~26x ranking-quality gap" arithmetic was unsound. Retracted as a
+measured quantity.** It compared our coverage requirement (~44%, measured with
+the HARD needle: realistic repo-text filler, `WORD-DDDD` code, depth 0.5)
+against upstream's 1.7% (`512 / (121000/4)`) — but upstream's recipe is
+`needle: sizes_words: [8000, 90000]`, which drives the OLD `needle` probe in
+`bench/runner/probes.py`, i.e. **random-WORD filler at the probe's default depth
+0.1**. Different task, different difficulty. The ratio mixed two probes and must
+not be quoted.
+
+**(b) Indexer key-quantization granularity is NOT the mechanism.**
+`tools/test_indexer_score_ranking.py` (CPU, seconds) round-trips indexer keys
+through E4M3 at this port's per-row (D=128) scale vs the checkpoint's
+`fp4_block_size=32` granularity and measures recall@k of the exact top-k:
+
+| candidates | k | recall @ per-row | recall @ block32 |
+|-----------:|---:|----------------:|-----------------:|
+| 2422 | 512 | 98.0% | 99.2% |
+| 4640 | 512 | 98.0% | 99.8% |
+| 8956 | 512 | 96.1% | 96.9% |
+| 8956 | 2048 | 97.9% | 98.1% |
+
+~1% apart, and the top-scoring entry is never dislodged (`rank_best = 0`
+everywhere), in both homogeneous and channel-outlier regimes. A 1% recall effect
+cannot explain the coverage requirement. E4M3 key quantization barely perturbs
+ranking at all.
+
+**But the sm89 regression IS real — now on a like-for-like task.** Running
+upstream's own probe and settings against our production config
+(`index_topk=512`, chunk 1056), secret `GLACIER-7741-ORYX`, 8000 filler words
+→ 10,815 prompt tokens:
+
+| depth | reply | verdict |
+|------:|-------|:-------:|
+| 0.1 (upstream default) | `GLACIER` | FAIL — digits and `ORYX` both lost |
+| 0.5 | `GLACIER-7741` | FAIL — `ORYX` lost |
+
+Upstream's recipe records PASS for **both** 8000 and 90000 words (≈121K tokens).
+Same probe, same secret, same depth, and we fail at 10.8K where they pass at
+121K. That is a genuine sm89 regression, stated qualitatively instead of as a
+bogus ratio.
+
+**Two useful consequences:**
+
+1. **A much cheaper regression metric.** The easy needle fails in ~65 s at 10.8K
+   tokens, versus 100–650 s per point for the hard needle, and it is the exact
+   probe upstream validates against — so it is the right gate for closing the
+   gap: `python3 tools/needle_probe.py 8011 8000 0.1`.
+2. **A repo claim is wrong and should stop being repeated.** Both
+   `bench/suites/needle_sweep.yaml` and the `needle_sweep` docstring assert that
+   random-WORD filler "did NOT reproduce the failure". At 10.8K tokens it
+   reproduces it plainly, and *more* severely at depth 0.1 than at 0.5. Whatever
+   configuration that claim came from, it does not generalise; realistic filler
+   is not required to see this.
+
+Note the failure shape is identical across both probes and both filler types:
+the needle's leading component survives and the TAIL is lost
+(`GLACIER-7741-ORYX` → `GLACIER-7741` → `GLACIER`;
+`ZEPHYR-ORYX-CYPRESS` → `ZEPHYR-ORYX-CORYX`). Whatever the mechanism, it
+truncates verbatim copy length rather than failing to locate the needle.
+
 ## 6. KV capacity: runtime fits three full contexts; printed metrics were wrong
 
 - Startup reported 912,691 tokens/3.482x; `/metrics` reported

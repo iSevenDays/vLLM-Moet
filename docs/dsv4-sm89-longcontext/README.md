@@ -58,10 +58,30 @@ coverage ≳44%, FAIL at ≤40%, coin-flip between. Rule of thumb: **reliable
 context ≈ 10 × index_topk** (512 → ~5K, 2048 → ~20K; 35825 tokens at topk 2048
 = 23% coverage, and it FAILS).
 
-**The important number:** upstream passes `needle @121k` with `index_topk=512` —
-coverage **1.7%**. We need **~44%**. That is a **~26× gap in indexer ranking
-quality** versus the native path: a substantive defect that never surfaces as a
-crash or a reference mismatch.
+**The regression is real, but quote it qualitatively — not as a ratio.** An
+earlier "~26× ranking-quality gap" figure was withdrawn (STATUS §5.16): it
+divided our hard-needle coverage requirement by upstream's, and upstream's
+recipe (`needle: sizes_words: [8000, 90000]`) runs a *different, easier* probe
+(random-word filler, default depth 0.1). Like-for-like, on upstream's own probe
+and settings, is still damning: at 10,815 tokens we return `GLACIER` for secret
+`GLACIER-7741-ORYX`, while upstream records PASS for both 8000 and 90000 words
+(≈121K tokens).
+
+Use that easy needle as the regression gate — it fails in **~65 s** versus
+100–650 s per hard-needle point, and it is exactly what upstream validates:
+
+```bash
+python3 tools/needle_probe.py 8011 8000 0.1     # FAIL today: "GLACIER"
+```
+
+⚠️ `bench/suites/needle_sweep.yaml` and the `needle_sweep` docstring claim
+random-word filler "did NOT reproduce the failure". **That is wrong** at this
+length — it reproduces plainly, and more severely at depth 0.1 than 0.5.
+
+Note the failure shape is filler-independent: the needle's leading component
+survives and the **tail** is lost (`GLACIER-7741-ORYX` → `GLACIER-7741` →
+`GLACIER`). Whatever the mechanism, it truncates verbatim copy length rather
+than failing to locate the needle.
 
 So:
 - `index_topk=2048` is a usable mitigation **up to ~20K context** and must still

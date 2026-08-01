@@ -19,9 +19,10 @@ reaching for another boot. Background:
 | `test_compressor_vs_checkpoint_ref.py` | CPU + `/kernels` mount | seconds | Compressor semantics vs an **independent transcription of the checkpoint's own `Compressor`** — the in-repo reference and the kernel were written together, so a shared misreading would pass. Agrees at ~2.6e-3 (bf16 floor). |
 | `test_compressor_state_capacity.py` | CPU | seconds | The state cache holds a **whole prefill chunk + the window**, so `save_partial_states` cannot overwrite state a later compress output still needs. Carries a negative control. |
 | `test_indexer_topk_selection.py` | 1 GPU | ~1 min | The Lightning-Indexer top-k selects **by score**, not positionally: with every high score beyond index 512, `persistent_topk` returns 512/512 correct. |
+| `test_indexer_score_ranking.py` | CPU | seconds | Whether indexer key-quantization GRANULARITY costs top-k ranking recall (this port's per-row D=128 scale vs the checkpoint's `fp4_block_size=32`). Verdict: **no** — ~1% apart, top entry never dislodged. |
 | `needle_digits_probe.py` | server | 30–190 s/point | Needle probe reporting `word_present` / `digits_present` separately plus top-N logprobs. **Use this, not `bench/runner/probes.py --probe needle_sweep`**, whose single-bit verdict caused a multi-hour misdiagnosis. |
 | `vllm_dsv4_chat_benchmark.py` | server | varies | Throughput / prefill / capacity probe (`single`, `concurrent`, `prefill`). Emits `gpu_telemetry` on failure too and survives EngineCore death. |
-| `needle_probe.py` | server | ~1 min | Quick needle with RANDOM-WORD filler. **Does not reproduce the failure** — realistic filler is required. Kept for contrast. |
+| `needle_probe.py` | server | ~65 s | Random-WORD-filler needle, and **the probe upstream's recipes validate against** (`needle: sizes_words: [8000, 90000]`, default depth 0.1). Use it as the cheap like-for-like regression gate: `needle_probe.py 8011 8000 0.1` fails today with `GLACIER` for `GLACIER-7741-ORYX`. NOTE: the repo's claim that random filler "does not reproduce the failure" is **wrong** at this length (STATUS 5.16). |
 | `needle_full.py` | server | varies | Needle + reasoning trace. |
 
 ### Running the containerised harnesses
