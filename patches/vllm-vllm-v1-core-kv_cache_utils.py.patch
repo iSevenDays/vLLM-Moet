@@ -1,5 +1,5 @@
 diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
-index b13c23d..f41566c 100644
+index b13c23d..e70c234 100644
 --- a/vllm/v1/core/kv_cache_utils.py
 +++ b/vllm/v1/core/kv_cache_utils.py
 @@ -916,24 +916,36 @@
@@ -188,7 +188,7 @@ index b13c23d..f41566c 100644
          # NOTE(yifan): for now, inside a UniformKV group, each page_size should
          # have the same number of layers. This also means we don't need to pad layers
          # inside a partial-full layer tuple.
-@@ -2143,6 +2132,18 @@
+@@ -2143,6 +2132,19 @@
                  vllm_config, kv_cache_config
              )
  
@@ -201,7 +201,8 @@ index b13c23d..f41566c 100644
 +                kv_cache_config.num_blocks,
 +                max(kv_cache_config.num_blocks - 1, 0),
 +                sum(blocks_per_group),
-+                blocks_per_group,
++                # info_once is backed by an lru_cache and hashes every arg.
++                tuple(blocks_per_group),
 +            )
 +
              logger.info_once("GPU KV cache size: %s tokens", f"{num_tokens:,}")

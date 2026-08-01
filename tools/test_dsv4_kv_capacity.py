@@ -6,6 +6,7 @@ from types import SimpleNamespace as NS
 
 import torch
 
+from vllm.v1.core import kv_cache_utils
 from vllm.v1.core.kv_cache_utils import (
     generate_scheduler_kv_cache_config,
     get_kv_cache_capacity,
@@ -74,6 +75,11 @@ worker = KVCacheConfig(
     num_blocks=4836, kv_cache_tensors=[], kv_cache_groups=groups)
 worker_blocks = get_num_blocks_per_request_for_kv_cache_config(cfg, worker)
 assert worker_blocks == [1024, 20, 20, 267, 149], worker_blocks
+
+# Production emits these blocks through logger.info_once, whose once-cache
+# hashes every format argument. Keep the per-group value hashable.
+kv_cache_utils.logger.info_once(
+    "DSV4 packed-KV regression per-group=%s", tuple(worker_blocks))
 
 scheduler = generate_scheduler_kv_cache_config([worker])
 scheduler_blocks = get_num_blocks_per_request_for_kv_cache_config(cfg, scheduler)

@@ -2141,7 +2141,8 @@ def get_kv_cache_configs(
                 kv_cache_config.num_blocks,
                 max(kv_cache_config.num_blocks - 1, 0),
                 sum(blocks_per_group),
-                blocks_per_group,
+                # info_once is backed by an lru_cache and hashes every arg.
+                tuple(blocks_per_group),
             )
 
             logger.info_once("GPU KV cache size: %s tokens", f"{num_tokens:,}")
