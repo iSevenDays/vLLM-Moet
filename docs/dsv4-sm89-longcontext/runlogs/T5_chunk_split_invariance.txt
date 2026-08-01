@@ -1,0 +1,50 @@
+WARNING 08-01 20:34:21 [interface.py:358] Failed to import from vllm._C: ModuleNotFoundError("No module named 'vllm._C'")
+INFO 08-01 20:34:28 [importing.py:53] Triton is installed but 0 active driver(s) found (expected 1). Disabling Triton to prevent runtime errors.
+INFO 08-01 20:34:28 [importing.py:88] Triton not installed or not compatible; certain GPU-related functions will not be available.
+W0801 20:34:29.108000 1 torch/utils/cpp_extension.py:140] No CUDA runtime is found, using CUDA_HOME='/usr/local/cuda'
+WARNING 08-01 20:34:29 [interface.py:358] Failed to import from vllm._C: ModuleNotFoundError("No module named 'vllm._C'")
+WARNING 08-01 20:34:29 [interface.py:358] Failed to import from vllm._C: ModuleNotFoundError("No module named 'vllm._C'")
+WARNING 08-01 20:34:29 [interface.py:358] Failed to import from vllm._C: ModuleNotFoundError("No module named 'vllm._C'")
+==============================================================================
+T5 / H3 — chunk-split invariance of the ratio-4 OVERLAPPING compressor
+==============================================================================
+
+port[1-chunk] vs port[N-chunk]:  expect EXACT 0 (reference is a pure
+  per-output read of a persistent paged state cache — no carried state).
+port[N-chunk] vs checkpoint:     expect the bf16 floor (~2.6e-3) at every
+  block; a boundary-only blow-up would confirm H3.
+
+ratio     T  nblk         splits    1vN_max    1vN_bnd    1vN_int  NvCK_rel    bnd_rel    int_rel  verdict
+----------------------------------------------------------------------------------------------------------
+    4    24     6            [6]  0.000e+00  0.000e+00  0.000e+00 2.835e-03  3.022e-03  2.911e-03  invariant
+    4    24     6            [8]  0.000e+00  0.000e+00  0.000e+00 2.667e-03  2.735e-03  3.074e-03  invariant
+    4    24     6           [10]  0.000e+00  0.000e+00  0.000e+00 2.704e-03  2.685e-03  3.220e-03  invariant
+    4    24     6      [6,14,18]  0.000e+00  0.000e+00  0.000e+00 2.893e-03  3.026e-03  0.000e+00  invariant
+    4    32     8        [10,18]  0.000e+00  0.000e+00  0.000e+00 2.821e-03  3.211e-03  2.719e-03  invariant
+    4    32     8           [16]  0.000e+00  0.000e+00  0.000e+00 2.770e-03  2.756e-03  3.180e-03  invariant
+    4    40    10      [8,16,24]  0.000e+00  0.000e+00  0.000e+00 2.796e-03  3.100e-03  2.932e-03  invariant
+    4    36     9 [6,12,18,24,30]  0.000e+00  0.000e+00  0.000e+00 2.628e-03  2.881e-03  0.000e+00  invariant
+    4  1056   264          [528]  0.000e+00  0.000e+00  0.000e+00 2.803e-03  2.591e-03  3.551e-03  invariant
+  128   512     4          [200]  0.000e+00  0.000e+00  0.000e+00 2.598e-03  2.575e-03  2.776e-03  invariant
+  128   512     4          [256]  0.000e+00  0.000e+00  0.000e+00 2.854e-03  2.936e-03  2.790e-03  invariant
+
+per-block detail for ratio=4, T=24, split=[6] (mid-ratio):
+  boundary blocks (adjacent to split@6): [0, 1, 2]
+  block     tokens      1vN_max     NvCK_rel  note
+      0        0-3    0.000e+00    2.986e-03  BOUNDARY
+      1        4-7    0.000e+00    2.505e-03  BOUNDARY
+      2       8-11    0.000e+00    3.022e-03  BOUNDARY
+      3      12-15    0.000e+00    2.911e-03  
+      4      16-19    0.000e+00    2.695e-03  
+      5      20-23    0.000e+00    2.884e-03  
+
+==============================================================================
+VERDICT: H3 REFUTED — the compressor reference is chunk-invariant
+  (port[1-chunk] == port[N-chunk] bit-identically at every block,
+   including mid-ratio and exact-ratio splits; port[N-chunk] matches
+   the checkpoint single-pass within the bf16 floor at boundary and
+   interior blocks alike). The chunk-size sensitivity in §3a is NOT
+   produced by the compressor's overlapping-window math. A real
+   cross-chunk bug, if one exists, lives outside this validated
+   reference (fused kernel / scheduler / state-cache eviction).
+==============================================================================
