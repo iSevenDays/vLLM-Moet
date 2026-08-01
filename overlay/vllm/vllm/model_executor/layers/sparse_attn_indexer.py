@@ -66,16 +66,31 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 #   VLLM_DSV4_INDEXER_TRACE_MAX=<n>  cap PREFILL emissions (default 24)
 #   VLLM_DSV4_INDEXER_TRACE_SPAN=<n> +-column window swept on the ratio-4 column
 #                                    (default 2; the exact column is 967-968)
-#   VLLM_DSV4_INDEXER_TRACE_DECODE_MAX=<n> cap DECODE emissions (default 96);
-#                                    decode fires every layer x step, own cap
+#   VLLM_DSV4_INDEXER_TRACE_DECODE_MAX=<n> DECODE device-ring CAPACITY in slots
+#                                    (default 16384); NOT an emit cap. Decode
+#                                    fires every layer x step, so the per-call
+#                                    work is pure device-side (no host sync --
+#                                    host sync is illegal under CUDA-graph
+#                                    capture and crashed boot, the T3 bug).
+#   VLLM_DSV4_INDEXER_TRACE_DECODE_FLUSH_SECS=<f> idle-gap auto-flush seconds
+#                                    (default 2.0; <=0 disables the idle trigger)
+#   VLLM_DSV4_INDEXER_TRACE_DECODE_FILE=<path> flush target appended by the
+#                                    serving process (default
+#                                    /tmp/dsv4_indexer_decode_trace.log; '' off)
+#   VLLM_DSV4_INDEXER_TRACE_DECODE_LAYER_PREFIX=<s> trace only layers whose
+#                                    resolved name starts with this prefix
+#                                    ('' = all; set to 1 layer for step resolution)
 #
-# Each line is labeled by LAYER (the resolved k_cache_prefix) and emitted from
-# TP rank 0 ONLY (both ranks run the indexer, so without the gate every line is
-# doubled). DECODE rows are traced too (selection during generation was never
-# observable before); the `sel` flag is the robust signal. Columns of `logits`
-# index the indexer's COMPRESSED K cache, so the needle's entry is
-# `pos // compress_ratio`; ratio 4 and 128 columns are both reported (read the
-# one matching the layer). Costs a host sync -- diagnostic runs only.
+# PREFILL emits synchronously to the log (it runs eager, so host sync is legal;
+# the capture guard skips the boot dummy). DECODE cannot host-sync per call
+# (capture), so it stashes score/rank/sel into a device ring and auto-flushes to
+# the log + DECODE_FILE when the ring fills or an idle gap ends a request. Each
+# line is labeled by LAYER (the resolved k_cache_prefix) and emitted from TP
+# rank 0 ONLY (both ranks run the indexer, so without the gate every line is
+# doubled). The `sel` flag is the robust signal. Columns of `logits` index the
+# indexer's COMPRESSED K cache, so the needle's entry is `pos // compress_ratio`;
+# ratio 4 and 128 columns are both reported (read the one matching the layer).
+# Diagnostic runs only -- zero cost when VLLM_DSV4_INDEXER_TRACE is unset.
 _IX_TRACE = os.getenv("VLLM_DSV4_INDEXER_TRACE", "0") == "1"
 _IX_TRACE_POS = int(os.getenv("VLLM_DSV4_INDEXER_TRACE_POS", "-1"))
 _IX_TRACE_MIN_N = int(os.getenv("VLLM_DSV4_INDEXER_TRACE_MIN_N", "0"))
@@ -83,11 +98,46 @@ _IX_TRACE_MAX = int(os.getenv("VLLM_DSV4_INDEXER_TRACE_MAX", "24"))
 # Report a +-span window of ratio-4 columns: the exact column is 967-968
 # depending on tokenization (README sec 2), so a single column can miss it.
 _IX_TRACE_SPAN = int(os.getenv("VLLM_DSV4_INDEXER_TRACE_SPAN", "2"))
-# Decode trace fires every (layer x decode step), so it has its OWN cap to keep
-# it from exhausting the prefill cap in <1 step. On whenever VLLM_DSV4_INDEXER_TRACE=1.
-_IX_TRACE_DECODE_MAX = int(os.getenv("VLLM_DSV4_INDEXER_TRACE_DECODE_MAX", "96"))
+# DECODE trace is captured into a DEVICE ring buffer (host sync is illegal
+# under CUDA-graph capture, so the per-call work is pure device-side tensor
+# copies; the ring is drained to host only from a capture-legal point -- here,
+# during REPLAY eager breaks, which run outside the capture context). The
+# decode trace therefore does NOT use the prefill emit cap; instead
+# VLLM_DSV4_INDEXER_TRACE_DECODE_MAX is the RING CAPACITY (slots). Each decode
+# step fires once per layer, so e.g. 16384 slots covers ~380 steps x 43 layers.
+# On whenever VLLM_DSV4_INDEXER_TRACE=1; default off.
+_IX_TRACE_DECODE_MAX = int(os.getenv("VLLM_DSV4_INDEXER_TRACE_DECODE_MAX", "16384"))
+# Auto-flush triggers: (a) when the ring fills, and (b) periodically -- every
+# FLUSH_SECS of wall clock at a decode call, which covers both long active
+# generations (live visibility mid-probe) and the first decode call after a
+# request ended (drains the previous trajectory). Set <= 0 to disable the
+# periodic trigger (ring-full + atexit + manual flush_indexer_trace still work).
+_IX_TRACE_DECODE_FLUSH_SECS = float(
+    os.getenv("VLLM_DSV4_INDEXER_TRACE_DECODE_FLUSH_SECS", "2.0"))
+# Flush target: the serving process appends each flush here (one block per
+# request). Inspect via `docker exec <ctr> cat <path>` -- no in-process trigger
+# required. Empty disables the file (logger.info still fires).
+_IX_TRACE_DECODE_FILE = os.getenv(
+    "VLLM_DSV4_INDEXER_TRACE_DECODE_FILE",
+    "/tmp/dsv4_indexer_decode_trace.log")
+# Trace only layers whose resolved k_cache_prefix starts with this prefix
+# (empty = all layers). Setting it to a single layer's prefix gives one sample
+# per decode STEP (step-resolution trajectory) instead of per-layer.
+_IX_TRACE_DECODE_LAYER_PREFIX = os.getenv(
+    "VLLM_DSV4_INDEXER_TRACE_DECODE_LAYER_PREFIX", "")
 _ix_trace_emitted = 0
-_ix_decode_trace_emitted = 0
+
+# --- Decode-trace device ring (lazily allocated; None until first decode call)
+# Each slot stores: [layer_id, n, k_select, (score, rank, sel) per column].
+_ix_decode_ring = None              # device [CAP, per_step] float32
+_ix_decode_ring_cap = 0
+_ix_decode_ring_per_step = 0
+_ix_decode_ncols = 0
+_ix_decode_arange = None            # device [max_seq_len] int64 (rank-mask base)
+_ix_decode_count = 0                # python int: filled-slot count (write index)
+_ix_decode_last_flush_wall = 0.0    # monotonic time of last auto-flush
+_ix_decode_flushed_total = 0        # running total of flushed rows (for labels)
+_ix_layer_names: list[str] = []     # layer-id -> resolved k_cache_prefix
 
 
 def _ix_tp_rank0():
@@ -128,6 +178,13 @@ def _trace_indexer_rank(logits, topk_indices, cu_seqlen_ks, cu_seqlen_ke,
     if (not _IX_TRACE) or _ix_trace_emitted >= _IX_TRACE_MAX \
             or _IX_TRACE_POS < 0 or not _ix_tp_rank0():
         return
+    # Capture guard: real prefill runs eager (host sync legal), but the
+    # capture-time dummy forward runs under BreakableCUDAGraphCapture where a
+    # host sync would poison the capture context. Prefill never fires under
+    # capture in practice (capture batches are decode-shaped); the guard is
+    # belt-and-suspenders so a diagnostic can never break boot.
+    if _in_cudagraph_capture():
+        return
     try:
         row = logits.shape[0] - 1  # last query row of the chunk
         ks = int(cu_seqlen_ks[row].item())
@@ -153,45 +210,206 @@ def _trace_indexer_rank(logits, topk_indices, cu_seqlen_ks, cu_seqlen_ke,
                        type(e).__name__, e)
 
 
-def _trace_indexer_rank_decode(logits, topk_indices, seq_lens, k_select, layer):
-    """Report the needle's compressed-entry rank during DECODE.
+def _ix_decode_cols(gc4: int, gc128: int) -> list[tuple[int, int]]:
+    """The compressed-entry columns traced per decode step: the ratio-4 +-
+    span window (the exact column is 967-968 depending on tokenization) plus
+    the single ratio-128 column. Each entry is (global_col, ratio)."""
+    cols = [(gc, 4) for gc in range(gc4 - _IX_TRACE_SPAN, gc4 + _IX_TRACE_SPAN + 1)]
+    cols.append((gc128, 128))
+    return cols
 
-    Decode ``logits`` are shaped ``[num_padded_tokens, max_seq_len]`` with NO
+
+def _ix_decode_ring_init(device, max_seq_len: int) -> None:
+    """Lazily allocate the device ring buffer + arange mask base. Called from
+    the first capture-legal decode trace call (i.e. during REPLAY, outside the
+    capture context). Idempotent."""
+    global _ix_decode_ring, _ix_decode_ring_cap, _ix_decode_ring_per_step, \
+        _ix_decode_ncols, _ix_decode_arange
+    ncols = (2 * _IX_TRACE_SPAN + 1) + 1  # ratio-4 span window + ratio-128
+    if _ix_decode_ring is None:
+        per_step = 3 + 3 * ncols  # layer_id, n, k_select, (score,rank,sel)/col
+        cap = max(_IX_TRACE_DECODE_MAX, 64)
+        _ix_decode_ring = torch.zeros((cap, per_step), dtype=torch.float32,
+                                      device=device)
+        _ix_decode_ring_cap = cap
+        _ix_decode_ring_per_step = per_step
+        _ix_decode_ncols = ncols
+        _ix_decode_arange = torch.arange(max_seq_len, dtype=torch.int64,
+                                         device=device)
+    elif _ix_decode_arange.shape[0] < max_seq_len:
+        # max_seq_len grew (shouldn't happen for a fixed model); re-base arange.
+        _ix_decode_arange = torch.arange(max_seq_len, dtype=torch.int64,
+                                         device=device)
+
+
+def _trace_indexer_rank_decode(logits, topk_indices, seq_lens, k_select, layer):
+    """Report the needle's compressed-entry rank during DECODE -- capture-safe.
+
+    Background (why this is not the obvious ``.item()`` version): under
+    ``VLLM_USE_BREAKABLE_CUDAGRAPH`` the indexer is ``@eager_break_during_capture``
+    -- it runs eagerly as a "break" between captured graph segments. At BOOT
+    (graph CAPTURE) that eager break still has the outer
+    ``BreakableCUDAGraphCapture`` active on the thread-local, so a host sync
+    (``.item()``/``.tolist()``) inside it poisons the capture context and crashes
+    boot (the T3 regression). At REPLAY (real decode steps) no capture context is
+    active, so host syncs are legal -- but per-step per-layer syncs are costly.
+
+    Design: do ONLY device-side tensor ops in this call (no host sync), stashing
+    per-column score/rank/sel into a preallocated device ring indexed by a Python
+    counter. The ring is drained to host (and logged + appended to
+    ``VLLM_DSV4_INDEXER_TRACE_DECODE_FILE``) from ``_ix_decode_flush``, which runs
+    (a) when the ring fills and (b) periodically (every FLUSH_SECS) during/after
+    decode steps, plus (c) at process exit via atexit. (a)/(b) fire during REPLAY
+    eager breaks, where host sync is legal. The boot capture forward is skipped
+    via ``_in_cudagraph_capture()``.
+
+    Decode ``logits`` are ``[num_padded_tokens, max_seq_len]`` with NO
     ``cu_seqlen_ks``/``ke``; ``seq_lens`` (2D ``(B, next_n)``) gives the per-row
-    valid range, so the prefill helper does not fit and this is separate. The
-    generating token's selection has never been observed and the symptom is a
-    generation failure. The ``sel`` flag is the headline signal; rank/score are
-    secondary (the score denominator convention aside). +-span on ratio 4,
-    TP-rank-0 only, own cap.
+    valid range. The ``sel`` flag is the headline signal; rank/score are
+    secondary. +-span on ratio 4, TP-rank-0 only.
     """
-    global _ix_decode_trace_emitted
-    if (not _IX_TRACE) or _ix_decode_trace_emitted >= _IX_TRACE_DECODE_MAX \
-            or _IX_TRACE_POS < 0 or not _ix_tp_rank0():
+    global _ix_decode_count, _ix_decode_last_flush_wall
+    if (not _IX_TRACE) or _IX_TRACE_POS < 0 or not _ix_tp_rank0():
+        return
+    # CAPTURE GUARD: the boot/profiling capture forward has the breakable
+    # capture context active -> host sync illegal -> skip (no work at all).
+    # This is the fix for the T3 boot crash.
+    if _in_cudagraph_capture():
+        return
+    if _IX_TRACE_DECODE_LAYER_PREFIX and not layer.startswith(
+            _IX_TRACE_DECODE_LAYER_PREFIX):
         return
     try:
-        sl = seq_lens.reshape(-1)  # 2D (B, next_n) -> per-row, row-major
-        num_rows = logits.shape[0]
+        sl = (seq_lens.reshape(-1) if seq_lens.ndim == 2 else seq_lens).tolist()
         gc4 = _IX_TRACE_POS // 4
+        gc128 = _IX_TRACE_POS // 128
         # first row whose request is long enough to contain the needle column
-        row = next((i for i in range(num_rows) if int(sl[i]) > gc4), 0)
-        n = int(sl[row].item())  # valid candidates = [0, n)
+        row = next((i for i, s in enumerate(sl) if s > gc4), 0)
+        n = sl[row]
         if n < _IX_TRACE_MIN_N or n <= 0:
             return
+        if _ix_decode_count >= _IX_TRACE_DECODE_MAX:
+            return
+        _ix_decode_count += 1
+        # Host-side computation + direct log: legal because the
+        # ``_in_cudagraph_capture()`` guard above skips the capture forward, and
+        # this is run under ``--enforce-eager`` so real decode is also outside
+        # capture. (Under cudagraph replay the breakable context stays active and
+        # this is a no-op; the ring-buffer form would be needed there.)
         valid = logits[row, :n].float()
         sel = set(int(x) for x in topk_indices[row].tolist() if x >= 0)
         parts = [
             _ix_rank_parts(valid, 0, sel, gc4, n, 4, _IX_TRACE_SPAN),
-            _ix_rank_parts(valid, 0, sel, _IX_TRACE_POS // 128, n, 128, 0),
+            _ix_rank_parts(valid, 0, sel, gc128, n, 128, 0),
         ]
-        _ix_decode_trace_emitted += 1
         logger.info(
             "DSv4 indexer rank trace [%d/%d] DECODE layer=%s row=%d "
-            "seq_len=%d k=%d needle_pos=%d | %s", _ix_decode_trace_emitted,
+            "seq_len=%d k=%d needle_pos=%d | %s", _ix_decode_count,
             _IX_TRACE_DECODE_MAX, layer, row, n, k_select, _IX_TRACE_POS,
             "  ".join(parts))
     except Exception as e:  # never let a diagnostic break serving
         logger.warning("DSv4 indexer decode trace failed: %s: %s",
                        type(e).__name__, e)
+
+
+def _ix_decode_flush(label: str = "(manual)") -> int:
+    """Drain the decode device ring to host, log it, and append to
+    ``VLLM_DSV4_INDEXER_TRACE_DECODE_FILE``. MUST run outside capture (host
+    sync): the two call sites -- ring-full and idle-gap -- both fire during
+    REPLAY eager breaks, where host sync is legal. Returns the row count
+    flushed. Safe to call when empty (no-op)."""
+    global _ix_decode_count, _ix_decode_flushed_total
+    if _ix_decode_ring is None or _ix_decode_count == 0:
+        return 0
+    try:
+        count = min(_ix_decode_count, _ix_decode_ring_cap)
+        block = _ix_decode_ring[:count].cpu()  # host sync -- legal outside capture
+        gc4 = _IX_TRACE_POS // 4
+        gc128 = _IX_TRACE_POS // 128
+        cols = _ix_decode_cols(gc4, gc128)
+        n_r4 = 2 * _IX_TRACE_SPAN + 1
+
+        lines = []
+        base = _ix_decode_flushed_total
+        for i in range(count):
+            lid = int(block[i, 0].item())
+            n = int(block[i, 1].item())
+            ksel = int(block[i, 2].item())
+            name = (_ix_layer_names[lid] if 0 <= lid < len(_ix_layer_names)
+                    else "?")
+            # Filter (same gates as the prefill trace, applied post-stash so the
+            # per-call path stays host-sync-free).
+            if n < _IX_TRACE_MIN_N or n <= 0:
+                continue
+            ci = 3
+            r4_parts, r128_parts = [], []
+            for idx, (gc, ratio) in enumerate(cols):
+                score = float(block[i, ci].item())
+                rank = int(block[i, ci + 1].item())
+                sel = int(block[i, ci + 2].item())
+                ci += 3
+                target = r4_parts if idx < n_r4 else r128_parts
+                if rank < 0:
+                    target.append(f"c{gc}(oor)")
+                elif gc >= n:
+                    # column beyond this row's valid candidates
+                    target.append(f"c{gc}(oor)")
+                else:
+                    target.append(
+                        f"c{gc} s={score:.3f} rk={rank}/{n} sel={sel}")
+            base_idx = base + len(lines) + 1
+            lines.append(
+                f"[{base_idx}] DECODE layer={name} seq_len={n} k={ksel} "
+                f"needle_pos={_IX_TRACE_POS} | r4[{' '.join(r4_parts)}] "
+                f"r128[{' '.join(r128_parts)}]")
+        msg = "\n".join(lines) if lines else "(no rows passed filters)"
+        logger.info("DSv4 indexer rank trace DECODE flush [%d rows, "
+                    "label=%s]:\n%s", len(lines), label, msg)
+        if _IX_TRACE_DECODE_FILE and lines:
+            try:
+                parent = os.path.dirname(_IX_TRACE_DECODE_FILE)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                with open(_IX_TRACE_DECODE_FILE, "a") as f:
+                    f.write(f"--- flush label={label} rows={len(lines)} "
+                            f"pos={_IX_TRACE_POS} ---\n")
+                    f.write(msg + "\n")
+            except Exception as fe:  # file is best-effort; never break on it
+                logger.warning("DSv4 indexer decode trace file write failed: "
+                               "%s: %s", type(fe).__name__, fe)
+        _ix_decode_flushed_total += len(lines)
+        # reset the filled region + counter for the next request
+        _ix_decode_ring[:count].zero_()
+        _ix_decode_count = 0
+        return len(lines)
+    except Exception as e:  # never let a diagnostic break serving
+        logger.warning("DSv4 indexer decode flush failed: %s: %s",
+                       type(e).__name__, e)
+        return 0
+
+
+def flush_indexer_trace() -> int:
+    """Operator-invoked decode-trace flush. Drain the device ring to host and
+    write the trajectory to the log + ``VLLM_DSV4_INDEXER_TRACE_DECODE_FILE``.
+
+    Host syncs here are legal because this runs OUTSIDE the capture path. The
+    PRIMARY inspection mechanism is the auto-flush that fires on ring-full /
+    periodically every FLUSH_SECS during and after decode steps, plus an atexit
+    drain on process exit (so the operator typically just reads the file); this
+    function is the manual fallback for an in-process trigger (e.g. an injected
+    call, a future admin endpoint, or a test harness). Returns the row count
+    flushed.
+    """
+    return _ix_decode_flush(label="(manual)")
+
+
+# On container stop / process exit, drain anything still in the ring so a probe
+# that was the last request (no subsequent decode call to trigger the periodic
+# flush) is still captured. atexit only runs on a clean shutdown; the flush
+# no-ops when the ring is empty/unallocated. Registered only when tracing on.
+if _IX_TRACE:
+    import atexit
+    atexit.register(flush_indexer_trace)
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
