@@ -260,6 +260,10 @@ def _load_native(dev) -> "dict[tuple[int,int], ctypes.c_void_p] | None":
 
 
 def _rel_diff(a: torch.Tensor, b: torch.Tensor, ref: torch.Tensor) -> float:
+    # be device-robust: ref may be computed on CPU while the kernel outputs are
+    # on the GPU. Compare on a's device.
+    b = b.to(a.device)
+    ref = ref.to(a.device)
     denom = max(float(ref.abs().max().item()), 1.0)
     return float((a - b).abs().max().item()) / denom
 
