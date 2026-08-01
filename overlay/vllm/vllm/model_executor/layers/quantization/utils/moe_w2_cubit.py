@@ -2843,6 +2843,11 @@ def _moe_w2_forward_timed(
     cap = d.shape[1]
     miss_rows = None
     use_pf4 = False        # prefill-FP4 (resident AND base modes; _PREFILL_FP4)
+    # Assigned below only by the resident-plane branch.  The host/base-cache
+    # branch deliberately has no FP8-delta dispatch, but the shared GEMM
+    # epilogue still tests this flag.  Keep its inactive value explicit so
+    # base-mode profile/warm-up forwards cannot read an unbound local.
+    use_w8 = False
     if torch.cuda.is_current_stream_capturing():
         # first capture freezes the workspace sizes (see _workspaces)
         _WS["frozen"] = True
