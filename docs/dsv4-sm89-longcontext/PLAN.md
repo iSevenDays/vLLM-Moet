@@ -95,8 +95,7 @@ docker start moet-0731-dspark-exact     # then wait for health as above
 |---|---|
 | `--enforce-eager` | operator directive; it also masks graph-path bugs |
 | Relax the `moe_w2` strict miss-replay guard | it exists so no output is emitted from a residual cache miss. If it trips, vary `num_speculative_tokens` instead of removing speculation |
-| Delete `/root/models/DeepSeek-V4-Flash` (146 GB, the OLD checkpoint) | approved in principle, **not** executed. Irreversible. Requires explicit operator confirmation |
-| Use the old checkpoint for any measurement | configs differ materially; results are not comparable |
+| Use the old checkpoint for any measurement | it is **deleted** (2026-08-01, operator-confirmed). Nothing to use |
 | Quote the §5.19 rank table, the "5 %→48 % spread", or the "~26× ranking gap" | all withdrawn (README §2, §4) |
 | Hand-edit `patches/` | generated. Edit `overlay/` and run `tools/gen_patches.py` |
 | Edit files under `vllm/` (the pinned v0.25.1 baseline) | copy to `overlay/vllm/<same path>` and edit there |

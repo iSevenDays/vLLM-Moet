@@ -47,12 +47,14 @@ tokenizer runs on CPU in seconds; that check would have caught the worst error
 ### Standing decisions
 
 - **`/root/models/DeepSeek-V4-Flash-0731` is the only checkpoint.** The older
-  `/root/models/DeepSeek-V4-Flash` (146 GB) is superseded: configs differ
-  materially (0731 adds DSpark — `dspark_block_size 5`,
-  `dspark_target_layer_ids [40,41,42]`, `dspark_markov_rank 256` — and has 46
-  `compress_ratios` entries vs 44). Any result quoted from the old checkpoint is
-  not comparable. ⚠️ **Deletion approved in principle but NOT executed** — 146 GB
-  and irreversible; confirm before reclaiming.
+  `/root/models/DeepSeek-V4-Flash` was **deleted 2026-08-01** (operator-confirmed,
+  146 GB reclaimed). It was verifiably the old one: 44 `compress_ratios` entries
+  and **no** dspark keys, vs 0731's 46 entries plus `dspark_block_size 5`,
+  `dspark_target_layer_ids [40,41,42]`, `dspark_markov_rank 256`. Any result
+  quoted from it is not comparable and should be re-measured or dropped.
+  Two stale `MODEL` defaults that pointed at it (`docker/serve_sm89_ds4.sh:142`,
+  `start.sh:23`) were repointed to `-0731` before the delete, so nothing can
+  resolve to a missing path.
 - `vllm-moet-sm89:v0251` is the canonical living tag. Preserve baselines as
   suffixed tags; never default to a candidate tag.
 - **Never `--enforce-eager`** on this rig.

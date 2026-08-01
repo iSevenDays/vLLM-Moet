@@ -20,7 +20,7 @@
 #   no --rm, restart policy  keep the container; `docker stop/start moet` beats cold runs
 #   NETWORK=none default     pass NETWORK=host only when you've decided to expose it
 set -euo pipefail
-MODEL="/root/models/DeepSeek-V4-Flash"   # 146 GB checkpoint (46 shards), deepseek_v4 arch
+MODEL="/root/models/DeepSeek-V4-Flash-0731"   # 146 GB checkpoint (46 shards), deepseek_v4 arch
 CACHE="/root/models/moet-cache"          # plane-cache + JIT caches live here (on /, ~79 GB free)
 NETWORK=${NETWORK:-none}
 MAXLEN=${MAXLEN:-16384}

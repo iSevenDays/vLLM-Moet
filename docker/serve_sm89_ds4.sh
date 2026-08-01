@@ -139,7 +139,7 @@ else
   QP_ENV=""
   PLANES_SUBDIR=planes
 fi
-MODEL=${MODEL:-/root/models/DeepSeek-V4-Flash}   # checkpoint dir (read-only)
+MODEL=${MODEL:-/root/models/DeepSeek-V4-Flash-0731}   # checkpoint dir (read-only)
 CACHE=${CACHE:-/root/models/moet-cache}          # quant caches; ~90 GB free
 JIT_CACHE=${JIT_CACHE:-$CACHE/jit}               # compiler cache may be shared
                                                   # across weight-cache namespaces
