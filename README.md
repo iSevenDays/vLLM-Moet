@@ -294,14 +294,23 @@ bugs that broke it are fixed; full investigation in
 [`docs/dsv4-sm89-longcontext/README.md`](docs/dsv4-sm89-longcontext/README.md)).
 The launcher header documents the knobs, residency modes, and the trap list.
 
-**Residency — use `exact` (shown) or `host`, not `gpu`.** On the 2×48 GiB cards
-the `-0731` 2-bit planes alone are ~36 GiB/card, and the load-time requant peak
-exceeds the 47 GiB capacity (`RESIDENCY=gpu` dies with CUDA OOM around layer
-34/43). Pre-building the planes under `host` does **not** help: gpu residency
-builds the planes in-VRAM and does not read the host disk cache, so a
-host→gpu two-step still OOMs (verified). Use `gpu` only for a smaller
-checkpoint or larger-VRAM cards. `exact` keeps the base in the 630 GiB host RAM
-and serves the full 262K window.
+**Residency modes — where the 2-bit expert base lives** (pick with `RESIDENCY=`):
+
+| mode | expert base | speed | quality | fits the 2×48 GiB cards? |
+|---|---|---|---|---|
+| `gpu` | all on the GPU, no host base | fastest | 2-bit | **no** — planes are ~36 GiB/card and the load-time requant peak exceeds 47 GiB (CUDA OOM ~layer 34/43) |
+| `host` | a GPU pool of hot experts + the rest in pinned host RAM | fast | 2-bit | yes (verified) |
+| `exact` | checkpoint FP4 in host RAM + a GPU cache | slower | highest (true FP4) | yes (production) |
+
+Use `gpu` only for a smaller checkpoint or larger-VRAM cards. A host→gpu
+two-step does not work: gpu residency builds the planes in-VRAM and does not
+read the host disk cache, so pre-building under `host` still OOMs (verified).
+
+On this box (2×48 GiB GPU, 630 GiB RAM): use `exact` for quality and the full
+262K window; use `host` to trade some quality for speed (a GPU hot-expert pool,
+`BASE_GB` GiB/rank, backed by host RAM); `gpu` is not an option for this
+checkpoint. `BASE_GB` (host) is the speed knob — a larger pool means fewer host
+misses and faster decode, at the cost of VRAM.
 
 The blocks below are the **upstream / other-hardware** configs (SM120 cubins,
 PRO 6000, 5090) inherited from `kacper-daftcode/vLLM-Moet`:
