@@ -140,15 +140,15 @@ else
   PLANES_SUBDIR=planes
 fi
 MODEL=${MODEL:-/root/models/DeepSeek-V4-Flash-0731}   # checkpoint dir (read-only)
-CACHE=${CACHE:-/root/models/moet-cache-0731-gpu}    # quant caches; host-residency 2-bit planes live here
+CACHE=${CACHE:-/root/models/moet-cache-0731-exact} # quant caches; exact FP4 packs live here
 JIT_CACHE=${JIT_CACHE:-/root/models/moet-cache/jit} # shared warm compiler cache (fast boot)
                                                   # across weight-cache namespaces
 NETWORK=${NETWORK:-host}     # this host serves directly; use 'none' to isolate quantization
 RESTART=${RESTART:-no}       # production: unless-stopped (survives crashes/reboots)
 MAXLEN=${MAXLEN:-262144}     # maximum context length; lower for the first boot test
-UTIL=${UTIL:-0.90}           # fraction of VRAM vLLM may use. RESIDENCY=host keeps the
-                             # 2-bit base in host RAM, so the GPU holds only the BASE_GB pool
-                             # + KV; 0.90 is the verified-boot budget on the 2x48 GiB cards.
+UTIL=${UTIL:-0.98}           # fraction of VRAM vLLM may use. exact residency keeps the
+                             # FP4 base in host RAM, so the GPU holds the FP4 cache + KV;
+                             # 0.98 is the verified budget on the 2x48 GiB cards.
 BATCHED_TOKENS=${BATCHED_TOKENS:-1056}  # max-num-batched-tokens (verified with DSpark k=5)
 NUM_SEQS=${NUM_SEQS:-3}      # request scheduler limit (verified)
 CUDAGRAPH_SIZES=${CUDAGRAPH_SIZES:-1,2,4,6,8,12,18}  # cudagraph_capture_sizes, comma-sep
@@ -161,7 +161,7 @@ if [ -z "$SPECULATIVE_CONFIG" ] && [ "$MTP_TOKENS" = "0" ]; then
   SPECULATIVE_CONFIG='{"method":"dspark","num_speculative_tokens":5,"dspark_scheduler":false}'
 fi
 PREFIX_CACHING=${PREFIX_CACHING:-0}  # 0 = --no-enable-prefix-caching (DSv4 sparse MLA)
-SCALE_REFIT=${SCALE_REFIT:-1}  # normal W2 conversion; 0 is for comparison or rollback
+SCALE_REFIT=${SCALE_REFIT:-0}  # exact residency REQUIRES 0 (checkpoint FP4 scales)
 FP8_DELTA_GB=${FP8_DELTA_GB:-0}  # FP8-e4m3 delta PREFILL tier (Ada native FP8 MMA).
                                  # >0 enables it: FP8-resident prefill pairs divert to
                                  # the w8 Triton kernel (higher precision than the bare
@@ -192,7 +192,7 @@ CUSTOM_ALL_REDUCE=${CUSTOM_ALL_REDUCE:-0}  # 0 = --disable-custom-all-reduce (NC
                              # (-> --disable-custom-all-reduce, NCCL fallback). Custom all-reduce
                              # needs the open-gpu-kernel-modules P2P patch on RTX 4090 D - see
                              # header section 2. Set 0 if your driver lacks that patch.
-RESIDENCY=${RESIDENCY:-host}  # 'host' = 2-bit base in pinned RAM + GPU pool (RAM-heavy);
+RESIDENCY=${RESIDENCY:-exact}  # 'host' = 2-bit base in pinned RAM + GPU pool (RAM-heavy);
                              # 'exact' = checkpoint FP4 in host RAM + mandatory GPU
                              # cache; native FP8 MMA for BOTH prefill and decode;
                              # 'gpu'  = base sharded ONTO the GPUs, no host cache (VRAM-heavy,
@@ -207,7 +207,7 @@ BASE_GB=${BASE_GB:-20}       # host residency: GPU expert-pool GiB/rank (THE spe
                              # gpu residency forces BASE_CACHE_GB=0 (base lives on the GPUs).
 EXACT_GB=${EXACT_GB:-30}     # exact residency: FP4-storage expert pool GiB/rank.
 STORE=${STORE:-$CACHE/packs} # host residency only: on-disk quant pack (real fs, NOT overlayfs)
-ARENA_GB=${ARENA_GB:-14}     # host residency only: pinned host-RAM cache over the pack, per rank
+ARENA_GB=${ARENA_GB:-40}     # exact/host residency: pinned host-RAM arena GiB/rank
 MEM_GB=${MEM_GB:-428}        # current host's HARD container RAM cap
 NAME=${NAME:-moet}
 IMG=${IMG:-vllm-moet-sm89:v0251}  # canonical living tag (vLLM 0.25.1 lineage),
@@ -296,9 +296,11 @@ if [ "$MOUNT_LAYOUT_FIX" = "1" ]; then
     vllm/v1/attention/ops/triton_paged_mqa_logits_dsv4.py \
     vllm/utils/deep_gemm.py \
     vllm/v1/attention/backends/mla/indexer.py \
-    vllm/model_executor/layers/sparse_attn_indexer.py \
-    vllm/tokenizers/deepseek_v4.py \
-    vllm/tokenizers/deepseek_v4_encoding.py ; do
+    vllm/model_executor/layers/sparse_attn_indexer.py ; do
+    # NOTE: the tokenizer (deepseek_v4.py / deepseek_v4_encoding.py) is intentionally
+    # NOT mounted -- the fork's tokenizer port produced incoherent output on -0731
+    # (prompt-echo, repetition) even at reasoning_effort=low, while the baseline
+    # tokenizer serves clean. Re-port only after diagnosing why.
     if [ -f "$REPO/overlay/vllm/$_rel" ]; then
       LAYOUT_FIX_VOLS="$LAYOUT_FIX_VOLS -v $REPO/overlay/vllm/$_rel:$_VLP/$_rel:ro"
     fi
@@ -347,7 +349,6 @@ docker run -d --name "$NAME" --restart "$RESTART" --gpus "$GPUS" --network "$NET
   $RESVOL \
   $LAYOUT_FIX_VOLS \
   -e VLLM_MOE_W2=1 \
-  -e VLLM_DSV4_DEFAULT_REASONING_EFFORT="${REASONING_EFFORT:-max}" \
   $DELTA_ENV \
   $QP_ENV \
   -e VLLM_MOE_W2_SCALE_REFIT="$SCALE_REFIT" \
