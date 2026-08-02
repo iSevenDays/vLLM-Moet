@@ -312,6 +312,21 @@ On this box (2×48 GiB GPU, 630 GiB RAM): use `exact` for quality and the full
 checkpoint. `BASE_GB` (host) is the speed knob — a larger pool means fewer host
 misses and faster decode, at the cost of VRAM.
 
+**Single-user throughput: trade KV concurrency for GPU expert residency.** Under
+`exact`, the GPU VRAM budget (`UTIL` × 48 GiB) is shared between the expert pool
+(`EXACT_GB` GiB/rank) and the KV cache. At `NUM_SEQS=3` the KV pool holds ~3× the
+max context (856K tokens) and the expert pool holds ~87% of experts. If you serve
+one user at a time, cap the KV to ~1× and raise the expert pool — more experts
+resident on-GPU means fewer slow host-RAM misses and faster decode:
+
+```bash
+NUM_SEQS=1 EXACT_GB=42 \
+  EXTRA_ARGS='--kv-cache-memory-bytes 2147483648' ./docker/serve_sm89_ds4.sh
+```
+
+(~2 GiB KV ≈ 1× the 262K window; the freed VRAM goes to a ~42 GiB expert pool so
+~100% of experts stay GPU-resident. Fewer concurrent requests, but each is faster.)
+
 The blocks below are the **upstream / other-hardware** configs (SM120 cubins,
 PRO 6000, 5090) inherited from `kacper-daftcode/vLLM-Moet`:
 

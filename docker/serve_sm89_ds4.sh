@@ -160,7 +160,7 @@ SPECULATIVE_CONFIG=${SPECULATIVE_CONFIG:-}  # compact JSON override for embedded
 if [ -z "$SPECULATIVE_CONFIG" ] && [ "$MTP_TOKENS" = "0" ]; then
   SPECULATIVE_CONFIG='{"method":"dspark","num_speculative_tokens":5,"dspark_scheduler":false}'
 fi
-PREFIX_CACHING=${PREFIX_CACHING:-0}  # 0 = --no-enable-prefix-caching (DSv4 sparse MLA)
+PREFIX_CACHING=${PREFIX_CACHING:-1}  # 1 = enable prefix caching (reuse repeated prompt KV)
 SCALE_REFIT=${SCALE_REFIT:-0}  # exact residency REQUIRES 0 (checkpoint FP4 scales)
 FP8_DELTA_GB=${FP8_DELTA_GB:-0}  # FP8-e4m3 delta PREFILL tier (Ada native FP8 MMA).
                                  # >0 enables it: FP8-resident prefill pairs divert to
@@ -206,6 +206,12 @@ READY_TIMEOUT_S=${READY_TIMEOUT_S:-1800}  # engine-ready wait (vLLM default 600)
 BASE_GB=${BASE_GB:-20}       # host residency: GPU expert-pool GiB/rank (THE speed knob).
                              # gpu residency forces BASE_CACHE_GB=0 (base lives on the GPUs).
 EXACT_GB=${EXACT_GB:-30}     # exact residency: FP4-storage expert pool GiB/rank.
+                             # VRAM TRADE-OFF: UTIL*48GiB is shared between this expert pool
+                             # and the KV cache. NUM_SEQS=3 -> KV pool ~3x max-context (856K
+                             # tokens), expert pool ~87% of experts. For single-user speed, cap
+                             # KV to ~1x (EXTRA_ARGS='--kv-cache-memory-bytes 2147483648', or
+                             # NUM_SEQS=1) and RAISE EXACT_GB (~42) so ~100% of experts stay
+                             # GPU-resident -> fewer host-RAM misses -> faster decode.
 STORE=${STORE:-$CACHE/packs} # host residency only: on-disk quant pack (real fs, NOT overlayfs)
 ARENA_GB=${ARENA_GB:-40}     # exact/host residency: pinned host-RAM arena GiB/rank
 MEM_GB=${MEM_GB:-428}        # current host's HARD container RAM cap
