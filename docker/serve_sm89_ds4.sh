@@ -274,35 +274,38 @@ else
   RESVOL="-v $STORE:/packs"
   RESENV="-e VLLM_MOE_W2_BASE_CACHE_GB=$BASE_GB -e VLLM_MOE_W2_PLANES_CACHE=/plane-cache -e VLLM_MOE_W2_STORE_DIR=/packs -e VLLM_MOE_W2_BASE_RAM_GB=$ARENA_GB"
 fi
-# Bind-mount the sm89 decode-indexer layout fix over the image's baked-in
-# copies, until vllm-moet-sm89:v0251 is rebuilt with it. The image ships the
-# INTERLEAVED read of the paged indexer KV cache while
-# indexer_k_quant_and_cache_kernel writes SEGREGATED -> garbage/NaN decode
-# scores past L=2048 (the long-context "digit loss"). See
-# overlay/vllm/vllm/v1/attention/ops/triton_paged_mqa_logits_dsv4.py.
+# Bind-mount the sm89 decode-indexer fixes over the image's baked-in copies,
+# until vllm-moet-sm89:v0251 is rebuilt with them. Two bugs, same 2048
+# boundary:
+#  * layout (Bug #2): the paged indexer KV cache is read INTERLEAVED while
+#    indexer_k_quant_and_cache_kernel writes SEGREGATED -> garbage/NaN decode
+#    scores past L=2048 (the long-context "digit loss").
+#  * decode top-k (Bug #1): the radix selectors got an UNCOMPRESSED scan bound
+#    and an unclamped k_select=512; when the compressed candidate count < 512
+#    (absolute context < 2048) they emit stale/NaN indices -> token salad.
 # Default ON so every launch picks up the fix; MOUNT_LAYOUT_FIX=0 disables
-# (e.g. once a rebuilt image carries the fix natively, or for an A/B).
+# (e.g. once a rebuilt image carries the fixes natively, or for an A/B).
 MOUNT_LAYOUT_FIX=${MOUNT_LAYOUT_FIX:-1}
 LAYOUT_FIX_VOLS=""
 if [ "$MOUNT_LAYOUT_FIX" = "1" ]; then
   REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
   _VLP=/usr/local/lib/python3.12/dist-packages
-  if [ -f "$REPO/overlay/vllm/vllm/v1/attention/ops/triton_paged_mqa_logits_dsv4.py" ]; then
-    LAYOUT_FIX_VOLS="$LAYOUT_FIX_VOLS -v $REPO/overlay/vllm/vllm/v1/attention/ops/triton_paged_mqa_logits_dsv4.py:$_VLP/vllm/v1/attention/ops/triton_paged_mqa_logits_dsv4.py:ro"
-  fi
-  if [ -f "$REPO/overlay/vllm/vllm/utils/deep_gemm.py" ]; then
-    LAYOUT_FIX_VOLS="$LAYOUT_FIX_VOLS -v $REPO/overlay/vllm/vllm/utils/deep_gemm.py:$_VLP/vllm/utils/deep_gemm.py:ro"
-  fi
-  if [ -f "$REPO/overlay/vllm/tests/kernels/attention/test_triton_paged_mqa_logits_dsv4.py" ]; then
-    LAYOUT_FIX_VOLS="$LAYOUT_FIX_VOLS -v $REPO/overlay/vllm/tests/kernels/attention/test_triton_paged_mqa_logits_dsv4.py:$_VLP/tests/kernels/attention/test_triton_paged_mqa_logits_dsv4.py:ro"
-  fi
+  for _rel in \
+    vllm/v1/attention/ops/triton_paged_mqa_logits_dsv4.py \
+    vllm/utils/deep_gemm.py \
+    vllm/v1/attention/backends/mla/indexer.py \
+    vllm/model_executor/layers/sparse_attn_indexer.py ; do
+    if [ -f "$REPO/overlay/vllm/$_rel" ]; then
+      LAYOUT_FIX_VOLS="$LAYOUT_FIX_VOLS -v $REPO/overlay/vllm/$_rel:$_VLP/$_rel:ro"
+    fi
+  done
   if [ -z "$LAYOUT_FIX_VOLS" ]; then
     echo "FATAL: MOUNT_LAYOUT_FIX=1 (default) but no layout-fix overlay files found under $REPO. " \
-      "Refusing to launch: the image ships the buggy interleaved indexer read. " \
+      "Refusing to launch: the image ships the buggy sm89 decode-indexer code (Bug #1 + Bug #2). " \
       "Either run from the repo checkout, or set MOUNT_LAYOUT_FIX=0 to serve the image as-is." >&2
     exit 1
   fi
-  unset REPO _VLP
+  unset REPO _VLP _rel
 fi
 if [ "$BREAKABLE_CUDAGRAPH" = auto ]; then
   BREAKABLE_ENV=""
