@@ -274,6 +274,36 @@ else
   RESVOL="-v $STORE:/packs"
   RESENV="-e VLLM_MOE_W2_BASE_CACHE_GB=$BASE_GB -e VLLM_MOE_W2_PLANES_CACHE=/plane-cache -e VLLM_MOE_W2_STORE_DIR=/packs -e VLLM_MOE_W2_BASE_RAM_GB=$ARENA_GB"
 fi
+# Bind-mount the sm89 decode-indexer layout fix over the image's baked-in
+# copies, until vllm-moet-sm89:v0251 is rebuilt with it. The image ships the
+# INTERLEAVED read of the paged indexer KV cache while
+# indexer_k_quant_and_cache_kernel writes SEGREGATED -> garbage/NaN decode
+# scores past L=2048 (the long-context "digit loss"). See
+# overlay/vllm/vllm/v1/attention/ops/triton_paged_mqa_logits_dsv4.py.
+# Default ON so every launch picks up the fix; MOUNT_LAYOUT_FIX=0 disables
+# (e.g. once a rebuilt image carries the fix natively, or for an A/B).
+MOUNT_LAYOUT_FIX=${MOUNT_LAYOUT_FIX:-1}
+LAYOUT_FIX_VOLS=""
+if [ "$MOUNT_LAYOUT_FIX" = "1" ]; then
+  REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+  _VLP=/usr/local/lib/python3.12/dist-packages
+  if [ -f "$REPO/overlay/vllm/vllm/v1/attention/ops/triton_paged_mqa_logits_dsv4.py" ]; then
+    LAYOUT_FIX_VOLS="$LAYOUT_FIX_VOLS -v $REPO/overlay/vllm/vllm/v1/attention/ops/triton_paged_mqa_logits_dsv4.py:$_VLP/vllm/v1/attention/ops/triton_paged_mqa_logits_dsv4.py:ro"
+  fi
+  if [ -f "$REPO/overlay/vllm/vllm/utils/deep_gemm.py" ]; then
+    LAYOUT_FIX_VOLS="$LAYOUT_FIX_VOLS -v $REPO/overlay/vllm/vllm/utils/deep_gemm.py:$_VLP/vllm/utils/deep_gemm.py:ro"
+  fi
+  if [ -f "$REPO/overlay/vllm/tests/kernels/attention/test_triton_paged_mqa_logits_dsv4.py" ]; then
+    LAYOUT_FIX_VOLS="$LAYOUT_FIX_VOLS -v $REPO/overlay/vllm/tests/kernels/attention/test_triton_paged_mqa_logits_dsv4.py:$_VLP/tests/kernels/attention/test_triton_paged_mqa_logits_dsv4.py:ro"
+  fi
+  if [ -z "$LAYOUT_FIX_VOLS" ]; then
+    echo "FATAL: MOUNT_LAYOUT_FIX=1 (default) but no layout-fix overlay files found under $REPO. " \
+      "Refusing to launch: the image ships the buggy interleaved indexer read. " \
+      "Either run from the repo checkout, or set MOUNT_LAYOUT_FIX=0 to serve the image as-is." >&2
+    exit 1
+  fi
+  unset REPO _VLP
+fi
 if [ "$BREAKABLE_CUDAGRAPH" = auto ]; then
   BREAKABLE_ENV=""
 else
@@ -308,6 +338,7 @@ docker run -d --name "$NAME" --restart "$RESTART" --gpus "$GPUS" --network "$NET
   -v "$CACHE/$PLANES_SUBDIR":/plane-cache \
   -v "$JIT_CACHE":/root/.cache \
   $RESVOL \
+  $LAYOUT_FIX_VOLS \
   -e VLLM_MOE_W2=1 \
   $DELTA_ENV \
   $QP_ENV \
