@@ -264,6 +264,37 @@ With the 2‑bit knobs off, the patch is exactly these base fixes — stock beha
 
 ## Quickstart
 
+**DeepSeek‑V4‑Flash‑0731 on 2× RTX 4090 D (Ada sm_89)** — this fork's primary
+target. The launcher builds the `docker run` from env vars and **bind-mounts the
+sm89 decode-indexer fixes by default** (`MOUNT_LAYOUT_FIX=1`, fatal if the
+overlay files are missing — see `docker/serve_sm89_ds4.sh`), so a plain launch
+serves the corrected code without an image rebuild:
+
+```bash
+MODEL=/root/models/DeepSeek-V4-Flash-0731 \
+CACHE=/root/models/moet-cache-0731-exact \
+JIT_CACHE=/root/models/moet-cache/jit \
+STORE=/root/models/moet-cache-0731-exact/packs \
+NAME=moet-0731 PORT=8001 NETWORK=host RESIDENCY=exact EXACT_GB=30 ARENA_GB=40 \
+MEM_GB=428 TP=2 GPUS='"device=0,1"' CUSTOM_ALL_REDUCE=0 \
+MAXLEN=262144 UTIL=0.98 BATCHED_TOKENS=1056 NUM_SEQS=3 \
+CUDAGRAPH_SIZES=1,2,4,6,8,12,18 PREFIX_CACHING=0 MTP_TOKENS=0 \
+SPECULATIVE_CONFIG='{"method":"dspark","num_speculative_tokens":5,"dspark_scheduler":false}' \
+EXTRA_ARGS='--kv-cache-memory-bytes 4846832640' \
+./docker/serve_sm89_ds4.sh
+# boot 6–10 min; health on http://127.0.0.1:8001/v1/models
+```
+
+Image: `vllm-moet-sm89:v0251` (built locally; keep, tag baselines as suffixed
+tags). `-0731` is the **only** checkpoint — the older `DeepSeek-V4-Flash` tree
+is deleted. Long context is correct to 64K+ (the decode-indexer layout + top-k
+bugs that broke it are fixed; full investigation in
+[`docs/dsv4-sm89-longcontext/README.md`](docs/dsv4-sm89-longcontext/README.md)).
+Knobs, residency modes, and the trap list are documented in the launcher header.
+
+The blocks below are the **upstream / other-hardware** configs (SM120 cubins,
+PRO 6000, 5090) inherited from `kacper-daftcode/vLLM-Moet`:
+
 ```bash
 git clone https://github.com/kacper-daftcode/vLLM-Moet && cd vLLM-Moet
 

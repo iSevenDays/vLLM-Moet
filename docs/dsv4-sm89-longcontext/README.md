@@ -17,6 +17,43 @@ for provenance: `git log --follow --all -- 'docs/dsv4-sm89-longcontext/*'` and
 
 ---
 
+> ## ✅ RESOLVED 2026-08-02 — root cause found and fixed
+>
+> The long-context digit loss was **not** an architectural `index_topk` limit
+> (§5/§7's pre-resolution framing, now refuted). It was two bugs in the sm89
+> decode-indexer path, ported from
+> [`the-crypt-keeper/vLLM-sm89`](https://github.com/the-crypt-keeper/vLLM-sm89)
+> (`sm89-ds4-work`) and re-validated on the RTX 4090 D:
+>
+> - **Bug #2 — long-context digit loss.** The paged indexer KV cache was read
+>   **interleaved** (`[D+4]` per token) while `indexer_k_quant_and_cache_kernel`
+>   writes it **segregated** (all k bytes, then all scale bytes, per block) →
+>   garbage/NaN decode candidate scores past L=2048. The §5.19 rank trace looked
+>   clean because it watched the *prefill* path (correct); the bug was in the
+>   *decode* path, which §2 later showed was never instrumented. Fix: the three
+>   readers → segregated + a real-writer self-test. Commit `93bd9b7d5`.
+> - **Bug #1 — short-prompt repetition.** The radix decode top-k got an
+>   uncompressed scan bound + an unclamped `k_select=512`; with <512 valid
+>   candidates (absolute context <2048) it emitted NaN indices → token-salad
+>   (e.g. a 15-token "capital of Germany?" returned word-salad repetition). Fix:
+>   route decode to `top_k_per_row_decode` + compress the scan bound. Commit
+>   `115b8b955`.
+> - **Tokenizer.** The reasoning-effort ladder was broken (`high` was a silent
+>   no-op, real `max` unreachable). Commit `02fe69a84`.
+>
+> **Validated:** `ask` @ 8K / 32K / 64K all PASS exact → `index_topk=512` is
+> sufficient once the cache is read correctly, so the `=2048` workaround in §7
+> is **obsolete**. Short-prompt repetition gone; paged-MQA layout self-test
+> `3.642e-02` at boot. `docker/serve_sm89_ds4.sh` bind-mounts the six fixed
+> overlay files by default (`MOUNT_LAYOUT_FIX=1`, fatal if missing) until the
+> image is rebuilt.
+>
+> The retraction chain in §4 and the raw measurements in §3 are retained for
+> provenance. §2's instrument correction (the trace watched the wrong column)
+> stood; §5 H1/H2/H3 were superseded by the fix, not by their falsifiers.
+
+---
+
 ## 0. Read this first
 
 Two things will cost you hours if you don't know them.
@@ -477,6 +514,12 @@ way to firm up the single most informative new datum. Record in `runlogs/`.
 ---
 
 ## 7. Fix strategy
+
+> ✅ **RESOLVED 2026-08-02 — see the banner at the top of this file.** The cause
+> was the decode-indexer bugs (layout + top-k), not coverage. The fix is in, so
+> `index_topk=512` is sufficient (64K retrieval passes); the `=2048` interim
+> workaround below is **obsolete**. This section is retained as the
+> pre-resolution strategy of record.
 
 **Now — interim production setting.** `index_topk=2048` is the only change
 measured to convert failures into passes (6/6 exact to 18.5K):
