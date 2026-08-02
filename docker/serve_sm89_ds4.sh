@@ -296,11 +296,13 @@ if [ "$MOUNT_LAYOUT_FIX" = "1" ]; then
     vllm/v1/attention/ops/triton_paged_mqa_logits_dsv4.py \
     vllm/utils/deep_gemm.py \
     vllm/v1/attention/backends/mla/indexer.py \
-    vllm/model_executor/layers/sparse_attn_indexer.py ; do
-    # NOTE: the tokenizer (deepseek_v4.py / deepseek_v4_encoding.py) is intentionally
-    # NOT mounted -- the fork's tokenizer port produced incoherent output on -0731
-    # (prompt-echo, repetition) even at reasoning_effort=low, while the baseline
-    # tokenizer serves clean. Re-port only after diagnosing why.
+    vllm/model_executor/layers/sparse_attn_indexer.py \
+    vllm/tokenizers/deepseek_v4.py ; do
+    # The tokenizer overlay is a MINIMAL patch on the baseline: one line, default
+    # reasoning_effort "high" -> "max" so the encoder applies REASONING_EFFORT_MAX.
+    # The full fork tokenizer port broke serving on -0731; this keeps everything
+    # else byte-identical to baseline. deepseek_v4_encoding.py is NOT mounted
+    # (overlay == baseline). Re-verify clean serving after any tokenizer change.
     if [ -f "$REPO/overlay/vllm/$_rel" ]; then
       LAYOUT_FIX_VOLS="$LAYOUT_FIX_VOLS -v $REPO/overlay/vllm/$_rel:$_VLP/$_rel:ro"
     fi

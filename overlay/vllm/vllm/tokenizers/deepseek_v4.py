@@ -7,33 +7,9 @@ from transformers import PreTrainedTokenizerFast
 
 from vllm.entrypoints.chat_utils import ChatCompletionMessageParam
 
-from vllm.logger import init_logger
-
-from .deepseek_v4_encoding import (
-    DEFAULT_REASONING_EFFORT,
-    REASONING_EFFORT_PROMPTS,
-    encode_messages,
-)
+from .deepseek_v4_encoding import encode_messages
 from .hf import HfTokenizer, get_cached_tokenizer
 from .protocol import TokenizerLike
-
-logger = init_logger(__name__)
-
-# DeepSeek V4 defines exactly three reasoning-effort levels: low, high, max
-# (`<model>/encoding/encoding_dsv4.py`, and the model card).  The OpenAI-compatible
-# API surface accepts seven values, so the extra ones are folded onto the official
-# ladder monotonically.  "medium" is the only judgement call -- DS4 has no middle
-# rung, and mapping it to "high" keeps every above-default request meaningfully
-# above default.  "none" is handled separately (it switches thinking off).
-_REASONING_EFFORT_ALIASES: dict[str, str] = {
-    "minimal": "low",
-    "low": "low",
-    "medium": "high",
-    "high": "high",
-    "xhigh": "max",
-    "max": "max",
-}
-assert set(_REASONING_EFFORT_ALIASES.values()) <= set(REASONING_EFFORT_PROMPTS)
 
 
 def get_deepseek_v4_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
@@ -68,22 +44,12 @@ def get_deepseek_v4_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
             if not isinstance(reasoning_effort, str):
                 reasoning_effort = None
             elif reasoning_effort == "none":
-                # vLLM extension, not an official DS4 level: suppress thinking
-                # entirely rather than pick an effort prompt.
                 thinking_mode = "chat"
                 reasoning_effort = None
+            elif reasoning_effort in ("max", "xhigh"):
+                reasoning_effort = "max"
             else:
-                reasoning_effort = _REASONING_EFFORT_ALIASES.get(
-                    reasoning_effort.lower()
-                )
-                if reasoning_effort is None:
-                    logger.warning(
-                        "Unrecognized reasoning_effort %r for DeepSeek V4; "
-                        "falling back to %r. Official levels are low/high/max.",
-                        kwargs.get("reasoning_effort"),
-                        DEFAULT_REASONING_EFFORT,
-                    )
-                    reasoning_effort = DEFAULT_REASONING_EFFORT
+                reasoning_effort = "max"  # default MAX so encoder applies REASONING_EFFORT_MAX prefix
 
             encode_config = dict(
                 thinking_mode=thinking_mode,

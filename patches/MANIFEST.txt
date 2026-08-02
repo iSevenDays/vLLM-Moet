@@ -54,7 +54,6 @@ vllm-vllm-models-deepseek_v4-nvidia-mtp.py.patch
 vllm-vllm-models-deepseek_v4-nvidia-ops-o_proj.py.patch
 vllm-vllm-models-deepseek_v4-nvidia-ops-triton_ada_fp8_bmm.py.patch
 vllm-vllm-tokenizers-deepseek_v4.py.patch
-vllm-vllm-tokenizers-deepseek_v4_encoding.py.patch
 vllm-vllm-utils-deep_gemm.py.patch
 vllm-vllm-utils-flashinfer.py.patch
 vllm-vllm-v1-attention-backends-flashinfer.py.patch
