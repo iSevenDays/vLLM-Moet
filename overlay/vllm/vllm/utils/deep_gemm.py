@@ -622,9 +622,11 @@ def _torch_fp8_paged_mqa_logits(q, kv_cache, weights, context_lens,
                                 max_model_len: int,
                                 clean_logits: bool = False) -> torch.Tensor:
     """Reference paged variant (decode): FP8 indexer cache layout
-    [num_blocks, block_size, 1, D+4] u8 — D fp8 bytes then a 4-byte f32
-    per-position scale. context_lens [B] (per-request length; draft row j
-    sees length-(next_n-1-j)) or [B, next_n] (explicit per-row lengths)."""
+    [num_blocks, block_size, 1, D+4] u8, SEGREGATED per block (block_size*D
+    fp8 k bytes, then block_size*4 f32 per-position scales) per
+    indexer_k_quant_and_cache_kernel. context_lens [B] (per-request length;
+    draft row j sees length-(next_n-1-j)) or [B, next_n] (explicit per-row
+    lengths)."""
     _warn_fallback("fp8_fp4_paged_mqa_logits")
     qv, qs = q
     if qs is not None:
@@ -660,11 +662,21 @@ def _torch_fp8_paged_mqa_logits(q, kv_cache, weights, context_lens,
                         dtype=torch.float32, device=dev)
     wf = weights.float()
     pos = torch.arange(width, device=dev)
+    # Segregated per-block layout: split each block's flat byte stream into its
+    # k region (block_size*d bytes) and scale region (block_size*4 bytes), per
+    # indexer_k_quant_and_cache_kernel. The allocation shape [num_blocks,
+    # block_size, 1, D+4] implies interleaved strides, but the writer stores
+    # segregated -- so do NOT index via the tensor's natural [block,pos,:D+4]
+    # strides; slice the flat per-block bytes instead.
+    kv_flat = kv_cache.reshape(num_blocks, block_size * (d + 4))
+    kv_q = kv_flat[:, :block_size * d].reshape(num_blocks, block_size, d)
+    kv_s = kv_flat[:, block_size * d:].reshape(num_blocks, block_size, 4)
     for b in range(bsz):
         blocks = block_tables[b].long().clamp_(0, num_blocks - 1)
-        kb = kv_cache[blocks].reshape(width, d + 4)
-        kf = (kb[:, :d].view(torch.float8_e4m3fn).float()
-              * kb[:, d:].contiguous().view(torch.float32).view(-1, 1))
+        kq = kv_q[blocks].reshape(width, d)
+        ks = kv_s[blocks].reshape(width, 4)
+        kf = (kq.contiguous().view(torch.float8_e4m3fn).float()
+              * ks.contiguous().view(torch.float32).view(-1, 1))
         qf = qv[b].float()                                # [next_n, H, D]
         s = torch.einsum("jhd,sd->jhs", qf, kf)
         w_b = wf[b * next_n:(b + 1) * next_n]             # [next_n, H]

@@ -1,9 +1,9 @@
 diff --git a/vllm/v1/attention/ops/triton_paged_mqa_logits_dsv4.py b/vllm/v1/attention/ops/triton_paged_mqa_logits_dsv4.py
 new file mode 100644
-index 0000000..18a2d77 100644
+index 0000000..ca3f058 100644
 --- /dev/null
 +++ b/vllm/v1/attention/ops/triton_paged_mqa_logits_dsv4.py
-@@ -0,0 +1,462 @@
+@@ -0,0 +1,577 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Triton port of DeepGEMM's ``fp8_paged_mqa_logits`` (DSv4 lightning indexer).
@@ -46,9 +46,14 @@ index 0000000..18a2d77 100644
 +(``s <= context_len[b] - next_n + j``), ``-inf`` elsewhere. ``k_deq`` is the
 +paged FP8-E4M3 cache row times its per-token f32 scale.
 +
-+FP8 indexer cache layout (``[num_blocks, block_size, 1, D+4]`` uint8): the
-+first ``D`` bytes are FP8-E4M3 values, the last 4 bytes are the little-endian
-+f32 dequant scale for that (block, position).
++FP8 indexer cache layout (``[num_blocks, block_size, 1, D+4]`` uint8) is
++SEGREGATED within each block, matching ``indexer_k_quant_and_cache_kernel``
++(``csrc/.../cache_kernels.cu``): the first ``block_size*D`` bytes of a block
++are FP8-E4M3 k values (k at ``block_base + pos*D + d``), the final
++``block_size*4`` bytes are the little-endian f32 per-token dequant scales
++(scale at ``block_base + block_size*D + pos*4``). It is NOT ``[D+4]`` per
++token — reading it interleaved shifts k by ``4*pos`` bytes and bitcasts
++neighbouring k bytes as the scale, yielding ~1e30 / NaN decode scores.
 +
 +Safety model: the kernel is used ONLY after ``dsv4_paged_mqa_logits_self_test``
 +has validated it against the torch reference on the actual silicon (run once
@@ -158,11 +163,14 @@ index 0000000..18a2d77 100644
 +    phys = tl.where((phys >= 0) & (phys < num_blocks), phys, 0).to(tl.int64)
 +
 +    # Dequantize the K tile: FP8-E4M3 bytes * per-token f32 scale.
-+    base = phys * stride_kv_blk + n_offs[:, None] * stride_kv_pos
++    # Segregated per-block layout (see module docstring): k at
++    # block_base + pos*D, scale at block_base + block_size*D + pos*4.
++    blk_base = phys * stride_kv_blk
++    base = blk_base + n_offs[:, None] * D
 +    kb = tl.load(kv_ptr + base + d_offs[None, :], mask=n_ok[:, None],
 +                 other=0).to(tl.uint32)
 +    k = _decode_fp8_e4m3(kb)                                # [BLOCK_N, D]
-+    s_base = phys * stride_kv_blk + n_offs * stride_kv_pos + D
++    s_base = blk_base + BLOCK_SIZE * D + n_offs * 4
 +    c0 = tl.load(kv_ptr + s_base + 0, mask=n_ok, other=0).to(tl.uint32)
 +    c1 = tl.load(kv_ptr + s_base + 1, mask=n_ok, other=0).to(tl.uint32)
 +    c2 = tl.load(kv_ptr + s_base + 2, mask=n_ok, other=0).to(tl.uint32)
@@ -245,7 +253,11 @@ index 0000000..18a2d77 100644
 +
 +    q_u8 = q_values.contiguous().view(torch.uint8)              # [B,next_n,H,D]
 +    q_u8 = q_u8.view(num_rows, H, D)
-+    kv = kv_cache.reshape(num_blocks, block_size, D + 4)
++    # Segregated per-block layout: reshape to 2-D so stride(0) is the block
++    # stride (block_size*(D+4)); the kernel addresses k/scale via the
++    # constexpr D and BLOCK_SIZE (k at block_base+pos*D, scale at
++    # block_base+BLOCK_SIZE*D+pos*4).
++    kv = kv_cache.reshape(num_blocks, block_size * (D + 4))
 +    w = weights.contiguous()
 +    bt = block_tables.contiguous()
 +    lens_row = _per_row_lengths(context_lens.to(dev), next_n, bsz)
@@ -313,7 +325,11 @@ index 0000000..18a2d77 100644
 +        offs = torch.arange(next_n, device=dev, dtype=torch.int32)
 +        lens2d = context_lens.to(dev)[:, None] - (next_n - 1 - offs)[None, :]
 +    lens2d = lens2d.clamp(min=0)
-+    kv = kv_cache.reshape(num_blocks, block_size, d + 4)
++    # Segregated per-block layout: split each block into its k region
++    # (block_size*d bytes) and its scale region (block_size*4 bytes).
++    kv = kv_cache.reshape(num_blocks, block_size * (d + 4))
++    kv_q = kv[:, :block_size * d].reshape(num_blocks, block_size, d)
++    kv_s = kv[:, block_size * d:].reshape(num_blocks, block_size, 4)
 +    max_nblk = block_tables.shape[1]
 +    width = max_nblk * block_size
 +    w_cols = min(width, max_model_len)
@@ -323,9 +339,10 @@ index 0000000..18a2d77 100644
 +    pos = torch.arange(width, device=dev)
 +    for b in range(bsz):
 +        blocks = block_tables[b].long().clamp_(0, num_blocks - 1)
-+        kb = kv[blocks].reshape(width, d + 4)
-+        kf = (kb[:, :d].view(torch.float8_e4m3fn).float()
-+              * kb[:, d:].contiguous().view(torch.float32).view(-1, 1))
++        kq = kv_q[blocks].reshape(width, d)
++        ks = kv_s[blocks].reshape(width, 4)
++        kf = (kq.contiguous().view(torch.float8_e4m3fn).float()
++              * ks.contiguous().view(torch.float32).view(-1, 1))
 +        qf = qv[b].float()                                   # [next_n, H, d]
 +        s = torch.einsum("jhd,sd->jhs", qf, kf)
 +        w_b = wf[b * next_n:(b + 1) * next_n]                # [next_n, H]
@@ -339,19 +356,22 @@ index 0000000..18a2d77 100644
 +def pack_fp8_indexer_cache_reference(kv_rows: torch.Tensor,
 +                                     block_size: int) -> torch.Tensor:
 +    """Encode f32 rows ``[num_blocks*block_size, D]`` into the FP8 indexer
-+    cache byte layout ``[num_blocks, block_size, 1, D+4]`` uint8 (per-token
-+    f32 scale in the trailing 4 bytes). Reference writer for the self-test
-+    and tests; saturating FP8-E4M3 so the kernel's integer decode is exact."""
++    cache byte layout ``[num_blocks, block_size, 1, D+4]`` uint8, SEGREGATED
++    per block (block_size*D quantized k bytes, then block_size*4 f32 per-token
++    scales) -- matching ``indexer_k_quant_and_cache_kernel``. Reference writer
++    for the self-test and tests; saturating FP8-E4M3 so the kernel's integer
++    decode is exact."""
 +    n, d = kv_rows.shape
 +    assert n % block_size == 0
 +    num_blocks = n // block_size
 +    amax = kv_rows.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
 +    scale = (amax / 448.0).to(torch.float32)                 # per-token f32
 +    quant = (kv_rows / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
-+    qb = quant.view(torch.uint8)                             # [n, d]
-+    sb = scale.contiguous().view(torch.uint8).reshape(n, 4)  # [n, 4]
-+    row_bytes = torch.cat([qb, sb], dim=-1)                  # [n, d+4]
-+    return row_bytes.reshape(num_blocks, block_size, 1, d + 4).contiguous()
++    # Segregated: all k bytes per block, then all scale bytes per block.
++    qb = quant.view(torch.uint8).reshape(num_blocks, block_size * d)
++    sb = scale.contiguous().view(torch.uint8).reshape(num_blocks, block_size * 4)
++    blk_bytes = torch.cat([qb, sb], dim=-1)                  # [num_blocks, bs*(d+4)]
++    return blk_bytes.reshape(num_blocks, block_size, 1, d + 4).contiguous()
 +
 +
 +def _worst_row_rel(got: torch.Tensor, want: torch.Tensor) -> float:
@@ -407,6 +427,79 @@ index 0000000..18a2d77 100644
 +    return _worst_row_rel(got, want)
 +
 +
++def _self_test_case_real_writer(device: torch.device) -> float:
++    """Layout cross-check against vLLM's OWN cache writer.
++
++    ``_self_test_case`` compares this port to a torch reference that reads the
++    cache the same way the port does -- so it passes whatever the layout is.
++    That is exactly how the segregated/interleaved mismatch survived: kernel,
++    reference and reference-packer all agreed with each other and all
++    disagreed with ``indexer_k_quant_and_cache``, which is what actually
++    fills the cache at runtime. Here the bytes come from that real writer, so
++    a layout drift fails instead of self-confirming.
++
++    Returns the worst row-relative error, or -1.0 if the op is unavailable.
++    """
++    from vllm import _custom_ops as vllm_ops
++
++    num_blocks, block_size, bsz, next_n, H, D = 4, 64, 2, 1, 32, 128
++    max_model_len = 128
++    n_tok = num_blocks * block_size
++    kv_cache = torch.zeros(num_blocks, block_size, 1, D + 4,
++                           dtype=torch.uint8, device=device)
++    k_rows = (torch.randn(n_tok, D, device=device, dtype=torch.bfloat16) * 2.0)
++    slot_mapping = torch.arange(n_tok, device=device, dtype=torch.int64)
++    try:
++        # quant_block_size == head_dim -> exactly one f32 scale per token,
++        # which is the DSv4 indexer's configuration.
++        vllm_ops.indexer_k_quant_and_cache(k_rows, kv_cache, slot_mapping, D,
++                                           "fp8_e4m3")
++    except Exception as exc:                                  # pragma: no cover
++        logger.warning_once(
++            "DSv4 paged-MQA-logits: real-writer layout cross-check skipped "
++            "(%s: %s)", type(exc).__name__, exc)
++        return -1.0
++    q = (torch.randn(bsz, next_n, H, D, device=device, dtype=torch.float32)
++         ).clamp(-448, 448).to(torch.float8_e4m3fn)
++    weights = torch.randn(bsz * next_n, H, device=device, dtype=torch.float32)
++    context_lens = torch.tensor([[100], [128]], device=device,
++                                dtype=torch.int32)
++    max_blocks = -(-max_model_len // block_size)
++    block_tables = torch.zeros(bsz, max_blocks, device=device,
++                               dtype=torch.int32)
++    for b in range(bsz):
++        # deliberately NOT identity: a layout bug that only shows up when the
++        # logical and physical block index differ would otherwise hide.
++        block_tables[b, :max_blocks] = torch.arange(
++            max_blocks, device=device, dtype=torch.int32) + b
++    got = paged_mqa_logits_dsv4_triton(
++        q_values=q, kv_cache=kv_cache, weights=weights,
++        context_lens=context_lens, block_tables=block_tables,
++        max_model_len=max_model_len)
++
++    # Ground truth from the PRE-quantization k, never touching the cache. The
++    # only comparison that is independent of the layout: a reference that
++    # reads the cache would share whatever assumption the kernel makes and
++    # agree with it either way (which is the trap this test exists to avoid).
++    width = max_blocks * block_size
++    pos = torch.arange(width, device=device)
++    want = torch.full((bsz * next_n, max_model_len), float("-inf"),
++                      dtype=torch.float32, device=device)
++    for b in range(bsz):
++        phys = (block_tables[b].long()[pos // block_size] * block_size
++                + pos % block_size).clamp_(0, n_tok - 1)
++        kf = k_rows[phys].float()                            # [width, D]
++        s = torch.einsum("jhd,sd->jhs", q[b].float(), kf)
++        w_b = weights[b * next_n:(b + 1) * next_n].float()
++        row = (torch.relu(s) * w_b[:, :, None]).sum(1)       # [next_n, width]
++        row = row.masked_fill(
++            pos[None, :] >= context_lens[b].to(device)[:, None].clamp(min=0),
++            float("-inf"))
++        cols = min(width, max_model_len)
++        want[b * next_n:(b + 1) * next_n, :cols] = row[:, :cols]
++    return _worst_row_rel(got, want)
++
++
 +@functools.cache
 +def dsv4_paged_mqa_logits_self_test() -> None:
 +    """One-shot on-device self-test; enables the kernel iff it matches the
@@ -430,6 +523,28 @@ index 0000000..18a2d77 100644
 +    device = torch.device("cuda", torch.cuda.current_device())
 +    worst = _self_test_case(device)
 +    cap = torch.cuda.get_device_capability(device)
++    # Layout gate. Quantization noise only (k is fp8-e4m3 with a per-token
++    # scale, q is fp8 on both sides), so a correct read lands near 1e-2 while
++    # a layout mismatch is O(1) or worse.
++    layout = _self_test_case_real_writer(device)
++    # NaN-safe: a wrong layout reads bitcast FP8 bytes as the dequant scale
++    # and the error comes back NaN, and `nan > 8e-2` is False. Gate on the
++    # PASS condition so anything not provably small fails.
++    if layout != -1.0 and not layout <= 8e-2:
++        _KERNEL_TRUSTED = False
++        logger.error(
++            "DSv4 paged-MQA-logits LAYOUT CHECK FAILED on sm_%d%d: "
++            "worst_row_rel=%.3e vs f32 ground truth over a cache filled by "
++            "vLLM's own indexer_k_quant_and_cache (threshold 8e-2). The port "
++            "is reading the indexer KV cache with the wrong byte layout - "
++            "keeping the torch reference. Note the reference reads the cache "
++            "the same way, so it is NOT known-good here either.",
++            cap[0], cap[1], layout)
++        return
++    if layout >= 0.0:
++        logger.info(
++            "DSv4 paged-MQA-logits layout check vs vLLM's own cache writer: "
++            "worst_row_rel=%.3e (f32 ground truth)", layout)
 +    if worst <= 3e-2:
 +        _KERNEL_TRUSTED = True
 +        logger.info(
