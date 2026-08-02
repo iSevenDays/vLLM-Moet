@@ -1089,6 +1089,28 @@ def sparse_attn_indexer(
             1024,
             2048,
         )
+        # sm89 (Ada) decode-selection correctness: route the indexer decode
+        # top-k to top_k_per_row_decode, disabling the radix selectors
+        # (cooperative_topk / persistent_topk). The radix selectors take a
+        # scan bound over logits columns and a SCALAR k, but the indexer's
+        # logits columns are COMPRESSED candidates and `k_select` (=512) is
+        # never clamped to the per-row compressed candidate count. When a
+        # row has fewer than 512 valid candidates (absolute context < 2048
+        # for ratio-4), the radix selector cannot fill k and emits stale/NaN
+        # indices (the logits buffer is built with clean_logits=False) ->
+        # the sampler attends to garbage and the generation collapses.
+        # top_k_per_row_decode takes no scan bound and clamps per row by the
+        # compressed seq_lens, so it is correct by construction. All four
+        # reference implementations agree the candidate axis is the compressed
+        # count (DeepSeek model.py `topk(min(index_topk, end_pos // ratio))`,
+        # DS.cpp, llama.cpp, SGLang). mla/indexer.py also compresses the scan
+        # bound now (defense-in-depth for whenever the radix path is
+        # re-enabled). COST: slower than the radix selectors, but decode is
+        # bandwidth-bound so the topk choice is not on the critical path.
+        # Unconditional on purpose -- worker procs do not inherit an env knob
+        # set on the API server, so gating this by env silently no-ops.
+        use_cooperative_topk = False
+        use_persistent_topk = False
         if use_cooperative_topk:
             workspace_manager = current_workspace_manager()
             (topk_workspace,) = workspace_manager.get_simultaneous(

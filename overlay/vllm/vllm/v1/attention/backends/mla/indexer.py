@@ -830,6 +830,27 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # bound over logits columns; under DCP those columns cover only the
         # local shard, so hand the kernels the (exact) local maximum.
         max_seq_len = common_attn_metadata.max_seq_len
+        # DeepseekV4 (compress_ratio > 1): the indexer's logits columns are
+        # COMPRESSED candidates, and `seq_lens` above was already divided by
+        # compress_ratio. This bound had not been, so the radix decode top-k
+        # selectors (cooperative_topk / persistent_topk) were handed a scan
+        # window compress_ratio-times wider than the valid candidate region
+        # and ranked stale columns (the logits buffer is built with
+        # clean_logits=False). Harmless while compressed count <= index_topk
+        # (512); corrupts selection the moment real ranking begins -- i.e. at
+        # compressed count 512 = absolute context 2048. The same units
+        # mismatch as the decode layout bug, two severities apart. All four
+        # reference implementations use the compressed count as the candidate
+        # axis (DeepSeek model.py `topk(min(index_topk, end_pos // ratio))`,
+        # DS.cpp, llama.cpp, SGLang). Divide before the DCP localisation
+        # below (the two are mutually exclusive anyway). NOTE: required but
+        # not sufficient alone -- the radix selectors also need k_select
+        # clamped to the per-row compressed count, which they cannot do
+        # (scalar k), so sparse_attn_indexer.py routes decode to
+        # top_k_per_row_decode regardless. This compression is the
+        # defense-in-depth that lets the radix path be re-enabled safely.
+        if self.compress_ratio > 1:
+            max_seq_len //= self.compress_ratio
         if self.dcp_world_size > 1:
             max_seq_len = dcp_local_count_int(
                 max_seq_len,
