@@ -3,12 +3,12 @@
 **Written 2026-08-01 by Claude (Opus 5), who may be unavailable for ~1 week.**
 
 You are good at executing tasks. This document assumes you do **not** have the
-accumulated context of this investigation, so every task below is fully
-specified: exact commands, expected output, and a decision table telling you what
-to conclude and where to go next. Do not improvise the order.
+accumulated context of this investigation. So every task below is fully
+specified: exact commands, expected output, and a decision table. The table tells
+you what to conclude and where to go next. Do not improvise the order.
 
 - **Background/knowledge → [`README.md`](README.md).** Read §0, §2, §4 before
-  starting. It tells you what is already ruled out, so you don't redo it.
+  you start. It tells you what is already ruled out, so you do not redo it.
 - **This file → what to do.** Tasks are `T1…T8`, ordered. Cheapest and most
   informative first. **T1, T2, T3, T5, T6, T8 need no GPU boot at all.**
 
@@ -18,7 +18,7 @@ to conclude and where to go next. Do not improvise the order.
 
 1. **Do not run an end-to-end needle sweep before T1 lands.** Every
    position-dependent number produced before T1 is suspect (README §2).
-2. **Verify an instrument's addressing before trusting its output.** The single
+2. **Verify an instrument's addressing before you trust its output.** The single
    worst error in this investigation was a diagnostic aimed at the wrong data
    (README §2). A CPU check of seconds would have caught it.
 3. **One GPU container at a time.** The model fills both GPUs (~48 GiB each).
@@ -27,7 +27,7 @@ to conclude and where to go next. Do not improvise the order.
    something, write down the evidence and the command that produced it.
 5. **When a result contradicts this plan, believe the result.** Seven
    interpretations have already been retracted here. Write the contradiction
-   down; don't force it into the existing story.
+   down. Do not force it into the existing story.
 6. **Prefer CPU harnesses over boots.** Boot 6–10 min; 8K needle point ~100 s;
    32K ~650 s; CPU harnesses seconds. See `tools/README.md`.
 
@@ -135,7 +135,7 @@ End commit messages with `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`
 **Why.** `tools/needle_digits_probe.py` inserts the needle at a **byte** fraction
 of the filler but reports its position as `int(prompt_tokens × depth)`, a **token**
 fraction. At `ask`/8192 that is off by **+970 tokens = 243 ratio-4 columns**. This
-is what invalidated the rank trace (README §2). Until fixed, every
+is what invalidated the rank trace (README §2). Until you fix it, every
 position-dependent claim is unreliable.
 
 **Steps.**
@@ -175,9 +175,9 @@ its attend set as `cat([always_included_window_idxs, compress_topk_idxs])`
 which **passes** this needle test on the same hardware — additionally models
 `indexer.local_blocks` (`~/llama.cpp/src/llama-arch.cpp:260–261`). If the
 reference/llama.cpp unconditionally admit the most recent N *compressed* blocks
-**in addition to** the top-k, and this port admits only the top-k, then recent
-entries the reference keeps are being dropped here. That alone would produce the
-observed symptom.
+**in addition to** the top-k, and this port admits only the top-k, then the port
+drops recent entries the reference keeps. That alone would produce the observed
+symptom.
 
 **Read these three, answer one question.**
 1. Checkpoint: `inference/model.py`, `Attention.forward` around lines 505–520
@@ -191,8 +191,8 @@ observed symptom.
 
 **The question: does any implementation always-include recent compressed blocks
 that this port drops?** Also check whether the GGUF metadata actually sets
-`local_blocks` for this model (`gguf-py` or `llama-gguf` dump on the GGUF in T6),
-because an unset key means llama.cpp isn't using it either.
+`local_blocks` for this model (`gguf-py` or `llama-gguf` dump on the GGUF in T6).
+An unset key means llama.cpp is not using it either.
 
 | finding | conclusion | next |
 |---|---|---|
@@ -229,12 +229,12 @@ output unreadable or absent.
    observed**. Add a call after the decode selection — after
    `torch.ops._C.persistent_topk` (`:810`) and `ops.top_k_per_row_decode`
    (`:819`). Note decode `logits` are shaped `[num_padded_tokens, max_seq_len]`
-   and there are no `cu_seqlen_ks/ke`; use `seq_lens` for the valid range, and
+   and there are no `cu_seqlen_ks/ke`. Use `seq_lens` for the valid range, and
    write a small separate helper rather than forcing the prefill one to fit.
 4. **Accept a column range.** Add `VLLM_DSV4_INDEXER_TRACE_SPAN` (default 2) and
-   report every ratio-4 column in `[pos//4 - span, pos//4 + span]`. Needed
-   because the true column is **967–968** depending on tokenization details
-   (README §2).
+   report every ratio-4 column in `[pos//4 - span, pos//4 + span]`. This is
+   needed because the true column is **967–968** depending on tokenization
+   details (README §2).
 
 **Verify without a boot:** `python3 -c "import ast;ast.parse(open('<file>').read())"`,
 then the mandatory patch sequence in §2. Do **not** boot yet.
@@ -262,7 +262,7 @@ from **H5**, i.e. whether selection is the mechanism at all.
      -e VLLM_DSV4_INDEXER_TRACE_MAX=128 \
      -v $PWD/overlay/vllm/vllm/model_executor/layers/sparse_attn_indexer.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer.py:ro"
    ```
-   **Confirm the mount landed** (§3) before waiting 10 minutes.
+   **Confirm the mount landed** (§3) before you wait 10 minutes.
 3. Run **both** variants and capture the trace after each:
    ```bash
    python3 tools/needle_digits_probe.py --lengths 8192 --variant ask \
@@ -298,7 +298,7 @@ from **H5**, i.e. whether selection is the mechanism at all.
 `max_num_batched_tokens` 1056→528 flips individual points in *both* directions
 (README §3a). A pure top-k coverage story cannot explain that: chunk size should
 not change scores. The ratio-4 compressor is *overlapping* and carries
-`kv_state`/`score_state` across calls, whereas the checkpoint builds them in one
+`kv_state`/`score_state` across calls. The checkpoint builds them in one
 `start_pos == 0` pass. `tools/test_compressor_vs_checkpoint_ref.py` validated the
 semantics **within a single chunk only**.
 
@@ -318,9 +318,9 @@ against the reference's single-pass output.
 ### T6 — Close the llama.cpp confounds *(~30 min, no GPU)*
 
 **Why.** "llama.cpp passes the needle test on this hardware" is the single most
-important new datum — it is the like-for-like reference that shifts the prior from
-"architectural limit" to "port defect". Three confounds must be closed or it
-proves nothing.
+important new datum — it is the like-for-like reference that shifts the prior
+from "architectural limit" to "port defect". Three confounds must be closed, or
+the datum proves nothing.
 
 1. **Which weights.** The GGUF in shell history is
    `/root/antirez/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf`.
@@ -349,8 +349,8 @@ checkpoint, downgrade the datum in `README.md` §3d and tell the operator.
 sm_89 attribution holds none of these fixed.
 
 **Steps.** Read that recipe (`git show upstream/main:bench/recipes/deepseek-v4-flash/pro6000x2-tp2.yaml`;
-`upstream` remote already exists), launch with its serve args as closely as the
-hardware allows, then run the **cheap** gate (~65 s):
+`upstream` remote already exists). Launch with its serve args as closely as the
+hardware allows. Then run the **cheap** gate (~65 s):
 
 ```bash
 python3 tools/needle_probe.py 8011 8000 0.1     # currently FAILS: "GLACIER"
@@ -363,16 +363,16 @@ python3 tools/needle_probe.py 8011 8000 0.1     # currently FAILS: "GLACIER"
 
 ⚠️ Changing speculation may trip the `moe_w2` strict guard (§2). Vary
 `num_speculative_tokens` rather than removing speculation. `MTP_TOKENS`/
-`SPECULATIVE_CONFIG` are the knobs; expect a Triton recompile and possible
+`SPECULATIVE_CONFIG` are the knobs. Expect a Triton recompile and possible
 capture-time OOM (§3) — reduce `--kv-cache-memory-bytes` if so.
 
 ---
 
 ### T8 — Numerically verify the CUDA routing kernels *(unit test, ~30 min)*
 
-**Why.** Low prior for this symptom but it closes the last unverified item in
+**Why.** Low prior for this symptom, but it closes the last unverified item in
 README §4. Production runs `ops.topk_hash_softplus_sqrt`; the torch fallbacks in
-`overlay/.../fused_moe/router/fused_topk_bias_router.py` are only reached on XPU/CPU, so the **CUDA** path has
+`overlay/.../fused_moe/router/fused_topk_bias_router.py` are only reached on XPU/CPU. So the **CUDA** path has
 never been checked numerically against the checkpoint.
 
 **Steps.** New `tools/test_topk_router_vs_checkpoint.py` asserting
@@ -395,7 +395,7 @@ After **every** task:
 3. Update this file: mark the task done with a one-line result.
 4. Commit. Overlay changes require the §2 sequence.
 
-**Escalate to the operator (don't decide alone) when:**
+**Escalate to the operator (do not decide alone) when:**
 - T2 confirms H1 and a selection-semantics patch is needed (changes model behaviour).
 - T4 returns the H2 branch (the whole framing changes).
 - Anything requires deleting data, relaxing the `moe_w2` guard, or shipping
@@ -409,7 +409,7 @@ After **every** task:
 - **Ground truth is `/root/models/DeepSeek-V4-Flash-0731/inference/model.py`.**
   It ships with the weights and is authoritative over any doc here, including
   this one.
-- `README.md` §4 lists what is already ruled out **with the evidence**, so you can
+- `README.md` §4 lists what is already ruled out **with the evidence**. So you can
   dispute it rather than redo it.
 - `tools/README.md` lists every harness with its cost and what it proves.
 - The old `STATUS.md`/`BRIEFING.md`/`HANDOFF.md` were deleted (absorbed into

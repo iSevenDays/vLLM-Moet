@@ -12,8 +12,8 @@ investigation lives here, in the repo whose code it describes.
 
 Nothing else. The former `STATUS.md` / `BRIEFING.md` / `HANDOFF.md` / archive are
 **deleted** — fully absorbed here. If you need the original §5.1–5.19 narrative
-for provenance: `git log --follow --all -- 'docs/dsv4-sm89-longcontext/*'` and
-`git show 3678f3b00:docs/dsv4-sm89-longcontext/archive/STATUS.md`.
+for provenance, run `git log --follow --all -- 'docs/dsv4-sm89-longcontext/*'` and
+read `git show 3678f3b00:docs/dsv4-sm89-longcontext/archive/STATUS.md`.
 
 ---
 
@@ -21,7 +21,7 @@ for provenance: `git log --follow --all -- 'docs/dsv4-sm89-longcontext/*'` and
 >
 > The long-context digit loss was **not** an architectural `index_topk` limit
 > (§5/§7's pre-resolution framing, now refuted). It was two bugs in the sm89
-> decode-indexer path, ported from
+> decode-indexer path. The bugs were ported from
 > [`the-crypt-keeper/vLLM-sm89`](https://github.com/the-crypt-keeper/vLLM-sm89)
 > (`sm89-ds4-work`) and re-validated on the RTX 4090 D:
 >
@@ -29,11 +29,11 @@ for provenance: `git log --follow --all -- 'docs/dsv4-sm89-longcontext/*'` and
 >   **interleaved** (`[D+4]` per token) while `indexer_k_quant_and_cache_kernel`
 >   writes it **segregated** (all k bytes, then all scale bytes, per block) →
 >   garbage/NaN decode candidate scores past L=2048. The §5.19 rank trace looked
->   clean because it watched the *prefill* path (correct); the bug was in the
+>   clean because it watched the *prefill* path (correct). The bug was in the
 >   *decode* path, which §2 later showed was never instrumented. Fix: the three
 >   readers → segregated + a real-writer self-test. Commit `93bd9b7d5`.
 > - **Bug #1 — short-prompt repetition.** The radix decode top-k got an
->   uncompressed scan bound + an unclamped `k_select=512`; with <512 valid
+>   uncompressed scan bound + an unclamped `k_select=512`. With <512 valid
 >   candidates (absolute context <2048) it emitted NaN indices → token-salad
 >   (e.g. a 15-token "capital of Germany?" returned word-salad repetition). Fix:
 >   route decode to `top_k_per_row_decode` + compress the scan bound. Commit
@@ -42,7 +42,7 @@ for provenance: `git log --follow --all -- 'docs/dsv4-sm89-longcontext/*'` and
 >   no-op, real `max` unreachable). Commit `02fe69a84`.
 >
 > **Validated:** `ask` @ 8K / 32K / 64K all PASS exact → `index_topk=512` is
-> sufficient once the cache is read correctly, so the `=2048` workaround in §7
+> sufficient once the cache is read correctly. So the `=2048` workaround in §7
 > is **obsolete**. Short-prompt repetition gone; paged-MQA layout self-test
 > `3.642e-02` at boot. `docker/serve_sm89_ds4.sh` bind-mounts the six fixed
 > overlay files by default (`MOUNT_LAYOUT_FIX=1`, fatal if missing) until the
@@ -50,13 +50,13 @@ for provenance: `git log --follow --all -- 'docs/dsv4-sm89-longcontext/*'` and
 >
 > The retraction chain in §4 and the raw measurements in §3 are retained for
 > provenance. §2's instrument correction (the trace watched the wrong column)
-> stood; §5 H1/H2/H3 were superseded by the fix, not by their falsifiers.
+> stood. §5 H1/H2/H3 were superseded by the fix, not by their falsifiers.
 
 ---
 
 ## 0. Read this first
 
-Two things will cost you hours if you don't know them.
+Two facts will cost you hours if you do not know them.
 
 **(a) "Needle retrieval is broken above ~8K" is wrong.** The model recovers the
 needle's leading component at every length tested (2K–48K) and loses the
@@ -70,15 +70,15 @@ true GLACIER-7741-ORYX  -> "GLACIER-7741"  (depth 0.5)  /  "GLACIER"  (depth 0.1
 
 Retrieval locates the needle. Exact multi-token copy is what fails. Use
 [`tools/needle_digits_probe.py`](../../tools/needle_digits_probe.py), which
-reports `word_present` / `digits_present` separately; the old
-`bench/runner/probes.py --probe needle_sweep` collapses both into one bit and is
-what produced the original misdiagnosis.
+reports `word_present` / `digits_present` separately. The old
+`bench/runner/probes.py --probe needle_sweep` collapses both into one bit. That
+old probe produced the original misdiagnosis.
 
 **(b) Seven interpretations have been retracted here (§4). The raw
 request/response measurements have never been wrong — every failure was in what
-an instrument was believed to be pointing at.** Before trusting any diagnostic,
-verify its addressing on a known input. The prompts are deterministic and the
-tokenizer runs on CPU in seconds; that check would have caught the worst error
+an instrument was believed to point at.** Before you trust any diagnostic,
+verify its addressing on a known input. The prompts are deterministic. The
+tokenizer runs on CPU in seconds. That check would have caught the worst error
 (§2) immediately.
 
 ### Standing decisions
@@ -88,9 +88,9 @@ tokenizer runs on CPU in seconds; that check would have caught the worst error
   146 GB reclaimed). It was verifiably the old one: 44 `compress_ratios` entries
   and **no** dspark keys, vs 0731's 46 entries plus `dspark_block_size 5`,
   `dspark_target_layer_ids [40,41,42]`, `dspark_markov_rank 256`. Any result
-  quoted from it is not comparable and should be re-measured or dropped.
+  quoted from it is not comparable. Re-measure or drop such results.
   Two stale `MODEL` defaults that pointed at it (`docker/serve_sm89_ds4.sh:142`,
-  `start.sh:23`) were repointed to `-0731` before the delete, so nothing can
+  `start.sh:23`) were repointed to `-0731` before the delete. So nothing can
   resolve to a missing path.
 - **~1 TB reclaimed 2026-08-01** (403 GB → 1.4 TB free). Beyond the checkpoint:
   its unreferenced conversions `-RAWINT4` / `-AMXINT4` / `-AMXINT4-NUMA1`
@@ -103,7 +103,7 @@ tokenizer runs on CPU in seconds; that check would have caught the worst error
   (53 GB), `moet-cache-0731-host` (133 GB), `DeepSeek-V4-Flash-0731-AMXINT4`
   (125 GB — AMXINT4 is a rejected direction, ~10 tok/s).
 - `vllm-moet-sm89:v0251` is the canonical living tag. Preserve baselines as
-  suffixed tags; never default to a candidate tag.
+  suffixed tags. Never default to a candidate tag.
 - **Never `--enforce-eager`** on this rig.
 - Production: container `moet-0731-dspark-exact`, port **8011**, sole container,
   indexer trace off by default.
@@ -132,7 +132,7 @@ and is authoritative — ~600 lines, read it directly.
   **never retained exactly** — only as learned gated-pooling compressed entries.
 - Selection: `topk_idxs = index_score.topk(min(index_topk, end_pos // ratio))`,
   `index_score = (einsum(q, kv_cache[:, :end_pos//ratio]).relu_() * weights).sum(dim=2)`.
-- An `Indexer` exists **only on `compress_ratio == 4` layers**; ratio-128 layers
+- An `Indexer` exists **only on `compress_ratio == 4` layers**. Ratio-128 layers
   use positional order (all causal entries) by design.
 - Attend set = `cat([always_included_window_idxs, compress_topk_idxs])`, two
   segments sharing ONE softmax (line ~520).
@@ -146,8 +146,8 @@ yarn factor 16 / `original_max_position_embeddings 65536`.
 
 ### Serving state — throughput, prefill envelope, KV capacity
 
-These are settled and **not** part of the open problem; they are here so nobody
-re-measures them. All on the §1 production config.
+These results are settled and are **not** part of the open problem. They are
+here so nobody re-measures them. All on the §1 production config.
 
 | gate | result |
 |---|---|
@@ -158,22 +158,22 @@ re-measures them. All on the §1 production config.
 
 **Prefill envelope ≈ 64–80K tokens.** Fresh-boot sweep: 16K/32K/48K/64K all pass;
 80K OOMs **at the same `nvidia-smi` peak (48,508 MiB) where 64K passed**. So the
-constraint is not total memory — it is a specific deep-context allocation plus
+constraint is not total memory. It is a specific deep-context allocation plus
 PyTorch cache fragmentation. The ceiling is therefore *allocator-state
-dependent*, not a clean function of prompt length: a dirty allocator (after
+dependent*, not a clean function of prompt length. A dirty allocator (after
 several decode benchmarks) fails earlier than a fresh boot.
 
 **KV capacity (boot log, authoritative).** `pool=4836` packed blocks,
 `allocatable=4835` (one null block reserved), `max-request=1480`,
 `per-group=(1024,20,20,267,149)`, GPU KV cache 856,573 tokens, max concurrency
 **3.27×** at 262,144 tokens/request. The two compressor groups (267/149) are
-sized *per prefill chunk plus the sliding window*, which is what makes chunked
-prefill safe — see §4's capacity row.
+sized *per prefill chunk plus the sliding window*. That sizing is what makes
+chunked prefill safe — see §4's capacity row.
 
 ⚠️ **`--kv-cache-memory-bytes` BYPASSES `--gpu-memory-utilization`.** Boot log,
 verbatim: *"reserved 4.51 GiB … skipped memory profiling. This does not respect
-the gpu_memory_utilization config."* Lowering `UTIL` alone is a **no-op**;
-headroom must come from reducing `--kv-cache-memory-bytes` or
+the gpu_memory_utilization config."* Lowering `UTIL` alone is a **no-op**.
+Headroom must come from reducing `--kv-cache-memory-bytes` or
 `--max-num-batched-tokens`.
 
 ---
@@ -203,7 +203,7 @@ Token dump of the traced column: `[' in',' `','gen','/','`',' as',' the',' valid
 — filler prose, **~243 columns from the needle**.
 
 **Independently re-verified** with `tools/verify_needle_token_position.py`
-(CPU, seconds — run this before aiming any position-addressed instrument):
+(CPU, seconds — run this before you aim any position-addressed instrument):
 
 | | measured | probe's estimate | off by |
 |---|---:|---:|---:|
@@ -211,13 +211,13 @@ Token dump of the traced column: `[' in',' `','gen','/','`',' as',' the',' valid
 | ratio-4 column | **967** | 1210 | **243** |
 | ratio-128 column | **30** | 37 | 7 |
 
-⚠️ The exact ratio-4 column is **967–968** depending on whether you index the
+⚠️ The exact ratio-4 column is **967–968**. It depends on whether you index the
 `"1605"` string start or the `'160'` token, and on the chat template's prefix.
-For a trace that ±1 matters: **sweep a small column range, not a single value.**
+For a trace, that ±1 matters: **sweep a small column range, not a single value.**
 
 **Root cause of the error:** the probe inserts the needle at a **byte** fraction
 of the filler but reports its position as a **token** fraction. The filler's
-first half (markdown + Python) tokenizes denser than its second half, so
+first half (markdown + Python) tokenizes denser than its second half. So
 byte-50 % lands at token-39.8 %.
 
 **Invalidated — do not quote:** the rank table (112/592/523/1003/693/184/125/492);
@@ -250,13 +250,13 @@ data + the question-chunk isolation: [`runlogs/T4_analysis.md`](runlogs/T4_analy
    `VLLM_DSV4_INDEXER_TRACE_DECODE_MAX`). The `sel` (selected) flag is the robust
    headline signal. *Observation* of decode selection is still pending — T4.
 2. The archived `BRIEFING.md` §3b "needle absolute token pos" column
-   (194/1695/2324/4843/9492) comes from the same estimate; `--abs-pos N` was
+   (194/1695/2324/4843/9492) comes from the same estimate. `--abs-pos N` was
    converted to `depth = N/L` and applied as a byte fraction. The pass/fail
    pattern still refutes "fixed position" and "fixed length" (those need only
-   *some* monotone axis) but **the axis values are wrong** — recompute before
-   fitting any threshold. **FIXED 2026-08-01 (T1):** `needle_digits_probe.py`
+   *some* monotone axis). But **the axis values are wrong** — recompute before
+   you fit any threshold. **FIXED 2026-08-01 (T1):** `needle_digits_probe.py`
    now reports the measured `needle_token_pos` (anchor = the digits, the column
-   a trace watches) and `needle_token_frac`, plus `position_measured`; the
+   a trace watches) and `needle_token_frac`, plus `position_measured`. The
    unsound `needle_abs_pos_est = int(pt × depth)` field is removed. `--abs-pos N`
    now places by **token** (tokenize → insert → re-tokenize → verify ±2, recorded
    as `placed_ok`). Verified: `ask/8192/0.5` → digits @ token **3,871**, ratio-4
@@ -286,7 +286,7 @@ data + the question-chunk isolation: [`runlogs/T4_analysis.md`](runlogs/T4_analy
 
 Two facts worth holding onto: **chunk size flips individual points in opposite
 directions** (2/6 either way, a *different* 2) — chunk size should not change
-scores, so a pure coverage story does not explain this; and **`index_topk=2048`
+scores, so a pure coverage story does not explain this. And **`index_topk=2048`
 is the only change ever measured to convert failures into passes**.
 
 ### 3b. Question form, all at pt ≈ 9685, topk512 ch1056
@@ -321,8 +321,8 @@ positions 0-4 in BOTH cases: all ~ -0.000
 **llama.cpp passes the needle test on this same hardware** (operator-verified
 2026-08-01) — **but on the OLD (superseded) checkpoint, not 0731; NOT
 like-for-like** (T6, 2026-08-01). So the prior shift this datum motivated
-("architectural limit of `index_topk=512`" → "port defect") is **not warranted**;
-the sm_89-port-suspicion stories lose their strongest support. Original confounds
+("architectural limit of `index_topk=512`" → "port defect") is **not warranted**.
+The sm_89-port-suspicion stories lose their strongest support. Original confounds
 (now partly resolved):
 1. **Which weights — RESOLVED (old checkpoint).** The GGUF llama.cpp used has
    `compress_ratios` length **44** and **no dspark keys** = the OLD checkpoint
@@ -414,7 +414,7 @@ watched the wrong column). Details: [`runlogs/T4_analysis.md`](runlogs/T4_analys
 **H3 — Chunked-prefill boundary corrupts the compressor's overlapping window.**
 Chunk size flips individual points (§3a), which a pure coverage story cannot
 explain — chunk size should not change scores. The ratio-4 compressor is
-overlapping and carries `kv_state`/`score_state` across calls; the reference
+overlapping and carries `kv_state`/`score_state` across calls. The reference
 builds them in one `start_pos == 0` pass, and our validation was single-chunk.
 *Falsifier:* V2b, CPU, no boot.
 
@@ -427,7 +427,7 @@ attribution holds none of them fixed. *Falsifier:* V5, one boot.
 question-time on the failing `ask` (20/21 layers), so plain coverage is not the
 8K mechanism. NOT fully eliminated: `index_topk=2048` still rescues 6/6 to 18.5K
 (§7) — so at *longer* contexts (where the digit likely ranks worse) coverage may
-contribute, and 2048 may help at 8K via a non-coverage path (attention-weight
+contribute. And 2048 may help at 8K via a non-coverage path (attention-weight
 distribution / context entries). The 8K and >8K mechanisms may differ.
 
 ---
@@ -436,7 +436,7 @@ distribution / context entries). The 8K and >8K mechanisms may differ.
 
 > **Superseded by [`PLAN.md`](PLAN.md)**, which specifies each of these as an
 > executable task (T1–T8) with exact commands, expected output and decision
-> tables. The summaries below are kept for rationale; **follow PLAN.md for the
+> tables. The summaries below are kept for rationale. **Follow PLAN.md for the
 > order and the mechanics.**
 
 **V0 — Measurement hygiene. Do this before any new sweep.** *(CPU, ~30 min)*
@@ -452,9 +452,9 @@ Otherwise every future position claim inherits the §2 error.
 2. ~~`--abs-pos` must place by **token** position (tokenize, insert, verify), not
    by converting to a byte fraction.~~ **DONE (T1, 2026-08-01).** `--abs-pos N`
    binary-searches the byte offset that puts the anchor at token N and records
-   `placed_ok` (within ±2). Needs the model tokenizer on the host (`pip install
+   `placed_ok` (within ±2). It needs the model tokenizer on the host (`pip install
    tokenizers`; loads `tokenizer.json`, byte-identical to AutoTokenizer
-   `add_special_tokens=False`); without it positions are `UNMEASURED` and
+   `add_special_tokens=False`). Without it, positions are `UNMEASURED` and
    `--abs-pos` errors loudly.
 3. Recompute the archived §3b position axis and restate the two refutations
    against it.
@@ -508,8 +508,9 @@ configuration (H4), not architecture. Note the `moe_w2` strict guard may trip
 when speculation changes: vary `num_speculative_tokens` rather than removing
 speculation; **never relax the guard**.
 
-**V6 — Close the llama.cpp confounds.** *(minutes)* §3d's three items. Cheapest
-way to firm up the single most informative new datum. Record in `runlogs/`.
+**V6 — Close the llama.cpp confounds.** *(minutes)* §3d's three items. This is
+the cheapest way to firm up the single most informative new datum. Record in
+`runlogs/`.
 
 ---
 
@@ -517,7 +518,7 @@ way to firm up the single most informative new datum. Record in `runlogs/`.
 
 > ✅ **RESOLVED 2026-08-02 — see the banner at the top of this file.** The cause
 > was the decode-indexer bugs (layout + top-k), not coverage. The fix is in, so
-> `index_topk=512` is sufficient (64K retrieval passes); the `=2048` interim
+> `index_topk=512` is sufficient (64K retrieval passes). The `=2048` interim
 > workaround below is **obsolete**. This section is retained as the
 > pre-resolution strategy of record.
 
