@@ -348,6 +348,7 @@ docker run -d --name "$NAME" --restart "$RESTART" --gpus "$GPUS" --network "$NET
   $RESVOL \
   $LAYOUT_FIX_VOLS \
   -e VLLM_MOE_W2=1 \
+  -e VLLM_DSV4_DEFAULT_REASONING_EFFORT="${REASONING_EFFORT:-max}" \
   $DELTA_ENV \
   $QP_ENV \
   -e VLLM_MOE_W2_SCALE_REFIT="$SCALE_REFIT" \

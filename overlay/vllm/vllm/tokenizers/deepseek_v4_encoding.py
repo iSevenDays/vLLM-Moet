@@ -13,6 +13,7 @@ with tool calling, thinking mode, and quick instruction task support.
 from typing import Any, Dict, List, Union, Optional, Tuple
 import copy
 import json
+import os
 
 import regex as re
 
@@ -91,7 +92,11 @@ REASONING_EFFORT_PROMPTS: Dict[str, str] = {
         "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n"
     ),
 }
-DEFAULT_REASONING_EFFORT = "low"
+# Default reasoning effort for requests that do not specify one. Env-configurable
+# so the serving launcher can set it (this rig serves at "max" by default —
+# VLLM_DSV4_DEFAULT_REASONING_EFFORT=max in docker/serve_sm89_ds4.sh). "max" only
+# adds the effort prefix in thinking mode; thinking=false requests are unaffected.
+DEFAULT_REASONING_EFFORT = os.getenv("VLLM_DSV4_DEFAULT_REASONING_EFFORT", "max")
 
 TOOLS_TEMPLATE = """## Tools
 

@@ -1,8 +1,16 @@
 diff --git a/vllm/tokenizers/deepseek_v4_encoding.py b/vllm/tokenizers/deepseek_v4_encoding.py
-index 6895771..5613acf 100644
+index 6895771..a54b46d 100644
 --- a/vllm/tokenizers/deepseek_v4_encoding.py
 +++ b/vllm/tokenizers/deepseek_v4_encoding.py
-@@ -67,11 +67,31 @@
+@@ -13,6 +13,7 @@
+ from typing import Any, Dict, List, Union, Optional, Tuple
+ import copy
+ import json
++import os
+ 
+ import regex as re
+ 
+@@ -67,11 +68,35 @@
      "<tool_result>{content}</tool_result>"
  )
  
@@ -35,11 +43,15 @@ index 6895771..5613acf 100644
 +        "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n"
 +    ),
 +}
-+DEFAULT_REASONING_EFFORT = "low"
++# Default reasoning effort for requests that do not specify one. Env-configurable
++# so the serving launcher can set it (this rig serves at "max" by default —
++# VLLM_DSV4_DEFAULT_REASONING_EFFORT=max in docker/serve_sm89_ds4.sh). "max" only
++# adds the effort prefix in thinking mode; thinking=false requests are unaffected.
++DEFAULT_REASONING_EFFORT = os.getenv("VLLM_DSV4_DEFAULT_REASONING_EFFORT", "max")
  
  TOOLS_TEMPLATE = """## Tools
  
-@@ -238,7 +258,8 @@
+@@ -238,7 +263,8 @@
          messages: Full list of messages in the conversation.
          thinking_mode: Either "chat" or "thinking".
          drop_thinking: Whether to drop reasoning content from earlier turns.
@@ -49,7 +61,7 @@ index 6895771..5613acf 100644
  
      Returns:
          Encoded string for this message.
-@@ -263,10 +284,12 @@
+@@ -263,10 +289,12 @@
      if tool_calls:
          tool_calls = tool_calls_from_openai_format(tool_calls)
  
@@ -66,7 +78,7 @@ index 6895771..5613acf 100644
  
      if role == "system":
          prompt += system_msg_template.format(content=content or "")
-@@ -533,7 +556,8 @@
+@@ -533,7 +561,8 @@
          drop_thinking: If True, drop reasoning from earlier assistant turns
                        (only keep reasoning for messages after the last user message).
          add_default_bos_token: Whether to prepend BOS token at conversation start.
