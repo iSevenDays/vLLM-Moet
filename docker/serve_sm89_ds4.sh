@@ -140,28 +140,27 @@ else
   PLANES_SUBDIR=planes
 fi
 MODEL=${MODEL:-/root/models/DeepSeek-V4-Flash-0731}   # checkpoint dir (read-only)
-CACHE=${CACHE:-/root/models/moet-cache}          # quant caches; ~90 GB free
-JIT_CACHE=${JIT_CACHE:-$CACHE/jit}               # compiler cache may be shared
+CACHE=${CACHE:-/root/models/moet-cache-0731-gpu}    # quant caches; host-residency 2-bit planes live here
+JIT_CACHE=${JIT_CACHE:-/root/models/moet-cache/jit} # shared warm compiler cache (fast boot)
                                                   # across weight-cache namespaces
 NETWORK=${NETWORK:-host}     # this host serves directly; use 'none' to isolate quantization
 RESTART=${RESTART:-no}       # production: unless-stopped (survives crashes/reboots)
 MAXLEN=${MAXLEN:-262144}     # maximum context length; lower for the first boot test
-UTIL=${UTIL:-0.98}           # fraction of VRAM vLLM may use (raised from 0.96; 2x48GiB
-                             # at TP2 RESIDENCY=gpu leaves ~5 GiB/card for everything-not-
-                             # weights, so every basis point matters. 0.98 + trimmed graphs
-                             # + smaller batch is the working budget for 131K sparse MLA).
-BATCHED_TOKENS=${BATCHED_TOKENS:-1024}  # max-num-batched-tokens; keep 1024 with MTP on (see section 4)
-NUM_SEQS=${NUM_SEQS:-4}      # request scheduler limit, not four full-length KV allocations
-CUDAGRAPH_SIZES=${CUDAGRAPH_SIZES:-1,2,4,8}  # cudagraph_capture_sizes, comma-sep (trimmed
-                             # from [1,2,4,8,12,16,24] to reduce captured buffers and
-                             # workspaces. Graph capture does not copy the model weights).
+UTIL=${UTIL:-0.90}           # fraction of VRAM vLLM may use. RESIDENCY=host keeps the
+                             # 2-bit base in host RAM, so the GPU holds only the BASE_GB pool
+                             # + KV; 0.90 is the verified-boot budget on the 2x48 GiB cards.
+BATCHED_TOKENS=${BATCHED_TOKENS:-1056}  # max-num-batched-tokens (verified with DSpark k=5)
+NUM_SEQS=${NUM_SEQS:-3}      # request scheduler limit (verified)
+CUDAGRAPH_SIZES=${CUDAGRAPH_SIZES:-1,2,4,6,8,12,18}  # cudagraph_capture_sizes, comma-sep
 BREAKABLE_CUDAGRAPH=${BREAKABLE_CUDAGRAPH:-auto}  # auto = leave vLLM default; 0 = keep
                              # torch.compile/Inductor enabled instead of auto breakable graphs.
-MTP_TOKENS=${MTP_TOKENS:-1}  # speculative tokens; keep 1 (see header section 4)
+MTP_TOKENS=${MTP_TOKENS:-0}  # 0 when SPECULATIVE_CONFIG (DSpark) is set below
 SPECULATIVE_CONFIG=${SPECULATIVE_CONFIG:-}  # compact JSON override for embedded
-                             # speculative heads (for example 0731 DSpark).
-                             # Empty preserves the MTP_TOKENS behavior above.
-PREFIX_CACHING=${PREFIX_CACHING:-1}  # reuse repeated prompt KV; read header section 4
+                             # speculative heads. Empty falls back to the 0731 DSpark default.
+if [ -z "$SPECULATIVE_CONFIG" ] && [ "$MTP_TOKENS" = "0" ]; then
+  SPECULATIVE_CONFIG='{"method":"dspark","num_speculative_tokens":5,"dspark_scheduler":false}'
+fi
+PREFIX_CACHING=${PREFIX_CACHING:-0}  # 0 = --no-enable-prefix-caching (DSv4 sparse MLA)
 SCALE_REFIT=${SCALE_REFIT:-1}  # normal W2 conversion; 0 is for comparison or rollback
 FP8_DELTA_GB=${FP8_DELTA_GB:-0}  # FP8-e4m3 delta PREFILL tier (Ada native FP8 MMA).
                                  # >0 enables it: FP8-resident prefill pairs divert to
@@ -189,11 +188,11 @@ EXTRA_ARGS=${EXTRA_ARGS:-}       # optional raw vLLM CLI args, e.g. "--cudagraph
 PORT=${PORT:-8001}           # API port (reachable only with NETWORK=host)
 GPUS=${GPUS:-'"device=0,1"'} # this host's two 48 GiB RTX 4090 D cards
 TP=${TP:-2}                  # tensor parallelism = number of GPUs used
-CUSTOM_ALL_REDUCE=${CUSTOM_ALL_REDUCE:-1}  # 1 = keep vLLM's P2P custom all-reduce; 0 = disable
+CUSTOM_ALL_REDUCE=${CUSTOM_ALL_REDUCE:-0}  # 0 = --disable-custom-all-reduce (NCCL fallback, verified on this host)
                              # (-> --disable-custom-all-reduce, NCCL fallback). Custom all-reduce
                              # needs the open-gpu-kernel-modules P2P patch on RTX 4090 D - see
                              # header section 2. Set 0 if your driver lacks that patch.
-RESIDENCY=${RESIDENCY:-gpu}  # 'host' = 2-bit base in pinned RAM + GPU pool (RAM-heavy);
+RESIDENCY=${RESIDENCY:-host}  # 'host' = 2-bit base in pinned RAM + GPU pool (RAM-heavy);
                              # 'exact' = checkpoint FP4 in host RAM + mandatory GPU
                              # cache; native FP8 MMA for BOTH prefill and decode;
                              # 'gpu'  = base sharded ONTO the GPUs, no host cache (VRAM-heavy,
